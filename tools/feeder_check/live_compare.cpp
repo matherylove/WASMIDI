@@ -2,6 +2,7 @@
 #include "midi_mapped_store.hpp"
 #include "bpfa_midi_store.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <chrono>
@@ -19,6 +20,9 @@ int main(int argc, char** argv) {
     BpfaMidiStore store;
 #else
     MidiMappedStore store;
+#endif
+#ifdef USE_BPFA
+    if (getenv("BPFA_ZSTD")) store.setRawSourceLimit(0);
 #endif
     MidiDocument meta;
     if (!store.index(g_size, readAt, nullptr, meta)) { fprintf(stderr, "index failed\n"); return 1; }

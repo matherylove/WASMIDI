@@ -3,6 +3,7 @@
 #include "bpfa_midi_store.hpp"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fcntl.h>
@@ -21,6 +22,9 @@ int main(int argc, char** argv) {
     BpfaMidiStore store;
 #else
     MidiMappedStore store;
+#endif
+#ifdef USE_BPFA
+    if (getenv("BPFA_ZSTD")) store.setRawSourceLimit(0);
 #endif
     MidiDocument meta;
     auto t0 = std::chrono::steady_clock::now();
