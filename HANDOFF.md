@@ -3688,4 +3688,69 @@ renderer, teclado con seeks, páginas) y en modo zstd (synth, teclado con seeks)
 **idénticos** al parser original. `store_compare` y `live_compare` aceptan
 `BPFA_ZSTD=1` para forzar la fuente zstd.
 
-Última revisión entregada: `wasmidi-main-rev62-faster-track-scan.zip`.
+Revisión anterior entregada: `wasmidi-main-rev62-faster-track-scan.zip`.
+
+---
+
+## 56. Revisión 63 — MIDIs con miles de pistas: cada cursor decodifica su propio bloque
+
+**Reporte del usuario:** con `The_Nuker_3_Ultimate_F4` la carga total tarda casi una
+hora (no los ~2 s medidos con Hypernova).
+
+**El archivo:** 16,66 GB de MIDI (7z de 83,5 MB), **9679 pistas**, PPQ 7680,
+2079 millones de notas, 867 s. Supera el límite crudo → fuente zstd. Benchmark en host
+leyendo el 7z en streaming por stdin (`tools/host_bench/large_midi_bench.cpp`; el disco
+del entorno no alcanza para extraerlo).
+
+**Causa:** la caché LRU compartida tenía 128 bloques de 64 KiB. Con 9679 pistas, los
+cursores fusionados (synth, renderer, teclado) leen una pista distinta casi en cada
+evento y se expulsan entre sí: **cada pocos eventos se descomprimía un bloque de 64 KiB
+entero**. El índice en sí no era el problema.
+
+| Rev. 62, host | Tiempo | Bloques descomprimidos |
+|---|---|---|
+| Índice (ingesta + escaneo) | 118 s | — |
+| 1 s de synth a mitad de canción (43,9M eventos) | **60,9 s** | 1.129.882 |
+| 1 s de renderer a mitad de canción | **60,1 s** | 1.129.885 |
+| Reconstrucción del teclado a mitad de canción | **82,8 s** | 1.308.829 |
+
+**Cambio (`bpfa_midi_store.{hpp,cpp}`):**
+
+- Cada `Cursor` tiene su propio búfer de bloque (`own`, reservado al primer uso) y
+  descomprime ahí; ya no compite con los demás. La LRU compartida queda para lecturas
+  sueltas (cabecera, SysEx, escaneo).
+- Tamaño de bloque según las pistas, elegido con la cabecera en la primera ventana de la
+  ingesta: ~256 MiB / (3 cursores × pistas), entre 8 y 64 KiB. Hypernova (26 pistas):
+  64 KiB como antes; Nuker: 8 KiB.
+- Contextos de zstd reutilizados (`ZSTD_compressCCtx`, `ZSTD_decompressDCtx`) en vez de
+  crear uno por bloque (con bloques chicos dominaba el costo: 4 KiB tardaba 17 s en
+  Hypernova).
+- `MergeCursor` reinicia sus cursores con `resize` (los cursores ahora no son copiables).
+- `check.sh`: el `zstd.h` mínimo incluye las funciones de contexto.
+
+**Después (rev. 63, host):**
+
+| | Tiempo | Bloques descomprimidos |
+|---|---|---|
+| Índice | 129 s (ingesta 48 s, limitada por la descompresión del 7z en Python; escaneo 73 s) | — |
+| 1 s de synth a mitad de canción | **1,56 s** (−97%) | 32.683 |
+| 1 s de renderer a mitad de canción | **1,81 s** (−97%) | 32.683 |
+| Reconstrucción del teclado a mitad de canción | **15,0 s** (−82%) | 150.111 |
+| Memoria del store | 1,94 GB (fuente 1,26 GB con bloques de 8 KiB; era 0,70 GB con 64 KiB) | |
+
+**Lo que queda:**
+
+- **1 s de música cuesta ~1,6 s de parseo a mitad de canción:** son 43,9 millones de
+  eventos por segundo (≈22M de notas/s); no entra en tiempo real en un solo hilo con
+  ninguna representación. Ahí deciden el límite de render y los descartes.
+- **Teclado tras un seek lejano: 15 s.** El presupuesto de snapshots (16M notas) se
+  agota temprano en un MIDI de 2.000 millones de notas y más adelante se reproduce desde
+  el inicio de cada pista. Siguiente candidato.
+- **En el navegador** puede sumar el crecimiento del heap: `MEMORY_GROWTH_GEOMETRIC_STEP=0`
+  pide exactamente lo necesario en cada crecimiento (cientos de crecimientos hasta
+  ~2 GB). No se puede medir acá.
+
+**Verificación:** `check.sh` (16 IDENTICAL, 0 DIFFER) y Hypernova en modo zstd (synth y
+teclado con seeks): **idénticos** al parser original.
+
+Última revisión entregada: `wasmidi-main-rev63-per-cursor-blocks.zip`.

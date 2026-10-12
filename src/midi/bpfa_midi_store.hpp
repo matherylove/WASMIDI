@@ -80,8 +80,12 @@ public:
     bool buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::vector<VisualNote>& output);
 
     // BPFA compressed source: 64 KiB zstd blocks, deduplicated, LRU-decoded.
+    // own: a cursor's private block buffer (sourceBlockSize() bytes); null uses the shared
+    // LRU cache. With thousands of tracks the shared cache thrashes (HANDOFF sec. 56).
     bool sourceBlock(uint64_t position, uint16_t& slotHint, const uint8_t*& data, uint64_t& begin,
-                     uint64_t& end) const;
+                     uint64_t& end, uint8_t* own = nullptr) const;
+    std::size_t sourceBlockSize() const { return sourceBlockSize_; }
+    bool compressedSource() const { return fileBytes_.empty() && !onDemand_ && !sourceChunks_.empty(); }
     bool sourceSlotValid(uint16_t slot, uint64_t begin) const;
     uint64_t storedSourceBytes() const { return storedSourceBytes_; }
 
@@ -143,6 +147,7 @@ private:
         uint64_t blockBegin = 0;
         uint64_t blockEnd = 0;
         uint16_t blockSlot = 0xffffu;
+        std::unique_ptr<uint8_t[]> own;
     };
 
     // Merged (tick, track) cursor over the original bytes; notesOnly keeps
@@ -190,6 +195,11 @@ private:
   private:
     uint64_t sourceSize_ = 0;
     mutable std::vector<CacheSlot> sourceCache_;
+    std::size_t sourceBlockSize_ = 64u * 1024u;
+    mutable void* decompressContext_ = nullptr;
+  public:
+    ~BpfaMidiStore();
+  private:
     mutable uint64_t sourceCacheAge_ = 0;
 
     bool valid_ = false;
