@@ -90,7 +90,35 @@ enum class Kind { Channel, Tempo, SysEx, End };
 
 // BPFA ReadNextEvent, extended to report tempo payloads of length >= 3 and every
 // SysEx (WASMIDI keeps them all; the synth decides what it supports).
-inline __attribute__((always_inline)) Kind readEventImpl(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2,
+// Contiguous source for the raw-mode track scan: no block refills (HANDOFF sec. 55).
+struct RawDecoder {
+    const uint8_t* bytes;
+    uint64_t position;
+    uint64_t end;
+    uint32_t tick = 0;
+    uint8_t runningStatus = 0;
+    bool finished = false;
+    const uint8_t* block = nullptr;
+
+    bool byte(uint8_t& v) {
+        if (position >= end) return false;
+        v = bytes[position++];
+        return true;
+    }
+    bool var(uint32_t& v) {
+        v = 0;
+        for (int i = 0; i < 4; ++i) {
+            uint8_t b = 0;
+            if (!byte(b)) return false;
+            v = (v << 7) | (b & 0x7f);
+            if (!(b & 0x80)) return true;
+        }
+        return false;
+    }
+};
+
+template <class D>
+inline __attribute__((always_inline)) Kind readEventImpl(D& d, uint8_t& status, uint8_t& d1, uint8_t& d2,
                                                          uint32_t& tempo, uint64_t& dataOffset, uint32_t& dataLength)
 {
     while (!d.finished && d.position < d.end) {
@@ -156,24 +184,16 @@ inline __attribute__((always_inline)) Kind readEventImpl(Decoder& d, uint8_t& st
     return Kind::End;
 }
 
-// Decodes on register copies: byte stores through uint8_t references would
-// otherwise alias the decoder fields and force reloads on every byte.
-Kind readEvent(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2, uint32_t& tempo,
-               uint64_t& dataOffset, uint32_t& dataLength)
+inline __attribute__((always_inline)) Kind readEvent(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2,
+                                                     uint32_t& tempo, uint64_t& dataOffset, uint32_t& dataLength)
 {
-    Decoder local = d;
-    uint8_t s = 0, a = 0, b = 0;
-    uint32_t t = 0, length = 0;
-    uint64_t offset = 0;
-    const Kind kind = readEventImpl(local, s, a, b, t, offset, length);
-    d = local;
-    status = s;
-    d1 = a;
-    d2 = b;
-    tempo = t;
-    dataOffset = offset;
-    dataLength = length;
-    return kind;
+    return readEventImpl(d, status, d1, d2, tempo, dataOffset, dataLength);
+}
+
+inline __attribute__((always_inline)) Kind readEvent(RawDecoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2,
+                                                     uint32_t& tempo, uint64_t& dataOffset, uint32_t& dataLength)
+{
+    return readEventImpl(d, status, d1, d2, tempo, dataOffset, dataLength);
 }
 
 void buildTempoIndexLocal(MidiDocument& output)
@@ -363,8 +383,6 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         for (uint16_t t = 0; t < out.trackCount; ++t) {
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
-            Decoder d{nullptr, storage.byteBegin, storage.byteEnd};
-            d.store = this;
             uint64_t events = 0, order = 0;
             FirstNote& first = firstNotes_[t];
             first.closeOrder.fill(std::numeric_limits<uint64_t>::max());
@@ -380,6 +398,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             uint8_t status = 0, d1 = 0, d2 = 0;
             uint32_t tempo = 0, dataLength = 0;
             uint64_t dataOffset = 0;
+            uint32_t finalTick = 0;
+            auto scanEvents = [&](auto& d) {
             for (;;) {
                 const Kind kind = readEvent(d, status, d1, d2, tempo, dataOffset, dataLength);
                 if (kind == Kind::End) break;
@@ -473,6 +493,16 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                     ++totalControls;
                 }
             }
+            finalTick = d.tick;
+            };
+            if (!fileBytes_.empty()) {
+                RawDecoder d{fileBytes_.data(), storage.byteBegin, storage.byteEnd};
+                scanEvents(d);
+            } else {
+                Decoder d{nullptr, storage.byteBegin, storage.byteEnd};
+                d.store = this;
+                scanEvents(d);
+            }
             for (uint16_t key = 0; key < activeCounts.size(); ++key) {
                 const uint32_t count = activeCounts[key];
                 if (!count) continue;
@@ -484,8 +514,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 }
                 closureOrder += count;
             }
-            storage.maxTick = d.tick;
-            out.maxTick = std::max(out.maxTick, d.tick);
+            storage.maxTick = finalTick;
+            out.maxTick = std::max(out.maxTick, finalTick);
             report(40 + int(30.0 * double(t + 1) / double(std::max<int>(1, out.trackCount))), "BPFA: track scan");
         }
         out.noteCount = totalNotes;

@@ -3650,4 +3650,42 @@ archivos más grandes van por zstd aunque entrarían crudos. Es el lado seguro.
 **Verificación:** `node --check` de workers y smoke test; `midi_worker_core.cpp`
 compila con y sin `WASMIDI_PARSER_BPFA`. El store no cambió (§53 verificado).
 
-Última revisión entregada: `wasmidi-main-rev61-zstd-by-budget.zip`.
+Revisión anterior entregada: `wasmidi-main-rev61-zstd-by-budget.zip`.
+
+---
+
+## 55. Revisión 62 — "BPFA: track scan" más rápido
+
+**Reporte del usuario:** la etapa "BPFA: track scan" es demasiado lenta. También pidió
+benchmarks con un Chromium en el entorno de trabajo en vez de en host: **no es posible
+acá** (no hay Chromium ni Playwright, no hay red para instalarlos, y no hay emsdk para
+compilar el wasm). Alternativa propuesta: un paso del CI (que sí tiene red y emsdk) que
+corra el sitio compilado en Chromium headless con un MIDI sintético y escriba los
+tiempos de carga en el log.
+
+**Causa (gprof, modo crudo):** `readEvent` era una llamada no inlineada por evento
+(124,6M en Hypernova) que además copiaba el decodificador entero de ida y vuelta (la
+"copia local" agregada en rev. 57 contra un aliasing que no resultó ser el problema):
+~65% del escaneo. El resto, la contabilidad por evento.
+
+**Cambio (`bpfa_midi_store.cpp`):**
+
+- `readEventImpl` es plantilla; `readEvent` se inlinea sin copiar el decodificador.
+- `RawDecoder`: decodificador sobre bytes contiguos sin ventana de bloques, usado por el
+  escaneo en modo crudo. El cuerpo del escaneo es una lambda genérica que corre con
+  `RawDecoder` (crudo) o `Decoder` (zstd). La reproducción (`decodeNext`) también se
+  beneficia del inline.
+
+**Medición (host, Hypernova, dos corridas):**
+
+| | Escaneo antes | Escaneo ahora | Carga total ahora |
+|---|---|---|---|
+| Crudo | 2,84-2,91 s | **1,73-1,93 s** | **~2,3 s** |
+| zstd | 3,27-3,34 s | **2,17-2,23 s** | **~3,5 s** |
+
+**Verificación:** `check.sh` (16 IDENTICAL, 0 DIFFER) y Hypernova en modo crudo (synth,
+renderer, teclado con seeks, páginas) y en modo zstd (synth, teclado con seeks):
+**idénticos** al parser original. `store_compare` y `live_compare` aceptan
+`BPFA_ZSTD=1` para forzar la fuente zstd.
+
+Última revisión entregada: `wasmidi-main-rev62-faster-track-scan.zip`.
