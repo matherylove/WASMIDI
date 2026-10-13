@@ -48,6 +48,7 @@ FILES = [
     "tools/worker_freelist_borrow_check.c",
     "web/coi-serviceworker.js",
     "web/midi-parser-worker.js",
+    "web/parser-bench.html",
     "web/snappysynth-audio-worklet.js",
     "web/snappysynth-worker.js",
     "web/snappysynth_bridge.js",

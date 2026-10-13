@@ -13,6 +13,14 @@ size_t ZSTD_compress(void* dst, size_t dstCapacity, const void* src, size_t srcS
 size_t ZSTD_decompress(void* dst, size_t dstCapacity, const void* src, size_t compressedSize);
 unsigned ZSTD_isError(size_t code);
 size_t ZSTD_compressBound(size_t srcSize);
+typedef struct ZSTD_CCtx_s ZSTD_CCtx;
+typedef struct ZSTD_DCtx_s ZSTD_DCtx;
+ZSTD_CCtx* ZSTD_createCCtx(void);
+size_t ZSTD_freeCCtx(ZSTD_CCtx* cctx);
+size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize, int level);
+ZSTD_DCtx* ZSTD_createDCtx(void);
+size_t ZSTD_freeDCtx(ZSTD_DCtx* dctx);
+size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize);
 #ifdef __cplusplus
 }
 #endif
