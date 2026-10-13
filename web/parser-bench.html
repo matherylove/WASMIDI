@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WASMIDI parser benchmark</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { margin: 2rem auto; max-width: 52rem; padding: 0 1rem; background: #111; color: #ddd; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #333; font-variant-numeric: tabular-nums; }
+  td.num { text-align: right; }
+  pre { background: #1b1b1b; padding: .8rem; overflow-x: auto; }
+  button { padding: .4rem 1rem; }
+</style>
+</head>
+<body>
+<h1>WASMIDI parser benchmark</h1>
+<p>Carga un MIDI con el mismo worker del parser que usa la app y mide cuánto dura cada etapa.
+No reproduce audio ni dibuja nada.</p>
+<p><input id="file" type="file" accept=".mid,.midi,audio/midi"> <button id="run" disabled>Medir</button></p>
+<div id="status"></div>
+<table id="stages" hidden>
+  <thead><tr><th>Etapa</th><th class="num">Duración</th><th class="num">%</th></tr></thead>
+  <tbody></tbody>
+</table>
+<h2>Resultado para copiar</h2>
+<pre id="report">—</pre>
+<script>
+"use strict";
+const fileInput = document.getElementById("file");
+const runButton = document.getElementById("run");
+const statusBox = document.getElementById("status");
+const table = document.getElementById("stages");
+const tbody = table.querySelector("tbody");
+const report = document.getElementById("report");
+
+fileInput.addEventListener("change", () => { runButton.disabled = !fileInput.files.length; });
+
+function fmt(ms) { return ms >= 10000 ? (ms / 1000).toFixed(1) + " s" : Math.round(ms) + " ms"; }
+
+runButton.addEventListener("click", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  runButton.disabled = true;
+  tbody.textContent = "";
+  table.hidden = false;
+  const stages = [];
+  let current = null;
+  const t0 = performance.now();
+  const worker = new Worker("midi-parser-worker.js?bench=" + Date.now());
+
+  function closeStage(now) {
+    if (!current) return;
+    current.ms = now - current.start;
+    const row = document.createElement("tr");
+    row.innerHTML = "<td></td><td class=num></td><td class=num></td>";
+    row.cells[0].textContent = current.stage;
+    row.cells[1].textContent = fmt(current.ms);
+    row.cells[2].textContent = current.percent + "%";
+    tbody.appendChild(row);
+    stages.push(current);
+    current = null;
+  }
+  function finish(text) {
+    const now = performance.now();
+    closeStage(now);
+    const total = now - t0;
+    statusBox.textContent = text + " — total " + fmt(total);
+    const lines = [
+      "file: " + file.name + " (" + (file.size / 1048576).toFixed(1) + " MB)",
+      "browser: " + navigator.userAgent,
+      "deviceMemory: " + (navigator.deviceMemory || "?") + " GB, cores: " + (navigator.hardwareConcurrency || "?"),
+      ...stages.map(s => s.stage + ": " + fmt(s.ms)),
+      "total: " + fmt(total) + " (" + text + ")"
+    ];
+    report.textContent = lines.join("\n");
+    worker.terminate();
+    runButton.disabled = false;
+  }
+
+  worker.onmessage = event => {
+    const m = event.data || {};
+    const now = performance.now();
+    if (m.type === "worker-ready") {
+      statusBox.textContent = "Worker listo; cargando…";
+      worker.postMessage({ type: "parse", file });
+    } else if (m.type === "progress") {
+      statusBox.textContent = m.percent + "% " + m.stage + " — " + fmt(now - t0);
+      if (!current || current.stage !== m.stage) {
+        closeStage(now);
+        current = { stage: m.stage, start: now, percent: m.percent };
+      }
+    } else if (m.type === "result-begin") {
+      closeStage(now);
+      current = { stage: "Transferencia del documento", start: now, percent: 100 };
+    } else if (m.type === "result-end") {
+      finish("Listo");
+    } else if (m.type === "error") {
+      finish("Error: " + m.message);
+    }
+  };
+  worker.onerror = e => finish("Error del worker: " + (e.message || e));
+});
+</script>
+</body>
+</html>

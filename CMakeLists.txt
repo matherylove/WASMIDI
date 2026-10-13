@@ -151,9 +151,10 @@ if(EMSCRIPTEN)
         "-sALLOW_MEMORY_GROWTH=1"
         "-sINITIAL_MEMORY=67108864"
         "-sMAXIMUM_MEMORY=17179869184"
-        # Do not reserve Emscripten's default +20% geometric slack while growing
-        # gigantic black MIDIs. Request only the pages actually needed.
-        "-sMEMORY_GROWTH_GEOMETRIC_STEP=0"
+        # +20% per growth, capped at 96 MiB of slack (HANDOFF sec. 57). The former
+        # GEOMETRIC_STEP=0 grew by exactly each request: hundreds of growths on huge MIDIs.
+        "-sMEMORY_GROWTH_GEOMETRIC_STEP=0.2"
+        "-sMEMORY_GROWTH_GEOMETRIC_CAP=100663296"
         "-sSTACK_SIZE=4194304"
         "-sFILESYSTEM=0"
         # Parser-only assertions keep fatal startup/runtime diagnostics useful;

@@ -3753,4 +3753,32 @@ entero**. El índice en sí no era el problema.
 **Verificación:** `check.sh` (16 IDENTICAL, 0 DIFFER) y Hypernova en modo zstd (synth y
 teclado con seeks): **idénticos** al parser original.
 
-Última revisión entregada: `wasmidi-main-rev63-per-cursor-blocks.zip`.
+Revisión anterior entregada: `wasmidi-main-rev63-per-cursor-blocks.zip`.
+
+---
+
+## 57. Revisión 64 — página de benchmark del parser en Chromium y crecimiento del heap
+
+**Reporte del usuario (rev. 63):** con The Nuker 3 la carga todavía puede tardar media
+hora. En host el índice tarda ~129 s; la diferencia está en el navegador y no se puede
+medir desde acá (sin Chromium, sin red, sin emsdk).
+
+**Cambios:**
+
+1. **`web/parser-bench.html`** (desplegada por el CI en `site/`): elige un MIDI, lanza el
+   mismo `midi-parser-worker.js` que la app con el protocolo normal (`worker-ready` →
+   `parse` → `progress` → `result-*`), y muestra cuánto dura cada etapa de progreso más
+   la transferencia del documento, con un texto para copiar (archivo, navegador,
+   `deviceMemory`, núcleos, etapas, total). No reproduce ni dibuja. Sirve para que el
+   usuario mida en su Chromium real, y como base para un benchmark headless en el CI.
+2. **Crecimiento del heap del parser:** `MEMORY_GROWTH_GEOMETRIC_STEP=0` pedía exactamente
+   cada asignación: con un store de ~2 GB son cientos de crecimientos de Memory64, y
+   cada uno recrea las vistas de JS y puede copiar la memoria. Ahora +20% por
+   crecimiento con tope de 96 MiB de holgura (`MEMORY_GROWTH_GEOMETRIC_CAP`), así que el
+   desperdicio que motivó el 0 queda acotado. No verificable en host.
+
+**Prueba pedida:** abrir `parser-bench.html` del sitio, medir The Nuker 3 y pegar el
+texto del resultado. Con eso se ve qué etapa se lleva la media hora (lectura del
+archivo, compresión, escaneo o transferencia).
+
+Última revisión entregada: `wasmidi-main-rev64-parser-bench.zip`.
