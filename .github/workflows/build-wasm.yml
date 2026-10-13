@@ -152,6 +152,7 @@ jobs:
           # Large MIDI parsing runs in its own non-pthread Worker WASM module.
           cp build/wasmidi-midi-parser.js site/
           cp web/midi-parser-worker.js site/
+          cp web/parser-bench.html site/
           cp web/visual-cache-worker.js site/
 
           # SnappySynthV2 is a separate modularized WASM module. Emscripten
