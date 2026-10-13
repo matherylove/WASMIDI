@@ -3781,4 +3781,42 @@ medir desde acá (sin Chromium, sin red, sin emsdk).
 texto del resultado. Con eso se ve qué etapa se lleva la media hora (lectura del
 archivo, compresión, escaneo o transferencia).
 
-Última revisión entregada: `wasmidi-main-rev64-parser-bench.zip`.
+Revisión anterior entregada: `wasmidi-main-rev64-parser-bench.zip`.
+
+---
+
+## 58. Revisión 65 — la carga corría en código no optimizado de V8 (Liftoff)
+
+**Medición del usuario con `parser-bench.html` (Chrome 155, 16 núcleos, rev. 64,
+The Nuker 3, 15.884 MB):**
+
+| Etapa | Navegador | Host (rev. 63) | Relación |
+|---|---|---|---|
+| Compresión de la fuente | 82,0 s | ~48 s (limitado por la descompresión del 7z en Python) | ≤1,7× |
+| Escaneo de pistas | **608,8 s** | 73 s | **8,3×** |
+| Total | 691,7 s | ~129 s | |
+
+Lo normal entre wasm y nativo es 1,5-2,5×. El 8× apunta a la misma causa que §19
+(rev. 40, `worker_cycle`): **V8 no tiene on-stack replacement para wasm**. Una función
+que entra una sola vez y queda en un bucle de minutos nunca pasa de Liftoff (código
+base, sin optimizar; con Memory64 todavía más lento) a TurboFan. `index()` entra una vez
+y el escaneo de todas las pistas (lambda genérica, inlineada) corre dentro de ella. La
+compresión llama a zstd (funciones separadas que sí se optimizan), por eso esa etapa
+sufre poco.
+
+**Cambio (`bpfa_midi_store.cpp`):** `runChunked(f)` llama a `f` una y otra vez a través
+de un puntero a función `volatile` (el inlining, incluso con LTO, no lo atraviesa), así
+el cuerpo es una función que se llama muchas veces y V8 la optimiza.
+
+- Escaneo: cada llamada procesa hasta 2^18 eventos (`ScanChunkEvents`) de la pista
+  actual y devuelve si terminó; `finalTick` se fija al terminar o al agotar el tramo.
+- Ingesta: cada llamada procesa una ventana de 8 MiB (hash, deduplicación, zstd).
+
+En host no cambia nada (Hypernova crudo ~2,1 s, zstd ~3,8 s): el beneficio es solo en
+V8. Resultados **idénticos** (`check.sh` 16/16; Hypernova crudo: synth y teclado con
+seeks; zstd: synth).
+
+**Prueba pedida:** repetir `parser-bench.html` con The Nuker 3. Si el escaneo baja a
+~2× del host (~150 s), la causa era esta.
+
+Última revisión entregada: `wasmidi-main-rev65-v8-tierup.zip`.

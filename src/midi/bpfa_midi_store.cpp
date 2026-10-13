@@ -197,6 +197,20 @@ inline __attribute__((always_inline)) Kind readEvent(RawDecoder& d, uint8_t& sta
     return readEventImpl(d, status, d1, d2, tempo, dataOffset, dataLength);
 }
 
+// V8 has no on-stack replacement for wasm: a loop entered once stays in baseline
+// (Liftoff) code. Long loops run as many short calls through an opaque pointer so
+// the optimized tier takes over (HANDOFF sec. 58, same fix as worker_cycle, sec. 19).
+using ChunkFn = bool (*)(void*);
+template <class F>
+bool callChunk(void* f) { return (*static_cast<F*>(f))(); }
+template <class F>
+void runChunked(F& f)
+{
+    ChunkFn volatile fn = &callChunk<F>;
+    while (!fn(&f)) {}
+}
+constexpr uint32_t ScanChunkEvents = 1u << 18;
+
 void buildTempoIndexLocal(MidiDocument& output)
 {
     std::stable_sort(output.tempoMap.begin(), output.tempoMap.end(),
@@ -405,10 +419,10 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             uint32_t tempo = 0, dataLength = 0;
             uint64_t dataOffset = 0;
             uint32_t finalTick = 0;
-            auto scanEvents = [&](auto& d) {
-            for (;;) {
+            auto scanEvents = [&](auto& d) -> bool {
+            for (uint32_t chunkEvents = 0; chunkEvents < ScanChunkEvents; ++chunkEvents) {
                 const Kind kind = readEvent(d, status, d1, d2, tempo, dataOffset, dataLength);
-                if (kind == Kind::End) break;
+                if (kind == Kind::End) { finalTick = d.tick; return true; }
                 if (kind == Kind::Tempo) {
                     out.tempoMap.push_back({d.tick, tempo});
                     ++order;
@@ -421,7 +435,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                     sx.order = order++;
                     sx.data.resize(std::size_t(dataLength) + 1u);
                     sx.data[0] = status;
-                    if (dataLength && !copySource(dataOffset, sx.data.data() + 1, dataLength)) break;
+                    if (dataLength && !copySource(dataOffset, sx.data.data() + 1, dataLength)) { finalTick = d.tick; return true; }
                     d.block = nullptr;
                     sysex_.push_back(std::move(sx));
                     continue;
@@ -500,14 +514,17 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 }
             }
             finalTick = d.tick;
+            return false;
             };
             if (!fileBytes_.empty()) {
                 RawDecoder d{fileBytes_.data(), storage.byteBegin, storage.byteEnd};
-                scanEvents(d);
+                auto chunk = [&]() { return scanEvents(d); };
+                runChunked(chunk);
             } else {
                 Decoder d{nullptr, storage.byteBegin, storage.byteEnd};
                 d.store = this;
-                scanEvents(d);
+                auto chunk = [&]() { return scanEvents(d); };
+                runChunked(chunk);
             }
             for (uint16_t key = 0; key < activeCounts.size(); ++key) {
                 const uint32_t count = activeCounts[key];
@@ -1430,11 +1447,15 @@ bool BpfaMidiStore::ingestSource(uint64_t size, MidiReadAt readAt, void* readUse
     ZSTD_DCtx* dctx = static_cast<ZSTD_DCtx*>(decompressContext_);
     struct FreeCctx { ZSTD_CCtx* c; ~FreeCctx() { ZSTD_freeCCtx(c); } } freeCctx{cctx};
     std::vector<uint8_t> candidate(SourceBlockSize);
-    for (uint64_t windowBegin = 0; windowBegin < size; windowBegin += ReadBlock) {
+    uint64_t windowBegin = 0;
+    bool ingestFailed = false;
+    auto ingestWindow = [&]() -> bool {
+        if (windowBegin >= size) return true;
         const std::size_t windowSize = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - windowBegin));
         if (!readAt(readUser, windowBegin, window.data(), windowSize)) {
             error_ = "Could not read MIDI source";
-            return false;
+            ingestFailed = true;
+            return true;
         }
         if (windowBegin == 0) {
             uint16_t tracks = 1;
@@ -1494,7 +1515,11 @@ bool BpfaMidiStore::ingestSource(uint64_t size, MidiReadAt readAt, void* readUse
         if (progress)
             progress(progressUser, int(1 + 39.0 * double(windowBegin + windowSize) / double(size)),
                      "BPFA: compressing source");
-    }
+        windowBegin += ReadBlock;
+        return false;
+    };
+    runChunked(ingestWindow);
+    if (ingestFailed) return false;
     sourceCache_.assign(SourceCacheSlots, CacheSlot{});
     return true;
 }
