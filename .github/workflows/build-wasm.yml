@@ -153,6 +153,7 @@ jobs:
           cp build/wasmidi-midi-parser.js site/
           cp web/midi-parser-worker.js site/
           cp web/parser-bench.html site/
+          cp web/midi-parser-helper.js site/
           cp web/visual-cache-worker.js site/
 
           # SnappySynthV2 is a separate modularized WASM module. Emscripten
