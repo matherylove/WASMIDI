@@ -438,6 +438,8 @@ static float *g_final_mix = NULL; // temp float buffer
 static int    g_final_cap = 0;
 static float  g_global_mix_gain = 1.0f;
 static volatile LONG g_output_soft_clip_enabled = 1;
+static volatile LONG g_steal_cap_percent = 25;
+void voice_set_steal_cap_percent(int percent) { InterlockedExchange(&g_steal_cap_percent, percent < 0 ? 0 : percent); }
 
 // Workers
 static int          g_worker_count = 0;
@@ -3997,6 +3999,14 @@ const int admit_key_cap = widx < SSW_ADMIT_MAX_WORKERS ? (int)load_relaxed_long(
 static __thread uint16_t admit_key_count[MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT];
 memset(admit_key_count, 0, sizeof(admit_key_count));
 int admit_key_max = 0;
+/* rev. 68 (HANDOFF sec. 61): at most steal_cap_percent of the pool is replaced
+ * per cycle; past that the incoming note is dropped instead of cutting a voice. */
+int steals_this_cycle = 0;
+const int steal_cap_percent = (int)load_relaxed_long(&g_steal_cap_percent);
+int steal_cap = steal_cap_percent > 0
+    ? (max_voices * steal_cap_percent / 100) / (g_worker_count > 0 ? g_worker_count : 1)
+    : 0;
+if (steal_cap_percent > 0 && steal_cap < 1) steal_cap = 1;
 LARGE_INTEGER admit_work_t0;
 QueryPerformanceCounter(&admit_work_t0);
 LARGE_INTEGER ss_cycle_begin;
@@ -4220,9 +4230,9 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
                                                                                                                                                                                                                                                                 e.ch, e.key, e.value, layer_index, vid);
                                                                                                                                                                                                                                                                 #endif
 
-                                                                                                                                                                                                                                                                if (vid < 0) {
+                                                                                                                                                                                                                                                                if (vid < 0 && (steal_cap <= 0 || steals_this_cycle < steal_cap)) {
 vid = steal_voice_fast(wd, e.ch, widx, incoming_loudness, original_volume_unit, e.key);
-                                                                                                                                                                                                                                                                if (vid >= 0) stolen = true;
+                                                                                                                                                                                                                                                                if (vid >= 0) { stolen = true; ++steals_this_cycle; }
                                                                                                                                                                                                                                                                 }
 if (ss_profile && vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)

@@ -3924,4 +3924,79 @@ los parciales y la fusión en un proceso):**
 pico (cada helper tiene sus bloques comprimidos hasta que el principal los copia), y la
 ganancia. Medir con `parser-bench.html`.
 
-Última revisión entregada: `wasmidi-main-rev67-parallel-load.zip`.
+**Medición del usuario (rev. 67, PC 1: 16 núcleos, `deviceMemory` 32, The Nuker 3):**
+
+| Etapa | Tiempo |
+|---|---|
+| Opening MIDI as a paged source (incluye la tabla de pistas: 9679 lecturas de 8 bytes en serie con `FileReaderSync`) | 2,98 s |
+| BPFA: parallel load (12 workers) | 38,3 s |
+| BPFA: merging partial indexes | 0,17 s |
+| **Total** | **42,2 s** |
+
+Evolución en la misma PC y archivo: 691,7 s (rev. 64) → 277,3 s (rev. 66) → **42,2 s**
+(rev. 67): 16× menos. Pendiente menor: la tabla de pistas (~7% del total) es una
+cadena de lecturas dependientes (cada cabecera dice dónde está la siguiente).
+
+Revisión anterior entregada: `wasmidi-main-rev67-parallel-load.zip` (+ nota de medición).
+
+---
+
+## 61. Revisión 68 — ideas de Kestrel/SVMS, parte 1: admisión, tope de robos y salida
+
+**Contexto:** el usuario pidió leer Kestrel (MPL-2.0, síntesis en GPU offline),
+SuperVirtualMIDISynth V3 (GPL-3, synth realtime para Black MIDI) y Kasaria (GPL-2,
+basado en Timidity) y luego implementar todas las ideas, con la GPU como alternativa
+seleccionable a la CPU. Solo se toman ideas (licencias GPL). Orden acordado:
+
+1. **Esta revisión:** admisión por bloque, tope de robos, limitador + bloqueador de DC.
+2. Multinúcleo estilo SVMS: un hilo procesa eventos en orden, el render se reparte en
+   tandas de 256 voces tomadas de un contador atómico, reducción en orden fijo
+   (determinismo); umbral para no paralelizar bloques chicos.
+3. Síntesis por WebGPU (estilo Kestrel) con interruptor GPU/CPU.
+
+**Cambios (`snappy_wasm_core.c`, `Voice/voice.{c,h}`, `CMakeLists.txt`):**
+
+- **Admisión por bloque (Kestrel, "admission decides who never starts"):** en
+  `ssw_render_queued_into`, antes de despachar, se cuentan los note-ons del bloque con
+  un histograma de velocity. Si superan `max_voices × g_admission_percent / 100`
+  (default 25%), se fija un umbral de velocity: entran todos los de velocity mayor y,
+  del umbral, los primeros que quepan en orden. Cada (canal, tecla) tiene una FIFO de
+  "entró / no entró" en corridas (`ssw_note_fifo`, O(1) en el caso común); el note-off
+  que el motor emparejaría (FIFO, como `SSW_NOTEOFF_FIFO`) con un note-on descartado
+  también se descarta, así no quedan notas colgadas. Se limpia en `ssw_reset`.
+  Exports: `ssw_set_admission_percent`, `ssw_admission_dropped`.
+- **Tope de robos por ciclo (Kestrel `--steal-percent`):** en `worker_cycle`, cada
+  worker puede robar como mucho `max_voices × 25% / workers` voces por ciclo; pasado eso
+  la nota entrante se descarta en vez de cortar otra voz (evita la "lluvia de ataques
+  de 85 ms" en zonas saturadas). `voice_set_steal_cap_percent`,
+  `ssw_set_steal_cap_percent` (0 = sin tope).
+- **Salida (Kestrel):** con "Soft clip" activado (el default), en lugar de la curva de
+  soft clip de `voice.c` se aplica en el core un pasa-altos Butterworth de 2.º orden a
+  15 Hz (bloqueador de DC) y un limitador brickwall con 2 ms de anticipación a
+  −0,3 dBFS (mínimo deslizante de la ganancia necesaria, ataque que llega a destino
+  antes del pico, release de 80 ms, clamp final). `voice_set_output_soft_clip_enabled`
+  queda siempre en 0. Agrega 2 ms de latencia.
+
+**Medición (host, Hypernova 100-104 s, 1024 voces, 1 worker, límite de render
+apagado):**
+
+| | Costo vs tiempo real | Bloque máx. | Robos/s | Descartes en el motor/s |
+|---|---|---|---|---|
+| rev. 67 | 1,57× | 144 ms | 77-259k | 0,7-1,1M |
+| rev. 68 solo limitador (admisión y tope en 0) | 1,49× | — | — | — |
+| **rev. 68** | **0,67×** | 24,8 ms | 19-62k | <1k |
+
+La admisión descartó 6,58M note-ons en 4 s antes de que llegaran a las voces. Nivel
+medio con admisión y tope: +0,7 dB respecto de sin ellos (las voces duran más); peor
+ventana de 50 ms: 0,9 dB más baja. El pico de salida queda en 0,966 (antes saturaba a
+1,0 en la conversión a 16 bits).
+
+**Hallazgo:** el motor **no es determinístico ni con 1 worker**: el presupuesto de
+cortes por bloque (`ssw_update_render_budget`) depende del tiempo medido, así que dos
+corridas idénticas difieren. Es lo que la parte 2 (render con reducción en orden fijo)
+y una opción de render determinístico deberían resolver para poder verificar audio
+byte a byte como el parser.
+
+**Sin cambios de UI:** el botón "Soft clip" ahora significa "limitador + DC blocker".
+
+Última revisión entregada: `wasmidi-main-rev68-admission-limiter.zip`.
