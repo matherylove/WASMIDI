@@ -890,6 +890,235 @@ void wmp_set_raw_source_limit_js(double bytes)
 #endif
 }
 
+// ---- Parallel load (HANDOFF sec. 60) ----------------------------------------
+#if WASMIDI_PARSER_BPFA
+std::vector<double> g_trackTable;
+std::vector<uint8_t> g_mergeBuffer;
+#endif
+
+// [format, trackCount, ticksPerBeat, blockSize, chunk position of every track..., file size]
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_track_table_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        g_trackTable.clear();
+        std::size_t size = 0;
+        if (!jsSizeToNative(byteCount, size) || size < 14) return 0;
+        uint8_t h[14];
+        if (!browserReadAt(nullptr, 0, h, 14) || std::memcmp(h, "MThd", 4) != 0) return 0;
+        const uint32_t headerSize = (uint32_t(h[4]) << 24) | (uint32_t(h[5]) << 16) | (uint32_t(h[6]) << 8) | h[7];
+        const uint16_t tracks = uint16_t((h[10] << 8) | h[11]);
+        g_trackTable.push_back(double((h[8] << 8) | h[9]));
+        g_trackTable.push_back(double(tracks));
+        g_trackTable.push_back(double((h[12] << 8) | h[13]));
+        g_trackTable.push_back(double(wasmidi::BpfaMidiStore::blockSizeForTracks(tracks)));
+        uint64_t position = 8ull + headerSize;
+        for (uint16_t t = 0; t < tracks; ++t) {
+            uint8_t c[8];
+            if (position + 8 > size || !browserReadAt(nullptr, position, c, 8) || std::memcmp(c, "MTrk", 4) != 0) {
+                g_trackTable.clear();
+                return 0;
+            }
+            g_trackTable.push_back(double(position));
+            position += 8ull + ((uint32_t(c[4]) << 24) | (uint32_t(c[5]) << 16) | (uint32_t(c[6]) << 8) | c[7]);
+        }
+        g_trackTable.push_back(double(size));
+        return int(g_trackTable.size());
+    } catch (...) {
+        g_trackTable.clear();
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_track_table_ptr_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_trackTable.empty() ? 0.0 : pointerToJsAddress(g_trackTable.data());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_partial_index_js(double byteCount, int format, int trackCount, int ticksPerBeat, int firstTrack,
+                         int endTrack, double firstChunkPosition, double rangeBegin, double rangeEnd,
+                         int blockSize, int compress, double snapshotBudget)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        g_error.clear();
+        std::size_t size = 0;
+        if (!jsSizeToNative(byteCount, size)) { g_error = "Invalid browser MIDI source size"; return 0; }
+        wasmidi::BpfaMidiStore::PartialPlan plan;
+        plan.format = uint16_t(format);
+        plan.trackCount = uint16_t(trackCount);
+        plan.ticksPerBeat = uint16_t(ticksPerBeat);
+        plan.firstTrack = uint16_t(firstTrack);
+        plan.endTrack = uint16_t(endTrack);
+        plan.firstChunkPosition = uint64_t(firstChunkPosition);
+        plan.rangeBegin = uint64_t(rangeBegin);
+        plan.rangeEnd = uint64_t(rangeEnd);
+        plan.blockSize = uint32_t(blockSize);
+        plan.compress = compress != 0;
+        plan.snapshotBudget = uint64_t(snapshotBudget);
+        if (!g_mappedStore.indexPartial(uint64_t(size), &browserReadAt, nullptr, plan, &progressCallback, nullptr)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Partial MIDI index could not obtain more memory from the browser/OS";
+        return 0;
+    }
+#else
+    (void)byteCount; (void)format; (void)trackCount; (void)ticksPerBeat; (void)firstTrack; (void)endTrack;
+    (void)firstChunkPosition; (void)rangeBegin; (void)rangeEnd; (void)blockSize; (void)compress; (void)snapshotBudget;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_partial_blob_ptr_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_mappedStore.partialBlob().empty() ? 0.0 : pointerToJsAddress(g_mappedStore.partialBlob().data());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_partial_blob_size_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return double(g_mappedStore.partialBlob().size());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_partial_release_js()
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.releasePartialBlob();
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_merge_begin_js(double byteCount, int format, int trackCount, int ticksPerBeat, int blockSize,
+                       int compressed)
+{
+#if WASMIDI_PARSER_BPFA
+    std::vector<uint8_t>().swap(g_result);
+    std::vector<wasmidi::VisualNote>().swap(g_visualPage);
+    std::vector<uint32_t>().swap(g_keySnapshotWords);
+    g_error.clear();
+    g_document = wasmidi::MidiDocument{};
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size)) { g_error = "Invalid browser MIDI source size"; return 0; }
+    if (!g_mappedStore.beginMerge(uint64_t(size), uint16_t(format), uint16_t(trackCount), uint16_t(ticksPerBeat),
+                                  uint32_t(blockSize), compressed != 0)) {
+        g_error = g_mappedStore.error();
+        return 0;
+    }
+    return 1;
+#else
+    (void)byteCount; (void)format; (void)trackCount; (void)ticksPerBeat; (void)blockSize; (void)compressed;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_merge_read_raw_js()
+{
+#if WASMIDI_PARSER_BPFA
+    if (!g_mappedStore.mergeReadRaw(&browserReadAt, nullptr, &progressCallback, nullptr)) {
+        g_error = g_mappedStore.error();
+        return 0;
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_merge_buffer_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        std::size_t size = 0;
+        if (!jsSizeToNative(byteCount, size) || size == 0) return 0.0;
+        g_mergeBuffer.resize(size);
+        return pointerToJsAddress(g_mergeBuffer.data());
+    } catch (...) {
+        g_error = "Parallel MIDI load could not obtain more memory from the browser/OS";
+        return 0.0;
+    }
+#else
+    (void)byteCount;
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_merge_part_js()
+{
+#if WASMIDI_PARSER_BPFA
+    const bool ok = g_mappedStore.mergePartial(g_mergeBuffer.data(), g_mergeBuffer.size());
+    std::vector<uint8_t>().swap(g_mergeBuffer);
+    if (!ok) g_error = g_mappedStore.error();
+    return ok ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_merge_finish_js()
+{
+#if WASMIDI_PARSER_BPFA
+    if (!g_mappedStore.finishMerge(g_document)) {
+        g_error = g_mappedStore.error();
+        g_document = wasmidi::MidiDocument{};
+        return 0;
+    }
+    std::vector<double>().swap(g_trackTable);
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 // CI probe for Memory64 heap growth, now that the BPFA store keeps the heap small
 // (HANDOFF sec. 49).
 #ifdef __EMSCRIPTEN__

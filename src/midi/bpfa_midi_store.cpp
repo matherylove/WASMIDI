@@ -265,6 +265,9 @@ void BpfaMidiStore::clear()
     sourceCache_.clear();
     sourceCacheAge_ = 0;
     ingest_.reset();
+    chunkBase_ = 0;
+    chunkKeys_.clear();
+    std::vector<uint8_t>().swap(partialBlob_);
     tracks_.clear();
     stateEvents_.clear();
     sysex_.clear();
@@ -325,7 +328,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             onDemandPageBytes_ = requestedPageBytes ? requestedPageBytes : 64u * 1024u;
             onDemandPages_ = requestedPageBytes && onDemandRequestPages_ ? onDemandRequestPages_ : 64u;
             sourceCache_.assign(onDemandPages_, CacheSlot{});
-        } else if (size <= rawSourceLimit_) {
+        } else if (size <= rawSourceLimit_ && !partialActive_) {
             fileBytes_.resize(static_cast<std::size_t>(size));
             for (uint64_t done = 0; done < size;) {
                 const std::size_t amount = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - done));
@@ -340,24 +343,36 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         } else {
             beginIngest(size, readAt, readUser, progress, progressUser);
         }
-        uint8_t header[14];
-        if (!copySource(0, header, sizeof(header)) || std::memcmp(header, "MThd", 4) != 0) {
-            error_ = "Missing MThd header";
-            return false;
-        }
-        const uint32_t headerSize = be32(header + 4);
-        if (headerSize < 6 || 8ull + headerSize > size) { error_ = "Invalid MIDI header"; return false; }
         MidiDocument out;
         out.remoteIndexed = true;
         out.minPitch = 127;
         out.maxPitch = 0;
-        out.format = be16(header + 8);
-        out.trackCount = be16(header + 10);
-        out.ticksPerBeat = be16(header + 12);
+        uint64_t position = 0;
+        uint16_t trackBegin = 0, trackEnd = 0;
+        if (partialActive_) {
+            out.format = partial_.format;
+            out.trackCount = partial_.trackCount;
+            out.ticksPerBeat = partial_.ticksPerBeat;
+            position = partial_.firstChunkPosition;
+            trackBegin = partial_.firstTrack;
+            trackEnd = partial_.endTrack;
+        } else {
+            uint8_t header[14];
+            if (!copySource(0, header, sizeof(header)) || std::memcmp(header, "MThd", 4) != 0) {
+                error_ = "Missing MThd header";
+                return false;
+            }
+            const uint32_t headerSize = be32(header + 4);
+            if (headerSize < 6 || 8ull + headerSize > size) { error_ = "Invalid MIDI header"; return false; }
+            out.format = be16(header + 8);
+            out.trackCount = be16(header + 10);
+            out.ticksPerBeat = be16(header + 12);
+            position = 8ull + headerSize;
+            trackEnd = out.trackCount;
+        }
         if (out.format > 1) { error_ = "Only MIDI Format 0 and 1 are supported"; return false; }
         if (out.ticksPerBeat == 0 || (out.ticksPerBeat & 0x8000)) { error_ = "SMPTE timing is not supported"; return false; }
 
-        uint64_t position = 8ull + headerSize;
         tracks_.resize(out.trackCount);
         firstNotes_.assign(out.trackCount, FirstNote{});
 
@@ -384,7 +399,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         uint32_t openFree = NoNode;
         std::array<uint32_t, 16u * 128u> openHead{}, openTail{};
         uint64_t snapshotNotesUsed = 0;
-        for (uint16_t t = 0; t < out.trackCount; ++t) {
+        const uint64_t snapshotBudget = partialActive_ ? partial_.snapshotBudget : SnapshotBudgetNotes;
+        for (uint16_t t = trackBegin; t < trackEnd; ++t) {
             {
                 // Chunk headers are read in file order so the single pass never jumps ahead.
                 uint8_t chunk[8];
@@ -489,7 +505,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 if ((events % CheckpointEventInterval) == 0)
                     storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
                 if ((events % SnapshotEventInterval) == 0 && openCount <= SnapshotMaxNotes &&
-                    snapshotNotesUsed + openCount <= SnapshotBudgetNotes) {
+                    snapshotNotesUsed + openCount <= snapshotBudget) {
                     snapshotNotesUsed += openCount;
                     VisualSnapshot snapshot;
                     snapshot.resume = {d.position, events, d.tick, d.runningStatus};
@@ -543,10 +559,10 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             if (error_.empty()) error_ = "Could not read MIDI source";
             return false;
         }
-        out.noteCount = totalNotes;
-        out.controlEventCount = totalControls;
-        buildTempoIndexLocal(out);
-        out.durationSeconds = static_cast<float>(out.tickToSeconds(out.maxTick));
+        if (partialActive_) {
+            exportPartial(out, notesPerTrack, totalControls);
+            return true;
+        }
 
 #if WASMIDI_BPFA_NOTE_STORE
         // BPFA note store: 8-byte records, patched in place at the note-off
@@ -606,24 +622,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         buildNoteBlocks();
 #endif
 
-        std::stable_sort(sysex_.begin(), sysex_.end(), [](const SysExRef& a, const SysExRef& b) {
-            if (a.tick != b.tick) return a.tick < b.tick;
-            if (a.track != b.track) return a.track < b.track;
-            return a.order < b.order;
-        });
-        std::stable_sort(stateEvents_.begin(), stateEvents_.end(),
-                         [](const SeekStateEvent& a, const SeekStateEvent& b) {
-            if (a.tick != b.tick) return a.tick < b.tick;
-            if (a.track != b.track) return a.track < b.track;
-            return a.order < b.order;
-        });
-
-
-        metadata_ = out;
-        buildColorTables();
-        visualCheckpointSpan_ = std::max<uint32_t>(1u, uint32_t((uint64_t(out.maxTick) + 127u) / 128u));
-        metadata = out;
-        valid_ = true;
+        finalizeIndex(out, totalNotes, totalControls, metadata);
         report(100, "BPFA MIDI ready");
         return true;
     } catch (const std::bad_alloc&) {
@@ -1421,8 +1420,14 @@ struct BpfaMidiStore::IngestState {
     MidiParseProgress progress = nullptr;
     void* progressUser = nullptr;
     std::vector<uint8_t> window;
+    std::vector<uint8_t> prevWindow;
     uint64_t rawBegin = 0;
     uint64_t frontier = 0;
+    uint64_t prevBegin = 0;
+    uint64_t prevEnd = 0;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    bool store = true;
     std::vector<UniqueBlock> unique;
     std::unordered_map<uint64_t, uint32_t> heads;
     std::size_t slabUsed = SourceSlabSize;
@@ -1457,6 +1462,18 @@ void BpfaMidiStore::beginIngest(uint64_t size, MidiReadAt readAt, void* readUser
     in.cctx = ZSTD_createCCtx();
     if (!decompressContext_) decompressContext_ = ZSTD_createDCtx();
     sourceCache_.assign(SourceCacheSlots, CacheSlot{});
+    in.end = size;
+    if (partialActive_) {
+        sourceBlockSize_ = partial_.blockSize;
+        const uint64_t b = sourceBlockSize_;
+        in.start = (partial_.rangeBegin / b) * b;
+        in.end = std::min<uint64_t>(size, ((partial_.rangeEnd + b - 1) / b) * b);
+        in.frontier = in.rawBegin = in.prevBegin = in.prevEnd = in.start;
+        in.store = partial_.compress;
+        chunkBase_ = in.start / b;
+        in.compressed.resize(ZSTD_compressBound(sourceBlockSize_));
+        in.candidate.resize(sourceBlockSize_);
+    }
 }
 
 bool BpfaMidiStore::ingestNextWindow()
@@ -1465,20 +1482,33 @@ bool BpfaMidiStore::ingestNextWindow()
     IngestState& in = *ingest_;
     const uint64_t size = sourceSize_;
     const uint64_t windowBegin = in.frontier;
-    if (windowBegin >= size) return false;
-    const std::size_t windowSize = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - windowBegin));
+    if (windowBegin >= in.end) return false;
+    const std::size_t windowSize = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, in.end - windowBegin));
+    if (!in.store) {
+        std::swap(in.window, in.prevWindow);
+        in.prevBegin = in.rawBegin;
+        in.prevEnd = in.frontier;
+        in.window.resize(ReadBlock);
+    }
     if (!in.readAt(in.readUser, windowBegin, in.window.data(), windowSize)) {
         error_ = "Could not read MIDI source";
         return false;
     }
-    if (windowBegin == 0) {
+    if (!in.store) {
+        in.rawBegin = windowBegin;
+        in.frontier = windowBegin + windowSize;
+        if (in.progress)
+            in.progress(in.progressUser, int(1 + 94.0 * double(in.frontier - in.start) / double(std::max<uint64_t>(1, in.end - in.start))),
+                        "BPFA: reading and scanning");
+        return true;
+    }
+    if (windowBegin == 0 && !partialActive_) {
         // Block size from the track count: every track cursor owns one decoded block,
         // so thousands of tracks need small blocks (HANDOFF sec. 56).
         uint16_t tracks = 1;
         if (windowSize >= 12 && std::memcmp(in.window.data(), "MThd", 4) == 0)
             tracks = std::max<uint16_t>(1, be16(in.window.data() + 10));
-        const std::size_t perCursor = (256u * 1024u * 1024u) / (3u * std::size_t(tracks));
-        while (sourceBlockSize_ > 8u * 1024u && sourceBlockSize_ > perCursor) sourceBlockSize_ >>= 1;
+        sourceBlockSize_ = blockSizeForTracks(tracks);
         sourceChunks_.reserve(static_cast<std::size_t>((size + sourceBlockSize_ - 1) / sourceBlockSize_));
     }
     const std::size_t blockSize = sourceBlockSize_;
@@ -1507,6 +1537,7 @@ bool BpfaMidiStore::ingestNextWindow()
         }
         for (; i < length; ++i) hash = (hash ^ block[i]) * 1099511628211ull;
         const uint64_t key = hash ^ (uint64_t(length) * 0x9e3779b97f4a7c15ull);
+        if (partialActive_) chunkKeys_.push_back(key);
         SourceChunk chunk{0, 0, uint32_t(length)};
         bool duplicate = false;
         auto head = in.heads.find(key);
@@ -1545,7 +1576,8 @@ bool BpfaMidiStore::ingestNextWindow()
     in.rawBegin = windowBegin;
     in.frontier = windowBegin + windowSize;
     if (in.progress)
-        in.progress(in.progressUser, int(1 + 94.0 * double(in.frontier) / double(size)),
+        in.progress(in.progressUser,
+                    int(1 + 94.0 * double(in.frontier - in.start) / double(std::max<uint64_t>(1, in.end - in.start))),
                     "BPFA: reading, compressing and scanning");
     return true;
 }
@@ -1554,12 +1586,12 @@ bool BpfaMidiStore::finishIngest()
 {
     if (!ingest_) return true;
     auto rest = [&]() -> bool {
-        if (ingest_->frontier >= sourceSize_) return true;
+        if (ingest_->frontier >= ingest_->end) return true;
         if (!ingestNextWindow()) { ingest_->frontier = ~uint64_t(0); return true; }
         return false;
     };
     runChunked(rest);
-    const bool ok = ingest_->frontier == sourceSize_;
+    const bool ok = ingest_->frontier == ingest_->end;
     ingest_.reset();
     sourceCache_.assign(SourceCacheSlots, CacheSlot{});
     return ok;
@@ -1586,7 +1618,7 @@ bool BpfaMidiStore::sourceSlotValid(uint16_t slot, uint64_t begin) const
     if (slot == 0xfffdu) return false;
     if (slot == 0xffffu || slot == 0xfffeu) return true;
     return slot < sourceCache_.size() &&
-        sourceCache_[slot].chunk == begin / (onDemand_ ? onDemandPageBytes_ : sourceBlockSize_);
+        sourceCache_[slot].chunk == begin / (onDemand_ ? onDemandPageBytes_ : sourceBlockSize_) - (onDemand_ ? 0 : chunkBase_);
 }
 
 bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uint8_t*& data, uint64_t& begin,
@@ -1630,7 +1662,7 @@ bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uin
     }
     if (ingest_) {
         BpfaMidiStore* self = const_cast<BpfaMidiStore*>(this);
-        while (position >= ingest_->frontier && ingest_->frontier < sourceSize_)
+        while (position >= ingest_->frontier && ingest_->frontier < ingest_->end)
             if (!self->ingestNextWindow()) return false;
         if (position >= ingest_->rawBegin && position < ingest_->frontier) {
             data = ingest_->window.data();
@@ -1639,13 +1671,23 @@ bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uin
             slotHint = 0xfffdu;
             return true;
         }
+        if (!ingest_->store) {
+            if (position < ingest_->prevBegin || position >= ingest_->prevEnd) return false;
+            data = ingest_->prevWindow.data();
+            begin = ingest_->prevBegin;
+            end = ingest_->prevEnd;
+            slotHint = 0xfffdu;
+            return true;
+        }
     }
-    const uint64_t chunkIndex = position / sourceBlockSize_;
+    const uint64_t globalChunk = position / sourceBlockSize_;
+    if (globalChunk < chunkBase_) return false;
+    const uint64_t chunkIndex = globalChunk - chunkBase_;
     if (chunkIndex >= sourceChunks_.size()) return false;
     const SourceChunk& chunk = sourceChunks_[chunkIndex];
     const uint8_t* stored = sourceSlabs_[chunk.physicalOffset / SourceSlabSize].get() +
         chunk.physicalOffset % SourceSlabSize;
-    begin = chunkIndex * sourceBlockSize_;
+    begin = globalChunk * sourceBlockSize_;
     end = begin + chunk.size;
     if (!(chunk.stored & SourceBlockCompressed)) {
         data = stored;
@@ -1684,6 +1726,408 @@ bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uin
     slotHint = uint16_t(selected);
     data = slot.bytes.data();
     return true;
+}
+
+uint32_t BpfaMidiStore::blockSizeForTracks(uint32_t trackCount)
+{
+    const std::size_t perCursor = (256u * 1024u * 1024u) / (3u * std::max<std::size_t>(1, trackCount));
+    uint32_t block = 64u * 1024u;
+    while (block > 8u * 1024u && block > perCursor) block >>= 1;
+    return block;
+}
+
+void BpfaMidiStore::finalizeIndex(MidiDocument& out, uint64_t totalNotes, uint64_t totalControls,
+                                  MidiDocument& metadata)
+{
+    out.noteCount = totalNotes;
+    out.controlEventCount = totalControls;
+    buildTempoIndexLocal(out);
+    out.durationSeconds = static_cast<float>(out.tickToSeconds(out.maxTick));
+    std::stable_sort(sysex_.begin(), sysex_.end(), [](const SysExRef& a, const SysExRef& b) {
+        if (a.tick != b.tick) return a.tick < b.tick;
+        if (a.track != b.track) return a.track < b.track;
+        return a.order < b.order;
+    });
+    std::stable_sort(stateEvents_.begin(), stateEvents_.end(),
+                     [](const SeekStateEvent& a, const SeekStateEvent& b) {
+        if (a.tick != b.tick) return a.tick < b.tick;
+        if (a.track != b.track) return a.track < b.track;
+        return a.order < b.order;
+    });
+    metadata_ = out;
+    buildColorTables();
+    visualCheckpointSpan_ = std::max<uint32_t>(1u, uint32_t((uint64_t(out.maxTick) + 127u) / 128u));
+    metadata = out;
+    valid_ = true;
+}
+
+namespace {
+struct BlobWriter {
+    std::vector<uint8_t>& out;
+    template <class T> void put(const T& v) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        out.insert(out.end(), p, p + sizeof(T));
+    }
+    void bytes(const void* p, std::size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        out.insert(out.end(), b, b + n);
+    }
+};
+struct BlobReader {
+    const uint8_t* p;
+    const uint8_t* end;
+    bool ok = true;
+    template <class T> T get() {
+        T v{};
+        if (std::size_t(end - p) < sizeof(T)) { ok = false; return v; }
+        std::memcpy(&v, p, sizeof(T));
+        p += sizeof(T);
+        return v;
+    }
+    const uint8_t* take(std::size_t n) {
+        if (std::size_t(end - p) < n) { ok = false; return nullptr; }
+        const uint8_t* r = p;
+        p += n;
+        return r;
+    }
+};
+constexpr uint32_t BlobMagic = 0x42504d57u;
+constexpr uint32_t BlobVersion = 1;
+}
+
+void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uint64_t>& notesPerTrack,
+                                  uint64_t totalControls)
+{
+    std::vector<uint8_t>& blob = partialBlob_;
+    blob.clear();
+    BlobWriter w{blob};
+    w.put(BlobMagic);
+    w.put(BlobVersion);
+    w.put(partial_.firstTrack);
+    w.put(partial_.endTrack);
+    w.put(uint32_t(sourceBlockSize_));
+    const uint64_t b = sourceBlockSize_;
+    const uint64_t ownedFirst = partial_.compress ? (partial_.rangeBegin + b - 1) / b : 0;
+    const uint64_t ownedEnd = partial_.compress ? (partial_.rangeEnd + b - 1) / b : 0;
+    w.put(ownedFirst);
+    w.put(ownedEnd - ownedFirst);
+    // Owned blocks: key, stored word, size, offset into the data area that follows.
+    std::unordered_map<uint64_t, uint64_t> dataOffsetOf;
+    uint64_t dataBytes = 0;
+    std::vector<uint64_t> offsets;
+    for (uint64_t g = ownedFirst; g < ownedEnd; ++g) {
+        const SourceChunk& c = sourceChunks_[g - chunkBase_];
+        auto it = dataOffsetOf.find(c.physicalOffset);
+        if (it == dataOffsetOf.end()) {
+            it = dataOffsetOf.emplace(c.physicalOffset, dataBytes).first;
+            dataBytes += c.stored & SourceBlockStoredSize;
+        }
+        offsets.push_back(it->second);
+        w.put(chunkKeys_[g - chunkBase_]);
+        w.put(c.stored);
+        w.put(c.size);
+        w.put(it->second);
+    }
+    w.put(dataBytes);
+    {
+        std::unordered_map<uint64_t, bool> done;
+        for (uint64_t g = ownedFirst; g < ownedEnd; ++g) {
+            const SourceChunk& c = sourceChunks_[g - chunkBase_];
+            if (!done.emplace(c.physicalOffset, true).second) continue;
+            w.bytes(sourceSlabs_[c.physicalOffset / SourceSlabSize].get() + c.physicalOffset % SourceSlabSize,
+                    c.stored & SourceBlockStoredSize);
+        }
+    }
+    for (uint16_t t = partial_.firstTrack; t < partial_.endTrack; ++t) {
+        const TrackStorage& tr = tracks_[t];
+        w.put(tr.byteBegin);
+        w.put(tr.byteEnd);
+        w.put(tr.maxTick);
+        w.put(out.activeChannelMasks[t]);
+        w.put(notesPerTrack[t]);
+        const FirstNote& f = firstNotes_[t];
+        w.put(f.seenMask);
+        w.bytes(f.tick.data(), sizeof(f.tick));
+        w.bytes(f.order.data(), sizeof(f.order));
+        w.bytes(f.closeOrder.data(), sizeof(f.closeOrder));
+        w.put(uint64_t(tr.checkpoints.size()));
+        w.bytes(tr.checkpoints.data(), tr.checkpoints.size() * sizeof(TrackCheckpoint));
+        w.put(uint64_t(tr.snapshots.size()));
+        for (const VisualSnapshot& v : tr.snapshots) {
+            w.put(v.resume);
+            w.put(uint64_t(v.notes.size()));
+            w.bytes(v.notes.data(), v.notes.size() * sizeof(SnapshotNote));
+        }
+    }
+    w.put(totalControls);
+    w.put(uint8_t(out.hasPitch ? 1 : 0));
+    w.put(out.minPitch);
+    w.put(out.maxPitch);
+    w.put(out.maxTick);
+    w.put(uint64_t(out.tempoMap.size() - 1));
+    for (std::size_t i = 1; i < out.tempoMap.size(); ++i) w.put(out.tempoMap[i]);
+    w.put(uint64_t(stateEvents_.size()));
+    w.bytes(stateEvents_.data(), stateEvents_.size() * sizeof(SeekStateEvent));
+    w.put(uint64_t(sysex_.size()));
+    for (const SysExRef& x : sysex_) {
+        w.put(x.tick);
+        w.put(x.track);
+        w.put(x.order);
+        w.put(uint64_t(x.data.size()));
+        w.bytes(x.data.data(), x.data.size());
+    }
+}
+
+bool BpfaMidiStore::indexPartial(uint64_t size, MidiReadAt readAt, void* readUser, const PartialPlan& plan,
+                                 MidiParseProgress progress, void* progressUser)
+{
+    partial_ = plan;
+    partialActive_ = true;
+    MidiDocument unused;
+    const bool ok = index(size, readAt, readUser, unused, progress, progressUser);
+    partialActive_ = false;
+    if (!ok) return false;
+    // Only the blob is needed now.
+    const std::vector<uint8_t> keep = std::move(partialBlob_);
+    clear();
+    partialBlob_ = std::move(keep);
+    return true;
+}
+
+bool BpfaMidiStore::beginMerge(uint64_t size, uint16_t format, uint16_t trackCount, uint16_t ticksPerBeat,
+                               uint32_t blockSize, bool compressed)
+{
+    clear();
+    try {
+        sourceSize_ = size;
+        sourceBlockSize_ = blockSize;
+        tracks_.resize(trackCount);
+        firstNotes_.assign(trackCount, FirstNote{});
+        mergeOut_ = MidiDocument{};
+        mergeOut_.remoteIndexed = true;
+        mergeOut_.minPitch = 127;
+        mergeOut_.maxPitch = 0;
+        mergeOut_.format = format;
+        mergeOut_.trackCount = trackCount;
+        mergeOut_.ticksPerBeat = ticksPerBeat;
+        mergeOut_.activeChannelMasks.assign(trackCount, 0);
+        mergeOut_.tempoMap.push_back({0, 500000});
+        mergeTotalNotes_ = mergeTotalControls_ = 0;
+        if (compressed) {
+            // The merge reuses the ingest dedup state; nothing is read here.
+            ingest_.reset(new IngestState);
+            ingest_->compressed.resize(ZSTD_compressBound(blockSize));
+            ingest_->candidate.resize(blockSize);
+            ingest_->frontier = ingest_->end = size;
+            if (!decompressContext_) decompressContext_ = ZSTD_createDCtx();
+            sourceChunks_.reserve(static_cast<std::size_t>((size + blockSize - 1) / blockSize));
+        }
+        merging_ = true;
+        return true;
+    } catch (...) {
+        clear();
+        error_ = "BPFA merge could not start";
+        return false;
+    }
+}
+
+bool BpfaMidiStore::mergeReadRaw(MidiReadAt readAt, void* readUser, MidiParseProgress progress, void* progressUser)
+{
+    try {
+        fileBytes_.resize(static_cast<std::size_t>(sourceSize_));
+        for (uint64_t done = 0; done < sourceSize_;) {
+            const std::size_t amount = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, sourceSize_ - done));
+            if (!readAt(readUser, done, fileBytes_.data() + done, amount)) {
+                error_ = "Could not read MIDI source";
+                return false;
+            }
+            done += amount;
+            if (progress)
+                progress(progressUser, int(1 + 39.0 * double(done) / double(sourceSize_)), "BPFA: reading source");
+        }
+        return true;
+    } catch (...) {
+        error_ = "BPFA MIDI store exhausted browser memory";
+        return false;
+    }
+}
+
+bool BpfaMidiStore::mergePartial(const uint8_t* data, std::size_t size)
+{
+    try {
+        BlobReader r{data, data + size};
+        if (r.get<uint32_t>() != BlobMagic || r.get<uint32_t>() != BlobVersion) { error_ = "Bad partial index"; return false; }
+        const uint16_t t0 = r.get<uint16_t>(), t1 = r.get<uint16_t>();
+        const uint32_t blockSize = r.get<uint32_t>();
+        const uint64_t ownedFirst = r.get<uint64_t>(), ownedCount = r.get<uint64_t>();
+        if (!r.ok || t1 > tracks_.size() || t0 > t1) { error_ = "Bad partial index"; return false; }
+        struct Owned { uint64_t key; uint32_t stored; uint32_t size; uint64_t offset; };
+        std::vector<Owned> owned(static_cast<std::size_t>(ownedCount));
+        for (Owned& o : owned) {
+            o.key = r.get<uint64_t>();
+            o.stored = r.get<uint32_t>();
+            o.size = r.get<uint32_t>();
+            o.offset = r.get<uint64_t>();
+        }
+        const uint64_t dataBytes = r.get<uint64_t>();
+        const uint8_t* area = r.take(static_cast<std::size_t>(dataBytes));
+        if (!r.ok) { error_ = "Bad partial index"; return false; }
+        if (ownedCount) {
+            if (!ingest_ || blockSize != sourceBlockSize_ || ownedFirst != sourceChunks_.size()) {
+                error_ = "Partial index blocks out of order";
+                return false;
+            }
+            // Same dedup as the single-threaded ingest: blocks in file order against
+            // every earlier distinct block, compared byte for byte.
+            constexpr uint32_t NoCollision = 0xffffffffu;
+            IngestState& in = *ingest_;
+            ZSTD_DCtx* dctx = static_cast<ZSTD_DCtx*>(decompressContext_);
+            std::vector<uint8_t> mine(blockSize);
+            for (const Owned& o : owned) {
+                const uint8_t* bytes = area + o.offset;
+                const uint32_t storedSize = o.stored & SourceBlockStoredSize;
+                SourceChunk chunk{0, 0, o.size};
+                bool duplicate = false;
+                bool mineReady = false;
+                auto head = in.heads.find(o.key);
+                if (head != in.heads.end()) {
+                    for (uint32_t u = head->second; u != NoCollision && !duplicate; u = in.unique[u].next) {
+                        const SourceChunk& other = sourceChunks_[in.unique[u].chunk];
+                        if (other.size != o.size) continue;
+                        if (!mineReady) {
+                            if (o.stored & SourceBlockCompressed) {
+                                const std::size_t n = ZSTD_decompressDCtx(dctx, mine.data(), o.size, bytes, storedSize);
+                                if (ZSTD_isError(n) || n != o.size) { error_ = "Bad partial block"; return false; }
+                            } else {
+                                std::memcpy(mine.data(), bytes, o.size);
+                            }
+                            mineReady = true;
+                        }
+                        const uint8_t* otherBytes = sourceSlabs_[other.physicalOffset / SourceSlabSize].get() +
+                            other.physicalOffset % SourceSlabSize;
+                        if (other.stored & SourceBlockCompressed) {
+                            const std::size_t n = ZSTD_decompressDCtx(dctx, in.candidate.data(), o.size, otherBytes,
+                                                                      other.stored & SourceBlockStoredSize);
+                            if (ZSTD_isError(n) || n != o.size) continue;
+                            otherBytes = in.candidate.data();
+                        }
+                        if (std::memcmp(otherBytes, mine.data(), o.size) == 0) {
+                            chunk.physicalOffset = other.physicalOffset;
+                            chunk.stored = other.stored;
+                            duplicate = true;
+                        }
+                    }
+                }
+                if (!duplicate) {
+                    if (in.slabUsed + storedSize > SourceSlabSize) {
+                        sourceSlabs_.emplace_back(new uint8_t[SourceSlabSize]);
+                        in.slabUsed = 0;
+                    }
+                    chunk.physicalOffset = uint64_t(sourceSlabs_.size() - 1) * SourceSlabSize + in.slabUsed;
+                    std::memcpy(sourceSlabs_.back().get() + in.slabUsed, bytes, storedSize);
+                    in.slabUsed += storedSize;
+                    storedSourceBytes_ += storedSize;
+                    chunk.stored = o.stored;
+                    const uint32_t index = uint32_t(in.unique.size());
+                    in.unique.push_back({uint32_t(sourceChunks_.size()), head == in.heads.end() ? NoCollision : head->second});
+                    if (head == in.heads.end()) in.heads.emplace(o.key, index);
+                    else head->second = index;
+                }
+                sourceChunks_.push_back(chunk);
+            }
+        }
+        for (uint16_t t = t0; t < t1; ++t) {
+            TrackStorage& tr = tracks_[t];
+            tr.byteBegin = r.get<uint64_t>();
+            tr.byteEnd = r.get<uint64_t>();
+            tr.maxTick = r.get<uint32_t>();
+            mergeOut_.activeChannelMasks[t] = r.get<uint32_t>();
+            mergeTotalNotes_ += r.get<uint64_t>();
+            FirstNote& f = firstNotes_[t];
+            f.seenMask = r.get<uint16_t>();
+            const uint8_t* p = r.take(sizeof(f.tick));
+            if (p) std::memcpy(f.tick.data(), p, sizeof(f.tick));
+            p = r.take(sizeof(f.order));
+            if (p) std::memcpy(f.order.data(), p, sizeof(f.order));
+            p = r.take(sizeof(f.closeOrder));
+            if (p) std::memcpy(f.closeOrder.data(), p, sizeof(f.closeOrder));
+            const uint64_t nc = r.get<uint64_t>();
+            p = r.take(static_cast<std::size_t>(nc * sizeof(TrackCheckpoint)));
+            if (!r.ok) break;
+            tr.checkpoints.resize(static_cast<std::size_t>(nc));
+            std::memcpy(tr.checkpoints.data(), p, static_cast<std::size_t>(nc * sizeof(TrackCheckpoint)));
+            const uint64_t ns = r.get<uint64_t>();
+            tr.snapshots.resize(static_cast<std::size_t>(ns));
+            for (VisualSnapshot& v : tr.snapshots) {
+                v.resume = r.get<TrackCheckpoint>();
+                const uint64_t n = r.get<uint64_t>();
+                p = r.take(static_cast<std::size_t>(n * sizeof(SnapshotNote)));
+                if (!r.ok) break;
+                v.notes.resize(static_cast<std::size_t>(n));
+                std::memcpy(v.notes.data(), p, static_cast<std::size_t>(n * sizeof(SnapshotNote)));
+            }
+            mergeOut_.maxTick = std::max(mergeOut_.maxTick, tr.maxTick);
+        }
+        mergeTotalControls_ += r.get<uint64_t>();
+        const bool hasPitch = r.get<uint8_t>() != 0;
+        const uint8_t minPitch = r.get<uint8_t>(), maxPitch = r.get<uint8_t>();
+        const uint32_t maxTick = r.get<uint32_t>();
+        if (hasPitch) {
+            mergeOut_.hasPitch = true;
+            mergeOut_.minPitch = std::min(mergeOut_.minPitch, minPitch);
+            mergeOut_.maxPitch = std::max(mergeOut_.maxPitch, maxPitch);
+        }
+        mergeOut_.maxTick = std::max(mergeOut_.maxTick, maxTick);
+        const uint64_t nt = r.get<uint64_t>();
+        for (uint64_t i = 0; i < nt && r.ok; ++i) mergeOut_.tempoMap.push_back(r.get<TempoChange>());
+        const uint64_t ne = r.get<uint64_t>();
+        const uint8_t* ep = r.take(static_cast<std::size_t>(ne * sizeof(SeekStateEvent)));
+        if (r.ok && ne) {
+            const std::size_t base = stateEvents_.size();
+            stateEvents_.resize(base + static_cast<std::size_t>(ne));
+            std::memcpy(stateEvents_.data() + base, ep, static_cast<std::size_t>(ne * sizeof(SeekStateEvent)));
+        }
+        const uint64_t nx = r.get<uint64_t>();
+        for (uint64_t i = 0; i < nx && r.ok; ++i) {
+            SysExRef x;
+            x.tick = r.get<uint32_t>();
+            x.track = r.get<uint16_t>();
+            x.order = r.get<uint64_t>();
+            const uint64_t n = r.get<uint64_t>();
+            const uint8_t* xp = r.take(static_cast<std::size_t>(n));
+            if (!r.ok) break;
+            x.data.assign(xp, xp + n);
+            sysex_.push_back(std::move(x));
+        }
+        if (!r.ok) { error_ = "Truncated partial index"; return false; }
+        return true;
+    } catch (...) {
+        error_ = "BPFA MIDI store exhausted browser memory";
+        return false;
+    }
+}
+
+bool BpfaMidiStore::finishMerge(MidiDocument& metadata)
+{
+    try {
+        if (!merging_) { error_ = "No merge in progress"; return false; }
+        if (ingest_) {
+            if (sourceChunks_.size() != (sourceSize_ + sourceBlockSize_ - 1) / sourceBlockSize_) {
+                error_ = "Parallel load left source blocks missing";
+                return false;
+            }
+            ingest_.reset();
+            sourceCache_.assign(SourceCacheSlots, CacheSlot{});
+        }
+        merging_ = false;
+        finalizeIndex(mergeOut_, mergeTotalNotes_, mergeTotalControls_, metadata);
+        mergeOut_ = MidiDocument{};
+        return true;
+    } catch (...) {
+        clear();
+        error_ = "BPFA MIDI store exhausted browser memory";
+        return false;
+    }
 }
 
 } // namespace wasmidi

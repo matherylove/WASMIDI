@@ -3868,4 +3868,60 @@ cuyo inicio cae en su rango) y devuelve un blob con bloques comprimidos + hashes
 contadores). El worker principal los incorpora en orden de pista y deduplica entre rangos
 con el mismo criterio que hoy, así el resultado coincide con la carga de un hilo.
 
-Última revisión entregada: `wasmidi-main-rev66-single-pass.zip`.
+Revisión anterior entregada: `wasmidi-main-rev66-single-pass.zip`.
+
+---
+
+## 60. Revisión 67 — carga en paralelo con Web Workers (paso 2 de 2)
+
+**Medición del usuario (rev. 66, PC 1, The Nuker 3):** 277,3 s en una sola etapa
+("reading, compressing and scanning"), contra 691,7 s de la rev. 64 (−60% entre §58 y
+§59).
+
+**Diseño:**
+
+1. El worker del parser lee la cabecera y la posición de cada `MTrk`
+   (`wmp_track_table_js`: lecturas de 8 bytes) y reparte las pistas en rangos contiguos
+   balanceados por bytes: `min(núcleos − 2, 12, pistas)` helpers. Sin al menos 2 rangos,
+   archivos < 128 MiB o < 4 núcleos, carga normal de un hilo.
+2. Cada helper (`web/midi-parser-helper.js`, mismo módulo wasm) recibe el `File` y su
+   plan, y corre `BpfaMidiStore::indexPartial`: la misma pasada única de §59 limitada a
+   su rango. Un bloque de fuente pertenece al helper cuyo rango contiene el inicio del
+   bloque; el helper lee hasta terminar el último bloque propio. En modo crudo los
+   helpers solo escanean (sin guardar bloques; conservan la ventana anterior para los
+   retrocesos de un byte) y el worker principal lee el archivo entero mientras tanto.
+3. El helper exporta un blob (`exportPartial`): bloques propios (hash, tamaño, palabra
+   de almacenamiento y bytes comprimidos), y por pista rango de bytes, `maxTick`, máscara
+   de canales, notas, primera nota, checkpoints y snapshots; además controles, alturas,
+   tempos, eventos de estado y SysEx. Presupuesto de snapshots proporcional a sus bytes.
+4. El worker principal fusiona los blobs **en orden de pista** (`mergePartial`):
+   deduplica cada bloque contra todos los anteriores con el mismo criterio que la carga
+   de un hilo (hash + comparación de bytes descomprimidos), copia los bytes comprimidos
+   sin recomprimir, y agrega tempos, estados y SysEx; `finishMerge` hace el mismo cierre
+   que `index()` (`finalizeIndex`, compartido).
+5. Si algo falla en cualquier helper: se terminan todos y se carga en un hilo.
+
+**Archivos:** `bpfa_midi_store.{hpp,cpp}` (`PartialPlan`, `indexPartial`,
+`exportPartial`, `beginMerge`, `mergeReadRaw`, `mergePartial`, `finishMerge`,
+`finalizeIndex`, `blockSizeForTracks`, base de bloques `chunkBase_`, ingesta acotada a
+un rango); `midi_worker_core.cpp` (exports `wmp_track_table_js`, `wmp_partial_*`,
+`wmp_merge_*`; agregados en CMake); `midi-parser-worker.js` (`parallelParse`, progreso
+ponderado por bytes con la etapa "BPFA: parallel load (N workers)"); CI copia el helper.
+
+**Verificación (host, `tools/feeder_check/bpfa_parallel_sim.hpp` simula la partición,
+los parciales y la fusión en un proceso):**
+
+- `check.sh`: 24 IDENTICAL, 0 DIFFER, incluidos synth, renderer, teclado y páginas con 3
+  helpers en modo crudo y zstd contra el parser original.
+- Hypernova con 6 helpers, crudo y zstd: synth, renderer y teclado con seeks idénticos.
+- Fuente comprimida idéntica en tamaño (68,21 MB) con 1, 4 y 8 helpers: la
+  deduplicación entre rangos equivale a la de un hilo.
+- Costo total de CPU de la división (simulada en serie): +15-25% sobre un hilo
+  (bloque de borde repetido, serialización, fusión). En paralelo el tiempo de pared
+  esperado es ~(un hilo / helpers) + fusión.
+
+**No verificable acá:** el arranque real de Workers y el wasm en cada helper, la memoria
+pico (cada helper tiene sus bloques comprimidos hasta que el principal los copia), y la
+ganancia. Medir con `parser-bench.html`.
+
+Última revisión entregada: `wasmidi-main-rev67-parallel-load.zip`.
