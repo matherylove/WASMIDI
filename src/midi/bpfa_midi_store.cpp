@@ -251,10 +251,6 @@ bool isResetSysEx(const std::vector<uint8_t>& bytes)
 
 } // namespace
 
-BpfaMidiStore::~BpfaMidiStore()
-{
-    if (decompressContext_) ZSTD_freeDCtx(static_cast<ZSTD_DCtx*>(decompressContext_));
-}
 
 void BpfaMidiStore::clear()
 {
@@ -268,6 +264,7 @@ void BpfaMidiStore::clear()
     sourceSize_ = 0;
     sourceCache_.clear();
     sourceCacheAge_ = 0;
+    ingest_.reset();
     tracks_.clear();
     stateEvents_.clear();
     sysex_.clear();
@@ -340,9 +337,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 if (progress)
                     progress(progressUser, int(1 + 39.0 * double(done) / double(size)), "BPFA: reading source");
             }
-        } else if (!ingestSource(size, readAt, readUser, progress, progressUser)) {
-            if (error_.empty()) error_ = "Could not read MIDI source";
-            return false;
+        } else {
+            beginIngest(size, readAt, readUser, progress, progressUser);
         }
         uint8_t header[14];
         if (!copySource(0, header, sizeof(header)) || std::memcmp(header, "MThd", 4) != 0) {
@@ -364,18 +360,6 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         uint64_t position = 8ull + headerSize;
         tracks_.resize(out.trackCount);
         firstNotes_.assign(out.trackCount, FirstNote{});
-        for (uint16_t t = 0; t < out.trackCount; ++t) {
-            uint8_t chunk[8];
-            if (size - position < 8 || !copySource(position, chunk, 8) || std::memcmp(chunk, "MTrk", 4) != 0) {
-                error_ = "Invalid or truncated MTrk chunk";
-                return false;
-            }
-            const uint32_t length = be32(chunk + 4);
-            if (uint64_t(length) > size - position - 8) { error_ = "Truncated MIDI track"; return false; }
-            tracks_[t].byteBegin = position + 8;
-            tracks_[t].byteEnd = position + 8 + length;
-            position += 8ull + length;
-        }
 
         if (onDemand_ && requestedPageBytes == 0) {
             const std::size_t budget = 64u * 1024u * 1024u;
@@ -401,6 +385,19 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         std::array<uint32_t, 16u * 128u> openHead{}, openTail{};
         uint64_t snapshotNotesUsed = 0;
         for (uint16_t t = 0; t < out.trackCount; ++t) {
+            {
+                // Chunk headers are read in file order so the single pass never jumps ahead.
+                uint8_t chunk[8];
+                if (size - position < 8 || !copySource(position, chunk, 8) || std::memcmp(chunk, "MTrk", 4) != 0) {
+                    error_ = "Invalid or truncated MTrk chunk";
+                    return false;
+                }
+                const uint32_t length = be32(chunk + 4);
+                if (uint64_t(length) > size - position - 8) { error_ = "Truncated MIDI track"; return false; }
+                tracks_[t].byteBegin = position + 8;
+                tracks_[t].byteEnd = position + 8 + length;
+                position += 8ull + length;
+            }
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
             uint64_t events = 0, order = 0;
@@ -539,7 +536,12 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             }
             storage.maxTick = finalTick;
             out.maxTick = std::max(out.maxTick, finalTick);
-            report(40 + int(30.0 * double(t + 1) / double(std::max<int>(1, out.trackCount))), "BPFA: track scan");
+            if (!ingest_)
+                report(40 + int(30.0 * double(t + 1) / double(std::max<int>(1, out.trackCount))), "BPFA: track scan");
+        }
+        if (!finishIngest()) {
+            if (error_.empty()) error_ = "Could not read MIDI source";
+            return false;
         }
         out.noteCount = totalNotes;
         out.controlEventCount = totalControls;
@@ -1412,116 +1414,155 @@ bool BpfaMidiStore::buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::v
     return true;
 }
 
-bool BpfaMidiStore::ingestSource(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
-                                 void* progressUser)
-{
+struct BpfaMidiStore::IngestState {
     struct UniqueBlock { uint32_t chunk; uint32_t next; };
-    constexpr uint32_t NoCollision = 0xffffffffu;
-    sourceSize_ = size;
-    // Block size from the track count, read from the header: every track cursor owns
-    // one decoded block, so thousands of tracks need small blocks (HANDOFF sec. 56).
-    sourceBlockSize_ = 64u * 1024u;
-    std::size_t SourceBlockSize = sourceBlockSize_;
-    sourceChunks_.clear();
+    MidiReadAt readAt = nullptr;
+    void* readUser = nullptr;
+    MidiParseProgress progress = nullptr;
+    void* progressUser = nullptr;
+    std::vector<uint8_t> window;
+    uint64_t rawBegin = 0;
+    uint64_t frontier = 0;
     std::vector<UniqueBlock> unique;
     std::unordered_map<uint64_t, uint32_t> heads;
     std::size_t slabUsed = SourceSlabSize;
+    std::vector<uint8_t> compressed;
+    std::vector<uint8_t> candidate;
+    ZSTD_CCtx* cctx = nullptr;
+    ~IngestState() { if (cctx) ZSTD_freeCCtx(cctx); }
+};
+
+BpfaMidiStore::BpfaMidiStore() = default;
+
+BpfaMidiStore::~BpfaMidiStore()
+{
+    if (decompressContext_) ZSTD_freeDCtx(static_cast<ZSTD_DCtx*>(decompressContext_));
+}
+
+void BpfaMidiStore::beginIngest(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
+                                void* progressUser)
+{
+    sourceSize_ = size;
+    sourceBlockSize_ = 64u * 1024u;
+    sourceChunks_.clear();
+    ingest_.reset(new IngestState);
+    IngestState& in = *ingest_;
+    in.readAt = readAt;
+    in.readUser = readUser;
+    in.progress = progress;
+    in.progressUser = progressUser;
+    in.window.resize(ReadBlock);
+    in.compressed.resize(ZSTD_compressBound(sourceBlockSize_));
+    in.candidate.resize(sourceBlockSize_);
+    in.cctx = ZSTD_createCCtx();
+    if (!decompressContext_) decompressContext_ = ZSTD_createDCtx();
+    sourceCache_.assign(SourceCacheSlots, CacheSlot{});
+}
+
+bool BpfaMidiStore::ingestNextWindow()
+{
+    constexpr uint32_t NoCollision = 0xffffffffu;
+    IngestState& in = *ingest_;
+    const uint64_t size = sourceSize_;
+    const uint64_t windowBegin = in.frontier;
+    if (windowBegin >= size) return false;
+    const std::size_t windowSize = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - windowBegin));
+    if (!in.readAt(in.readUser, windowBegin, in.window.data(), windowSize)) {
+        error_ = "Could not read MIDI source";
+        return false;
+    }
+    if (windowBegin == 0) {
+        // Block size from the track count: every track cursor owns one decoded block,
+        // so thousands of tracks need small blocks (HANDOFF sec. 56).
+        uint16_t tracks = 1;
+        if (windowSize >= 12 && std::memcmp(in.window.data(), "MThd", 4) == 0)
+            tracks = std::max<uint16_t>(1, be16(in.window.data() + 10));
+        const std::size_t perCursor = (256u * 1024u * 1024u) / (3u * std::size_t(tracks));
+        while (sourceBlockSize_ > 8u * 1024u && sourceBlockSize_ > perCursor) sourceBlockSize_ >>= 1;
+        sourceChunks_.reserve(static_cast<std::size_t>((size + sourceBlockSize_ - 1) / sourceBlockSize_));
+    }
+    const std::size_t blockSize = sourceBlockSize_;
     auto append = [&](const uint8_t* data, std::size_t length) -> uint64_t {
-        if (slabUsed + length > SourceSlabSize) {
+        if (in.slabUsed + length > SourceSlabSize) {
             sourceSlabs_.emplace_back(new uint8_t[SourceSlabSize]);
-            slabUsed = 0;
+            in.slabUsed = 0;
         }
-        const uint64_t offset = uint64_t(sourceSlabs_.size() - 1) * SourceSlabSize + slabUsed;
-        std::memcpy(sourceSlabs_.back().get() + slabUsed, data, length);
-        slabUsed += length;
+        const uint64_t offset = uint64_t(sourceSlabs_.size() - 1) * SourceSlabSize + in.slabUsed;
+        std::memcpy(sourceSlabs_.back().get() + in.slabUsed, data, length);
+        in.slabUsed += length;
         storedSourceBytes_ += length;
         return offset;
     };
-    auto stored = [&](const SourceChunk& chunk) {
-        return sourceSlabs_[chunk.physicalOffset / SourceSlabSize].get() + chunk.physicalOffset % SourceSlabSize;
-    };
-    std::vector<uint8_t> window(ReadBlock);
-    std::vector<uint8_t> compressed(ZSTD_compressBound(SourceBlockSize));
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
-    if (!decompressContext_) decompressContext_ = ZSTD_createDCtx();
     ZSTD_DCtx* dctx = static_cast<ZSTD_DCtx*>(decompressContext_);
-    struct FreeCctx { ZSTD_CCtx* c; ~FreeCctx() { ZSTD_freeCCtx(c); } } freeCctx{cctx};
-    std::vector<uint8_t> candidate(SourceBlockSize);
-    uint64_t windowBegin = 0;
-    bool ingestFailed = false;
-    auto ingestWindow = [&]() -> bool {
-        if (windowBegin >= size) return true;
-        const std::size_t windowSize = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - windowBegin));
-        if (!readAt(readUser, windowBegin, window.data(), windowSize)) {
-            error_ = "Could not read MIDI source";
-            ingestFailed = true;
-            return true;
+    for (std::size_t begin = 0; begin < windowSize; begin += blockSize) {
+        const std::size_t length = std::min(blockSize, windowSize - begin);
+        const uint8_t* block = in.window.data() + begin;
+        uint64_t hash = 1469598103934665603ull;
+        std::size_t i = 0;
+        for (; i + 8 <= length; i += 8) {
+            uint64_t word;
+            std::memcpy(&word, block + i, 8);
+            hash = (hash ^ word) * 1099511628211ull;
+            hash ^= hash >> 29;
         }
-        if (windowBegin == 0) {
-            uint16_t tracks = 1;
-            if (windowSize >= 12 && std::memcmp(window.data(), "MThd", 4) == 0)
-                tracks = std::max<uint16_t>(1, be16(window.data() + 10));
-            const std::size_t perCursor = (256u * 1024u * 1024u) / (3u * std::size_t(tracks));
-            while (sourceBlockSize_ > 8u * 1024u && sourceBlockSize_ > perCursor) sourceBlockSize_ >>= 1;
-            SourceBlockSize = sourceBlockSize_;
-            sourceChunks_.reserve(static_cast<std::size_t>((size + SourceBlockSize - 1) / SourceBlockSize));
-        }
-        for (std::size_t begin = 0; begin < windowSize; begin += SourceBlockSize) {
-            const std::size_t length = std::min(SourceBlockSize, windowSize - begin);
-            const uint8_t* block = window.data() + begin;
-            uint64_t hash = 1469598103934665603ull;
-            std::size_t i = 0;
-            for (; i + 8 <= length; i += 8) {
-                uint64_t word;
-                std::memcpy(&word, block + i, 8);
-                hash = (hash ^ word) * 1099511628211ull;
-                hash ^= hash >> 29;
-            }
-            for (; i < length; ++i) hash = (hash ^ block[i]) * 1099511628211ull;
-            const uint64_t key = hash ^ (uint64_t(length) * 0x9e3779b97f4a7c15ull);
-            SourceChunk chunk{0, 0, uint32_t(length)};
-            bool duplicate = false;
-            auto head = heads.find(key);
-            if (head != heads.end()) {
-                for (uint32_t u = head->second; u != NoCollision && !duplicate; u = unique[u].next) {
-                    const SourceChunk& other = sourceChunks_[unique[u].chunk];
-                    if (other.size != length) continue;
-                    const uint8_t* otherBytes = stored(other);
-                    if (other.stored & SourceBlockCompressed) {
-                        const std::size_t decoded = ZSTD_decompressDCtx(dctx, candidate.data(), length, otherBytes,
-                                                                        other.stored & SourceBlockStoredSize);
-                        if (ZSTD_isError(decoded) || decoded != length) continue;
-                        otherBytes = candidate.data();
-                    }
-                    if (std::memcmp(otherBytes, block, length) == 0) {
-                        chunk.physicalOffset = other.physicalOffset;
-                        chunk.stored = other.stored;
-                        duplicate = true;
-                    }
+        for (; i < length; ++i) hash = (hash ^ block[i]) * 1099511628211ull;
+        const uint64_t key = hash ^ (uint64_t(length) * 0x9e3779b97f4a7c15ull);
+        SourceChunk chunk{0, 0, uint32_t(length)};
+        bool duplicate = false;
+        auto head = in.heads.find(key);
+        if (head != in.heads.end()) {
+            for (uint32_t u = head->second; u != NoCollision && !duplicate; u = in.unique[u].next) {
+                const SourceChunk& other = sourceChunks_[in.unique[u].chunk];
+                if (other.size != length) continue;
+                const uint8_t* otherBytes = sourceSlabs_[other.physicalOffset / SourceSlabSize].get() +
+                    other.physicalOffset % SourceSlabSize;
+                if (other.stored & SourceBlockCompressed) {
+                    const std::size_t decoded = ZSTD_decompressDCtx(dctx, in.candidate.data(), length, otherBytes,
+                                                                    other.stored & SourceBlockStoredSize);
+                    if (ZSTD_isError(decoded) || decoded != length) continue;
+                    otherBytes = in.candidate.data();
+                }
+                if (std::memcmp(otherBytes, block, length) == 0) {
+                    chunk.physicalOffset = other.physicalOffset;
+                    chunk.stored = other.stored;
+                    duplicate = true;
                 }
             }
-            if (!duplicate) {
-                const std::size_t result = ZSTD_compressCCtx(cctx, compressed.data(), compressed.size(), block, length, 1);
-                const bool ok = !ZSTD_isError(result) && result < length;
-                chunk.physicalOffset = append(ok ? compressed.data() : block, ok ? result : length);
-                chunk.stored = uint32_t(ok ? result : length) | (ok ? SourceBlockCompressed : 0u);
-                const uint32_t index = uint32_t(unique.size());
-                unique.push_back({uint32_t(sourceChunks_.size()), head == heads.end() ? NoCollision : head->second});
-                if (head == heads.end()) heads.emplace(key, index);
-                else head->second = index;
-            }
-            sourceChunks_.push_back(chunk);
         }
-        if (progress)
-            progress(progressUser, int(1 + 39.0 * double(windowBegin + windowSize) / double(size)),
-                     "BPFA: compressing source");
-        windowBegin += ReadBlock;
+        if (!duplicate) {
+            const std::size_t result = ZSTD_compressCCtx(in.cctx, in.compressed.data(), in.compressed.size(),
+                                                         block, length, 1);
+            const bool ok = !ZSTD_isError(result) && result < length;
+            chunk.physicalOffset = append(ok ? in.compressed.data() : block, ok ? result : length);
+            chunk.stored = uint32_t(ok ? result : length) | (ok ? SourceBlockCompressed : 0u);
+            const uint32_t index = uint32_t(in.unique.size());
+            in.unique.push_back({uint32_t(sourceChunks_.size()), head == in.heads.end() ? NoCollision : head->second});
+            if (head == in.heads.end()) in.heads.emplace(key, index);
+            else head->second = index;
+        }
+        sourceChunks_.push_back(chunk);
+    }
+    in.rawBegin = windowBegin;
+    in.frontier = windowBegin + windowSize;
+    if (in.progress)
+        in.progress(in.progressUser, int(1 + 94.0 * double(in.frontier) / double(size)),
+                    "BPFA: reading, compressing and scanning");
+    return true;
+}
+
+bool BpfaMidiStore::finishIngest()
+{
+    if (!ingest_) return true;
+    auto rest = [&]() -> bool {
+        if (ingest_->frontier >= sourceSize_) return true;
+        if (!ingestNextWindow()) { ingest_->frontier = ~uint64_t(0); return true; }
         return false;
     };
-    runChunked(ingestWindow);
-    if (ingestFailed) return false;
+    runChunked(rest);
+    const bool ok = ingest_->frontier == sourceSize_;
+    ingest_.reset();
     sourceCache_.assign(SourceCacheSlots, CacheSlot{});
-    return true;
+    return ok;
 }
 
 bool BpfaMidiStore::copySource(uint64_t position, uint8_t* destination, std::size_t length) const
@@ -1542,6 +1583,7 @@ bool BpfaMidiStore::copySource(uint64_t position, uint8_t* destination, std::siz
 
 bool BpfaMidiStore::sourceSlotValid(uint16_t slot, uint64_t begin) const
 {
+    if (slot == 0xfffdu) return false;
     if (slot == 0xffffu || slot == 0xfffeu) return true;
     return slot < sourceCache_.size() &&
         sourceCache_[slot].chunk == begin / (onDemand_ ? onDemandPageBytes_ : sourceBlockSize_);
@@ -1585,6 +1627,18 @@ bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uin
         slotHint = uint16_t(selected);
         data = slot.bytes.data();
         return true;
+    }
+    if (ingest_) {
+        BpfaMidiStore* self = const_cast<BpfaMidiStore*>(this);
+        while (position >= ingest_->frontier && ingest_->frontier < sourceSize_)
+            if (!self->ingestNextWindow()) return false;
+        if (position >= ingest_->rawBegin && position < ingest_->frontier) {
+            data = ingest_->window.data();
+            begin = ingest_->rawBegin;
+            end = ingest_->frontier;
+            slotHint = 0xfffdu;
+            return true;
+        }
     }
     const uint64_t chunkIndex = position / sourceBlockSize_;
     if (chunkIndex >= sourceChunks_.size()) return false;

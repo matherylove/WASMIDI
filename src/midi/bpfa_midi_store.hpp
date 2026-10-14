@@ -41,7 +41,7 @@ public:
         uint16_t reserved;
     };
 
-    BpfaMidiStore() = default;
+    BpfaMidiStore();
     BpfaMidiStore(const BpfaMidiStore&) = delete;
     BpfaMidiStore& operator=(const BpfaMidiStore&) = delete;
 
@@ -165,8 +165,14 @@ private:
     void mergePop(MergeCursor& m);
     void buildNoteBlocks();
     void buildColorTables();
-    bool ingestSource(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
-                      void* progressUser);
+    // Single pass (HANDOFF sec. 59): the scan pulls bytes and each 8 MiB window is
+    // read, deduplicated and compressed the first time the scan reaches it.
+    struct IngestState;
+    void beginIngest(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
+                     void* progressUser);
+    bool ingestNextWindow();
+    bool finishIngest();
+    std::unique_ptr<IngestState> ingest_;
     bool copySource(uint64_t position, uint8_t* destination, std::size_t length) const;
     struct SourceChunk {
         uint64_t physicalOffset;

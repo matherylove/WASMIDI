@@ -3819,4 +3819,53 @@ seeks; zstd: synth).
 **Prueba pedida:** repetir `parser-bench.html` con The Nuker 3. Si el escaneo baja a
 ~2× del host (~150 s), la causa era esta.
 
-Última revisión entregada: `wasmidi-main-rev65-v8-tierup.zip`.
+Revisión anterior entregada: `wasmidi-main-rev65-v8-tierup.zip`.
+
+---
+
+## 59. Revisión 66 — una sola pasada en modo zstd (paso 1 de 2)
+
+**Medición del usuario (rev. 65, otra PC: 24 núcleos, `deviceMemory` 32, The Nuker 4,
+20.937 MB):** compresión 103,2 s (203 MB/s, igual que antes), escaneo 197,4 s
+(106 MB/s; la rev. 64 en la otra PC daba 26 MB/s) → total 301 s. El arreglo de Liftoff
+(§58) funcionó: el escaneo quedó ~2× del nativo, lo esperable. Nota: Chrome 155 informa
+`deviceMemory` 32, no está topado en 8 como se asumió en §54.
+
+**Pedido del usuario:** hacer las dos mejoras propuestas: una sola pasada y carga en
+paralelo con varios Web Workers. Esta revisión es la primera.
+
+**Cambio (`bpfa_midi_store.{hpp,cpp}`):** en modo zstd ya no se comprime todo el archivo
+y después se lo vuelve a descomprimir para escanearlo:
+
+- `beginIngest` prepara el estado (`IngestState`: ventana de 8 MiB, mapa de
+  deduplicación, contexto de compresión) sin leer nada.
+- `sourceBlock` ingiere ventanas a demanda: cuando el escaneo pide una posición más
+  allá de la frontera, `ingestNextWindow` lee la ventana, deduplica y comprime sus
+  bloques, y el escaneo lee **directo de la ventana cruda** (slot `0xfffd`, inválido
+  para cursores persistentes). Lo que queda detrás de la frontera (un evento que cruza el
+  borde, el running status que retrocede un byte) sale del bloque comprimido.
+- Las cabeceras `MTrk` se leen dentro del bucle de escaneo, en orden de archivo, para no
+  saltar adelante; `finishIngest` comprime lo que quede tras la última pista.
+- Progreso: una sola etapa "BPFA: reading, compressing and scanning" (por bytes).
+- Constructor y destructor fuera de línea (`IngestState` es un tipo incompleto en el
+  header).
+
+**Medición (host):** Hypernova en zstd sin cambio apreciable (~3,7-4,1 s en ambas
+versiones: con bloques de 64 KiB la descompresión era barata). Nuker 3: 123 s contra
+129 s, pero en host la descompresión del 7z en Python comparte el único núcleo, así que
+la medición no es limpia. Lo que se elimina es descomprimir todo el archivo durante el
+escaneo: para Nuker con bloques de 8 KiB son ~16 s nativos, más en wasm. Estimación
+para el navegador: −10-20%. La ganancia grande la tiene que dar el paralelismo.
+
+**Verificación:** `check.sh` 16/16 IDENTICAL; Hypernova en zstd (synth, teclado con
+seeks) idénticos.
+
+**Paso 2 (siguiente): carga en paralelo.** Diseño: el worker del parser lee las
+cabeceras de pista, reparte pistas contiguas (balanceadas por bytes) entre N workers
+auxiliares con el mismo módulo wasm; cada uno ingiere y escanea su rango (los bloques
+cuyo inicio cae en su rango) y devuelve un blob con bloques comprimidos + hashes e
+índice por pista (checkpoints, snapshots, primeras notas, tempos, selectores, SysEx,
+contadores). El worker principal los incorpora en orden de pista y deduplica entre rangos
+con el mismo criterio que hoy, así el resultado coincide con la carga de un hilo.
+
+Última revisión entregada: `wasmidi-main-rev66-single-pass.zip`.
