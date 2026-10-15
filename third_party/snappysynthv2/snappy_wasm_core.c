@@ -212,6 +212,141 @@ static inline int64_t ssw_seconds_to_frame(double seconds) {
 #endif
 }
 
+/* ---- rev. 68 (HANDOFF sec. 61) ------------------------------------------
+ * Block admission (Kestrel): when a block brings more note-ons than
+ * max_voices * percent / 100, only the loudest (velocity, then stack count) are
+ * dispatched. The note-off that pairs with a dropped note-on (FIFO per channel
+ * and key, as the engine pairs them) is dropped too, so nothing hangs. */
+static int g_admission_percent = 25;
+static uint32_t g_admission_dropped = 0;
+typedef struct { uint32_t count; uint8_t kept; } ssw_note_run;
+typedef struct { ssw_note_run* runs; uint32_t head, size, cap; } ssw_note_fifo;
+static ssw_note_fifo g_note_fifo[16 * 128];
+
+static void ssw_note_fifo_clear_all(void) {
+    for (int i = 0; i < 16 * 128; ++i) { g_note_fifo[i].head = 0; g_note_fifo[i].size = 0; }
+}
+
+static void ssw_note_fifo_push(int key, int kept) {
+    ssw_note_fifo* f = &g_note_fifo[key];
+    if (f->size) {
+        ssw_note_run* last = &f->runs[(f->head + f->size - 1) % f->cap];
+        if (last->kept == (uint8_t)kept && last->count < 0xffffffffu) { ++last->count; return; }
+    }
+    if (f->size == f->cap) {
+        const uint32_t cap = f->cap ? f->cap * 2 : 4;
+        ssw_note_run* runs = (ssw_note_run*)malloc(sizeof(ssw_note_run) * cap);
+        if (!runs) return;
+        for (uint32_t i = 0; i < f->size; ++i) runs[i] = f->runs[(f->head + i) % f->cap];
+        free(f->runs);
+        f->runs = runs;
+        f->cap = cap;
+        f->head = 0;
+    }
+    f->runs[(f->head + f->size) % f->cap] = (ssw_note_run){1u, (uint8_t)kept};
+    ++f->size;
+}
+
+static int ssw_note_fifo_pop(int key) {
+    ssw_note_fifo* f = &g_note_fifo[key];
+    if (!f->size) return 1;
+    ssw_note_run* first = &f->runs[f->head];
+    const int kept = first->kept;
+    if (--first->count == 0) { f->head = (f->head + 1) % f->cap; --f->size; }
+    return kept;
+}
+
+void ssw_set_admission_percent(int percent) { g_admission_percent = percent < 0 ? 0 : percent; }
+int ssw_admission_dropped(void) { return (int)g_admission_dropped; }
+void ssw_set_steal_cap_percent(int percent) { voice_set_steal_cap_percent(percent); }
+/* Deterministic mode (HANDOFF sec. 62): one render call per block (no time-driven
+ * splits), render-time limiter off, render queue sorted by voice age. With
+ * "single" sharding the mix does not depend on worker count or timing. */
+static int g_ssw_deterministic = 0;
+void ssw_set_deterministic(int enabled) {
+    g_ssw_deterministic = enabled ? 1 : 0;
+    voice_set_deterministic(g_ssw_deterministic);
+}
+
+/* Output stage (Kestrel): 15 Hz DC blocker, then a 2 ms lookahead brickwall
+ * limiter at -0.3 dBFS, then a final clamp. Used instead of the soft clip curve
+ * when "soft clip" is enabled. */
+#define SSW_LIMIT_MAX_LOOKAHEAD 512
+static struct {
+    int ready, sample_rate, channels, lookahead;
+    double dc_b0, dc_b1, dc_b2, dc_a1, dc_a2;
+    double dc_x1[2], dc_x2[2], dc_y1[2], dc_y2[2];
+    float delay[SSW_LIMIT_MAX_LOOKAHEAD * 2];
+    float need[SSW_LIMIT_MAX_LOOKAHEAD];
+    int pos;
+    float gain, attack, release, ceiling;
+} g_outstage;
+
+static void ssw_output_stage_reset(void) {
+    memset(&g_outstage, 0, sizeof(g_outstage));
+}
+
+static void ssw_output_stage_setup(int sample_rate, int channels) {
+    ssw_output_stage_reset();
+    g_outstage.sample_rate = sample_rate;
+    g_outstage.channels = channels > 2 ? 2 : channels;
+    g_outstage.lookahead = (int)(sample_rate * 0.002);
+    if (g_outstage.lookahead < 1) g_outstage.lookahead = 1;
+    if (g_outstage.lookahead > SSW_LIMIT_MAX_LOOKAHEAD) g_outstage.lookahead = SSW_LIMIT_MAX_LOOKAHEAD;
+    {
+        /* 2nd-order Butterworth high-pass at 15 Hz (bilinear transform). */
+        const double fc = 15.0, q = 0.70710678118654752;
+        const double w0 = 2.0 * 3.14159265358979323846 * fc / (double)sample_rate;
+        const double cw = cos(w0), alpha = sin(w0) / (2.0 * q), a0 = 1.0 + alpha;
+        g_outstage.dc_b0 = (1.0 + cw) / 2.0 / a0;
+        g_outstage.dc_b1 = -(1.0 + cw) / a0;
+        g_outstage.dc_b2 = (1.0 + cw) / 2.0 / a0;
+        g_outstage.dc_a1 = -2.0 * cw / a0;
+        g_outstage.dc_a2 = (1.0 - alpha) / a0;
+    }
+    for (int i = 0; i < g_outstage.lookahead; ++i) g_outstage.need[i] = 1.0f;
+    g_outstage.gain = 1.0f;
+    g_outstage.ceiling = 0.966f;
+    g_outstage.attack = (float)(1.0 - exp(-5.0 / (double)g_outstage.lookahead));
+    g_outstage.release = (float)(1.0 - exp(-1.0 / (0.080 * (double)sample_rate)));
+    g_outstage.ready = 1;
+}
+
+static void ssw_output_stage(float* buffer, int frames) {
+    if (!g_outstage.ready || g_outstage.channels < 1) return;
+    const int ch = g_outstage.channels, la = g_outstage.lookahead;
+    for (int n = 0; n < frames; ++n) {
+        float* frame = buffer + (size_t)n * (size_t)ch;
+        float peak = 0.0f;
+        for (int c = 0; c < ch; ++c) {
+            const double x = frame[c];
+            const double y = g_outstage.dc_b0 * x + g_outstage.dc_b1 * g_outstage.dc_x1[c] + g_outstage.dc_b2 * g_outstage.dc_x2[c] -
+                             g_outstage.dc_a1 * g_outstage.dc_y1[c] - g_outstage.dc_a2 * g_outstage.dc_y2[c];
+            g_outstage.dc_x2[c] = g_outstage.dc_x1[c]; g_outstage.dc_x1[c] = x;
+            g_outstage.dc_y2[c] = g_outstage.dc_y1[c]; g_outstage.dc_y1[c] = y;
+            const float v = (float)y;
+            const float a = v < 0.0f ? -v : v;
+            if (a > peak) peak = a;
+            /* swap the incoming sample with the one leaving the lookahead line */
+            const float out = g_outstage.delay[g_outstage.pos * 2 + c];
+            g_outstage.delay[g_outstage.pos * 2 + c] = v;
+            frame[c] = out;
+        }
+        g_outstage.need[g_outstage.pos] = peak > g_outstage.ceiling ? g_outstage.ceiling / peak : 1.0f;
+        float target = 1.0f;
+        for (int i = 0; i < la; ++i) if (g_outstage.need[i] < target) target = g_outstage.need[i];
+        g_outstage.gain += (target - g_outstage.gain) * (target < g_outstage.gain ? g_outstage.attack : g_outstage.release);
+        if (g_outstage.gain > 1.0f) g_outstage.gain = 1.0f;
+        for (int c = 0; c < ch; ++c) {
+            float y = frame[c] * g_outstage.gain;
+            if (y > g_outstage.ceiling) y = g_outstage.ceiling;
+            if (y < -g_outstage.ceiling) y = -g_outstage.ceiling;
+            frame[c] = y;
+        }
+        if (++g_outstage.pos >= la) g_outstage.pos = 0;
+    }
+}
+
 void ssw_clear_events(void) {
     ssw_event_block* block = g_event_head;
     while (block) {
@@ -283,7 +418,7 @@ int ssw_queue_events(const uint32_t* messages, const double* times, int count) {
 
 /* Source-exposed runtime/performance settings. */
 static int g_requested_workers = 0;       /* 0 = original auto policy */
-static int g_note_sharding = 0;           /* 0 auto, 1 channel, 2 hash */
+static int g_note_sharding = 0;           /* 0 auto, 1 channel, 2 hash, 3 single */
 static int g_steal_score_cache = 1;       /* SS_STEAL_SCORE_CACHE default */
 static int g_fast_note_off = 1;           /* SS_FAST_NOTE_OFF default */
 static int g_validate_state = 0;           /* SS_VALIDATE_STATE default off */
@@ -305,6 +440,7 @@ static void ssw_apply_source_runtime_options(void) {
 
     if (g_note_sharding == 1) setenv("SS_NOTE_SHARDING", "channel", 1);
     else if (g_note_sharding == 2) setenv("SS_NOTE_SHARDING", "hash", 1);
+    else if (g_note_sharding == 3) setenv("SS_NOTE_SHARDING", "single", 1);
     else unsetenv("SS_NOTE_SHARDING");
 
     setenv("SS_STEAL_SCORE_CACHE", g_steal_score_cache ? "1" : "0", 1);
@@ -779,7 +915,7 @@ int ssw_init_ex(int sample_rate,
         workers > 0 ? workers : 0;
 
     g_note_sharding =
-        note_sharding >= 1 && note_sharding <= 2
+        note_sharding >= 1 && note_sharding <= 3
             ? note_sharding
             : 0;
 
@@ -806,8 +942,7 @@ int ssw_init_ex(int sample_rate,
         g_max_voices,
         &g_cfg);
 
-    voice_set_output_soft_clip_enabled(
-        g_soft_clip);
+    voice_set_output_soft_clip_enabled(0);
 
     gs_reset_part_map(0);
 
@@ -830,6 +965,7 @@ int ssw_init_ex(int sample_rate,
     g_render_load_ema = -1.0;
     ssw_clear_events();
     g_ready = 1;
+    ssw_output_stage_setup(g_cfg.sample_rate, g_cfg.num_channels);
     return 1;
 }
 
@@ -993,7 +1129,7 @@ void ssw_set_vor_mode(int mode) { voice_set_vor_volume_mode(mode ? 1 : 0); }
 void ssw_set_soft_clip(int enabled) {
     g_soft_clip = enabled ? 1 : 0;
     if (g_ready)
-        voice_set_output_soft_clip_enabled(g_soft_clip);
+        voice_set_output_soft_clip_enabled(0);
 }
 
 void ssw_reset(void) {
@@ -1008,6 +1144,8 @@ void ssw_reset(void) {
     g_render_budget = 1;
     g_render_load_ema = -1.0;
     ssw_clear_events();
+    ssw_note_fifo_clear_all();
+    if (g_outstage.ready) ssw_output_stage_setup(g_outstage.sample_rate, g_outstage.channels);
 }
 
 void ssw_send_sysex(const uint8_t* data, int length, uint32_t offset) {
@@ -1037,6 +1175,7 @@ static int ssw_render_to_buffer(float* out_buffer,
      * like the native engine. Clearing here as well only doubles memory
      * bandwidth on every device block. */
     voice_render_float(out_buffer, frames);
+    if (g_soft_clip) ssw_output_stage(out_buffer, frames);
     g_render_cursor += frames;
     return 1;
 }
@@ -1315,6 +1454,40 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
     g_dispatch_accum_us = 0.0;
     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
 
+    /* Block admission (rev. 68): velocity threshold so at most `admit` note-ons
+     * of this block are dispatched. */
+    int admit_threshold = -1, admit_quota = 0;
+    if (g_admission_percent > 0) {
+        const long admit = (long)g_max_voices * g_admission_percent / 100 > 0
+            ? (long)g_max_voices * g_admission_percent / 100 : 1;
+        uint32_t histogram[128];
+        long note_ons = 0;
+        memset(histogram, 0, sizeof(histogram));
+        for (ssw_event_block* b = g_event_head; b; b = b->next) {
+            int stop = 0;
+            for (size_t i = b->index; i < b->count; ++i) {
+                const ssw_scheduled_event* ev = &b->events[i];
+                if (ev->sample_frame >= block_end_frame) { stop = 1; break; }
+                if ((ev->message & 0xf0u) == 0x90u && ((ev->message >> 16) & 0x7fu)) {
+                    ++histogram[(ev->message >> 16) & 0x7fu];
+                    ++note_ons;
+                }
+            }
+            if (stop) break;
+        }
+        if (note_ons > admit) {
+            long above = 0;
+            for (int v = 127; v >= 0; --v) {
+                if (above + (long)histogram[v] > admit) {
+                    admit_threshold = v;
+                    admit_quota = (int)(admit - above);
+                    break;
+                }
+                above += histogram[v];
+            }
+        }
+    }
+
     while (g_event_head) {
         ssw_event_block* block = g_event_head;
         while (block->index < block->count) {
@@ -1369,6 +1542,22 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
                 }
 
+                if (command == 0x90u || command == 0x80u) {
+                    const int key = (ch << 7) | (int)((event->message >> 8) & 0x7fu);
+                    const int velocity = (int)((event->message >> 16) & 0x7fu);
+                    if (command == 0x90u && velocity) {
+                        int kept = 1;
+                        if (admit_threshold >= 0) {
+                            if (velocity < admit_threshold) kept = 0;
+                            else if (velocity == admit_threshold) kept = admit_quota-- > 0;
+                        }
+                        ssw_note_fifo_push(key, kept);
+                        if (!kept) { ++g_admission_dropped; ++block->index; continue; }
+                    } else if (!ssw_note_fifo_pop(key)) {
+                        ++block->index;
+                        continue;
+                    }
+                }
                 {
 #if SSW_COLLAPSE_CONTROLLER_BURSTS
                     /* Skip a controller value that a later one in this same run
@@ -1404,6 +1593,7 @@ events_done:
             remaining);
         g_render_cursor += remaining;
     }
+    if (g_soft_clip) ssw_output_stage((float*)out_ptr, frames);
     g_song_frame = block_end_frame;
     g_song_time_seconds =
         (double)g_song_frame /
@@ -1413,8 +1603,9 @@ events_done:
         const double elapsed_ms = ssw_now_ms() - started_ms;
         g_last_render_us = elapsed_ms * 1000.0;
         g_last_dispatch_us = g_dispatch_accum_us;
-        ssw_update_render_budget(elapsed_ms, frames);
-        if (g_render_limit_percent > 0 && frames > 0) {
+        if (g_ssw_deterministic) g_render_budget = 1;
+        else ssw_update_render_budget(elapsed_ms, frames);
+        if (g_render_limit_percent > 0 && frames > 0 && !g_ssw_deterministic) {
             /* Over the limit, the workers that set the block time cap how many
                note-ons each (channel, key) may start per cycle: spam keys shed
                notes, sparse keys (melody) never do (HANDOFF sec. 41). */

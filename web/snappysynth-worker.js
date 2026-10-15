@@ -25,7 +25,7 @@ let realtimePriority = 1;
 
 let requestedWorkers = 0;
 let debugMetrics = false;     // 0 = original automatic policy
-let noteSharding = 0;         // 0 auto, 1 channel, 2 hash
+let noteSharding = 0;         // 0 auto, 1 channel, 2 hash, 3 single
 let stealScoreCache = true;   // source default ON
 let fastNoteOff = true;       // source default ON
 let validateState = false;    // source default OFF
@@ -1476,7 +1476,7 @@ onmessage = async event => {
                 Math.max(
                     0,
                     Math.min(
-                        2,
+                        3,
                         Number(data.noteSharding) |
                         0));
 

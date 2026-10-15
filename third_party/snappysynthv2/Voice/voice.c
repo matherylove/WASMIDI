@@ -438,6 +438,9 @@ static float *g_final_mix = NULL; // temp float buffer
 static int    g_final_cap = 0;
 static float  g_global_mix_gain = 1.0f;
 static volatile LONG g_output_soft_clip_enabled = 1;
+static volatile LONG g_steal_cap_percent = 25;
+static int g_event_worker_count = 1; /* workers that process events: 1 in "single" sharding */
+void voice_set_steal_cap_percent(int percent) { InterlockedExchange(&g_steal_cap_percent, percent < 0 ? 0 : percent); }
 
 // Workers
 static int          g_worker_count = 0;
@@ -464,6 +467,15 @@ static HANDLE       g_render_consumers_ready = NULL;
 #endif
 // Global render task queue for intra-block work-stealing
 static int *g_render_queue = NULL;
+/* rev. 69 (HANDOFF sec. 62): fixed 256-voice render tiles, each with its own mix
+ * buffer, summed in tile order; queue built in worker order (sorted by voice age in
+ * deterministic mode), so thread timing never changes the mix order. */
+#define RENDER_TILE_VOICES 256
+static float *g_tile_mix = NULL;
+static int    g_tile_mix_tiles = 0;
+static int    g_tile_mix_frames = 0;
+static volatile LONG g_deterministic = 0;
+void voice_set_deterministic(int enabled) { InterlockedExchange(&g_deterministic, enabled ? 1 : 0); }
 static int  g_render_queue_cap = 0;
 static volatile LONG g_render_size = 0;
 static volatile LONG g_render_pop = 0;
@@ -3984,6 +3996,30 @@ static DWORD wait_for_worker_cycle(LONG render_cycle, DWORD timeout_ms) {
 #if SSW_WORKER_CYCLE_TRAMPOLINE && (defined(__GNUC__) || defined(__clang__))
 __attribute__((noinline))
 #endif
+static int voice_age_less(const void *a, const void *b) {
+    const int va = *(const int*)a, vb = *(const int*)b;
+    if (va < 0 || vb < 0) return (va < 0) - (vb < 0);
+    const uint32_t aa = voices[va].voice_age, ab = voices[vb].voice_age;
+    return aa < ab ? -1 : aa > ab ? 1 : (va < vb ? -1 : va > vb);
+}
+
+/* Run by the last producer only: every worker's event phase has finished. */
+static void build_render_queue_ordered(void) {
+    LONG n = 0;
+    for (int w = 0; w < g_worker_count; ++w) {
+        worker_data *wd = &g_workers[w];
+        const int filter = g_validate_state || wd->release_count != 0;
+        for (int i = 0; i < wd->active_count && n < g_render_queue_cap; ++i) {
+            const int vid = wd->active[i];
+            g_render_queue[n++] = (filter && (vid < 0 || vid >= max_voices || voices[vid].env_state == ENV_OFF))
+                ? -1 : vid;
+        }
+    }
+    if (load_relaxed_long(&g_deterministic) && n > 1)
+        qsort(g_render_queue, (size_t)n, sizeof(int), voice_age_less);
+    g_render_size = n;
+}
+
 static int worker_cycle(int widx, worker_data *wd) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
 const int ss_profile = debug_metrics_on();
@@ -3997,6 +4033,14 @@ const int admit_key_cap = widx < SSW_ADMIT_MAX_WORKERS ? (int)load_relaxed_long(
 static __thread uint16_t admit_key_count[MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT];
 memset(admit_key_count, 0, sizeof(admit_key_count));
 int admit_key_max = 0;
+/* rev. 68 (HANDOFF sec. 61): at most steal_cap_percent of the pool is replaced
+ * per cycle; past that the incoming note is dropped instead of cutting a voice. */
+int steals_this_cycle = 0;
+const int steal_cap_percent = (int)load_relaxed_long(&g_steal_cap_percent);
+int steal_cap = steal_cap_percent > 0
+    ? (max_voices * steal_cap_percent / 100) / (g_event_worker_count > 0 ? g_event_worker_count : 1)
+    : 0;
+if (steal_cap_percent > 0 && steal_cap < 1) steal_cap = 1;
 LARGE_INTEGER admit_work_t0;
 QueryPerformanceCounter(&admit_work_t0);
 LARGE_INTEGER ss_cycle_begin;
@@ -4220,9 +4264,9 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
                                                                                                                                                                                                                                                                 e.ch, e.key, e.value, layer_index, vid);
                                                                                                                                                                                                                                                                 #endif
 
-                                                                                                                                                                                                                                                                if (vid < 0) {
+                                                                                                                                                                                                                                                                if (vid < 0 && (steal_cap <= 0 || steals_this_cycle < steal_cap)) {
 vid = steal_voice_fast(wd, e.ch, widx, incoming_loudness, original_volume_unit, e.key);
-                                                                                                                                                                                                                                                                if (vid >= 0) stolen = true;
+                                                                                                                                                                                                                                                                if (vid >= 0) { stolen = true; ++steals_this_cycle; }
                                                                                                                                                                                                                                                                 }
 if (ss_profile && vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
@@ -4714,6 +4758,7 @@ if (widx < SSW_ADMIT_MAX_WORKERS) {
 }
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
+                                                                                                                                                                                                                                                                build_render_queue_ordered();
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();
                                                                                                                                                                                                                                                                 SetEvent(g_render_producers_ready);
                                                                                                                                                                                                                                                                 }
@@ -4724,42 +4769,11 @@ if (widx < SSW_ADMIT_MAX_WORKERS) {
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 // zero buffer
                                                                                                                                                                                                                                                                 if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 1;
-                                                                                                                                                                                                                                                                memset(mix, 0, sizeof(float)*frames*channels);
-
+                                                                                                                                                                                                                                                                
                                                                                                                                                                                                                                                                 validate_worker_state("post_events", widx, wd);
 
-                                                                                                                                                                                                                                                                // Producer phase: reserve a contiguous slice and fill (1 atomic per worker)
-                                                                                                                                                                                                                                                                // Reserve a contiguous slice atomically. If we cannot write all reserved
-                                                                                                                                                                                                                                                                // entries due to queue capacity, we reduce g_render_size by the unused amount
-                                                                                                                                                                                                                                                                // to keep the producers/consumers consistent and avoid out-of-bounds reads.
-                                                                                                                                                                                                                                                                LONG wanted = (LONG)wd->active_count;
-                                                                                                                                                                                                                                                                LONG base = InterlockedAdd(&g_render_size, wanted) - wanted;
-                                                                                                                                                                                                                                                                int to_copy = wd->active_count;
-                                                                                                                                                                                                                                                                if (base < 0) base = 0;
-                                                                                                                                                                                                                                                                if (base + to_copy > g_render_queue_cap) {
-                                                                                                                                                                                                                                                                // compute how many we can actually write
-                                                                                                                                                                                                                                                                int allowed = (int)(g_render_queue_cap - base);
-                                                                                                                                                                                                                                                                if (allowed < 0) allowed = 0;
-                                                                                                                                                                                                                                                                // decrement the unused reservation so g_render_size matches actual written
-                                                                                                                                                                                                                                                                LONG unused = wanted - (LONG)allowed;
-                                                                                                                                                                                                                                                                if (unused > 0) InterlockedAdd(&g_render_size, -unused);
-                                                                                                                                                                                                                                                                to_copy = allowed;
-                                                                                                                                                                                                                                                                }
-
-                                                                                                                                                                                                                                                                if (!g_validate_state && wd->release_count == 0) {
-                                                                                                                                                                                                                                                                memcpy(g_render_queue + base, wd->active, sizeof(int) * (size_t)to_copy);
-                                                                                                                                                                                                                                                                } else {
-                                                                                                                                                                                                                                                                for (int i=0; i<to_copy; ++i) {
-                                                                                                                                                                                                                                                                int vid = wd->active[i];
-                                                                                                                                                                                                                                                                if (vid < 0 || vid >= max_voices || voices[vid].env_state == ENV_OFF) {
-                                                                                                                                                                                                                                                                g_render_queue[base + i] = -1;
-                                                                                                                                                                                                                                                                } else {
-                                                                                                                                                                                                                                                                g_render_queue[base + i] = vid;
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                }
-
-                                                                                                                                                                                                                                                                // If to_copy was 0 we do not reserve any entries; ensure consistency
+                                                                                                                                                                                                                                                                // Producer phase: the last producer builds the ordered queue (rev. 69).
+  // If to_copy was 0 we do not reserve any entries; ensure consistency
 if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
 if (widx < SSW_ADMIT_MAX_WORKERS) {
     InterlockedExchange(&g_admit_key_max[widx], admit_key_max);
@@ -4771,6 +4785,7 @@ if (widx < SSW_ADMIT_MAX_WORKERS) {
 }
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
+                                                                                                                                                                                                                                                                build_render_queue_ordered();
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();
                                                                                                                                                                                                                                                                 SetEvent(g_render_producers_ready);
                                                                                                                                                                                                                                                                 }
@@ -4798,21 +4813,9 @@ int need_compact = (wd->release_count > 0);
 
                                                                                                                                                                                                                                                                 // Consumer phase: work-stealing across all voices (pop in chunks to reduce atomics)
                                                                                                                                                                                                                                                                 // Chunk size scales with total voice count: fewer atomic ops per worker at high loads.
-LONG pop_chunk;
+LONG pop_chunk = RENDER_TILE_VOICES;
 LONG render_size = load_relaxed_long(&g_render_size);
-{
-    LONG base = RENDER_POP_CHUNK;
-    if      (render_size >  32000) base = 1024;
-    else if (render_size >  16000) base = 512;
-    // Scale chunk with worker count so each worker grabs at most ~2 chunks.
-    // At 24 workers / 8192 voices the old fixed 256 meant 32×24 = 768 atomic
-    // pops — lines bounce between all cores.  per_worker = 8192/24 = 341, so
-    // chunk becomes max(256, aligned 344) = 344, only 24 pops total.
-    LONG per_worker = render_size / (LONG)g_worker_count;
-    if (per_worker < 1) per_worker = 1;
-    pop_chunk = base > per_worker ? base : per_worker;
-    pop_chunk = (pop_chunk + 7) & ~7;   // round to multiple of 8 for SIMD alignment
-}
+const size_t tile_stride = (size_t)g_tile_mix_frames * (size_t)channels;
 int ss_worker_counted = 0;
 LARGE_INTEGER ss_busy_begin, ss_busy_end, ss_busy_freq;
 if (ss_profile) {
@@ -4837,6 +4840,8 @@ InterlockedAdd(&g_worker_busy_us,
 break;
 }
 LONG end = idx + pop_chunk; if (end > render_size) end = render_size;
+mix = g_tile_mix + (size_t)(idx / RENDER_TILE_VOICES) * tile_stride;
+memset(mix, 0, sizeof(float) * (size_t)frames * (size_t)channels);
 if (ss_profile && !ss_worker_counted) { ss_worker_counted = 1; InterlockedAdd(&g_workers_participating, 1); }
 for (LONG k = idx; k < end; ++k) {
 #if defined(__AVX2__) || defined(__wasm_simd128__)
@@ -6247,6 +6252,17 @@ return 0;
                                                                                                                                                                                                                                                                 // ==============================
 
                                                                                                                                                                                                                                                                 static void ensure_worker_mix_capacity(int frames) {
+{
+    const int want_tiles = max_voices / RENDER_TILE_VOICES + 2;
+    const int want_frames = frames > 2048 ? frames : 2048;
+    if (!g_tile_mix || g_tile_mix_tiles < want_tiles || g_tile_mix_frames < want_frames) {
+        _aligned_free(g_tile_mix);
+        g_tile_mix = (float*)_aligned_malloc(sizeof(float) * (size_t)want_tiles * (size_t)want_frames *
+                                             (size_t)g_audio.num_channels, 64);
+        g_tile_mix_tiles = g_tile_mix ? want_tiles : 0;
+        g_tile_mix_frames = g_tile_mix ? want_frames : 0;
+    }
+}
                                                                                                                                                                                                                                                                 int samples = frames * g_audio.num_channels;
                                                                                                                                                                                                                                                                 for (int w=0; w<g_worker_count; ++w) {
                                                                                                                                                                                                                                                                 if (g_worker_mix_cap_frames[w] < frames || g_worker_mix_buffers[w]==NULL) {
@@ -6307,16 +6323,22 @@ g_worker_count = desired;
                                                                                                                                                                                                                                                                 g_worker_mix_has_data = (int*)calloc(g_worker_count, sizeof(int));
 
                                                                                                                                                                                                                                                                 int note_map_by_channel = (max_voices <= g_worker_count * STEAL_CHANNEL_MAP_VOICES_PER_WORKER);
+                                                                                                                                                                                                                                                                /* Auto: up to 4096 voices the admitted note-ons fit one event thread (rev. 69). */
+                                                                                                                                                                                                                                                                if (max_voices <= 4096) note_map_by_channel = 2;
                                                                                                                                                                                                                                                                 {
                                                                                                                                                                                                                                                                 const char *sharding_env = getenv("SS_NOTE_SHARDING");
                                                                                                                                                                                                                                                                 if (sharding_env && sharding_env[0]) {
                                                                                                                                                                                                                                                                 if (_stricmp(sharding_env, "channel") == 0) note_map_by_channel = 1;
                                                                                                                                                                                                                                                                 else if (_stricmp(sharding_env, "hash") == 0) note_map_by_channel = 0;
+                                                                                                                                                                                                                                                                else if (_stricmp(sharding_env, "single") == 0) note_map_by_channel = 2;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
-                                                                                                                                                                                                                                                                for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
-                                                                                                                                                                                                                                                                g_channel_worker_map[ch] = (g_worker_count > 0) ? (ch % g_worker_count) : 0;
+                                                                                                                                                                                                                                                                g_event_worker_count = (note_map_by_channel == 2) ? 1 : (g_worker_count > 0 ? g_worker_count : 1);
+  for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
+                                                                                                                                                                                                                                                                /* "single" (SVMS, HANDOFF sec. 62): worker 0 processes every event; all workers
+                                                                                                                                                                                                                                                                 * still share the render tiles. */
+                                                                                                                                                                                                                                                                g_channel_worker_map[ch] = (note_map_by_channel == 2 || g_worker_count <= 0) ? 0 : (ch % g_worker_count);
                                                                                                                                                                                                                                                                 for (int key = 0; key < MIDI_KEY_COUNT; ++key) {
                                                                                                                                                                                                                                                                 unsigned int worker_count = (unsigned int)g_worker_count;
                                                                                                                                                                                                                                                                 unsigned int note_hash = (unsigned int)(ch * MIDI_KEY_COUNT + key);
@@ -7449,57 +7471,35 @@ g_render_decimate_step = step; // main thread; WaitForMultipleObjects above prov
 #ifdef GPUMIX
     accum_initialized = (gpu_processed > 0);
 #endif
-                                                                                                                                                                                                                                                                for (int w = 0; w < g_worker_count; ++w) {
-                                                                                                                                                                                                                                                               float *mix = g_worker_mix_buffers[w];
-if (g_worker_mix_has_data && !g_worker_mix_has_data[w]) continue;
-
-// SIMPLE OPTIMIZATION: Basic SIMD mixing
-int i = 0;
-if (!accum_initialized) {
-#if defined(__AVX512F__)
-int n = samples & ~15;
-for (; i < n; i += 16) {
-_mm512_storeu_ps(out_buffer + i, _mm512_loadu_ps(mix + i));
-}
-#elif defined(__AVX2__)
-int n = samples & ~7;
-for (; i < n; i += 8) {
-_mm256_storeu_ps(out_buffer + i, _mm256_loadu_ps(mix + i));
-}
-#elif defined(__wasm_simd128__)
-int n = samples & ~3;
-for (; i < n; i += 4) {
-wasm_v128_store(out_buffer + i, wasm_v128_load(mix + i));
-}
+                                                                                                                                                                                                                                                                {
+    /* rev. 69: tiles in fixed order (HANDOFF sec. 62). */
+    const LONG queued = load_relaxed_long(&g_render_size);
+    const int tiles = (int)((queued + RENDER_TILE_VOICES - 1) / RENDER_TILE_VOICES);
+    const size_t tile_stride = (size_t)g_tile_mix_frames * (size_t)channels;
+    for (int t = 0; t < tiles; ++t) {
+        const float *mix = g_tile_mix + (size_t)t * tile_stride;
+        int i = 0;
+        if (!accum_initialized) {
+#if defined(__wasm_simd128__)
+            int n = samples & ~3;
+            for (; i < n; i += 4) wasm_v128_store(out_buffer + i, wasm_v128_load(mix + i));
 #endif
-for (; i < samples; ++i) out_buffer[i] = mix[i];
-accum_initialized = 1;
-continue;
+            for (; i < samples; ++i) out_buffer[i] = mix[i];
+            accum_initialized = 1;
+            continue;
+        }
+#if defined(__wasm_simd128__)
+        int n = samples & ~3;
+        for (; i < n; i += 4)
+            wasm_v128_store(out_buffer + i, wasm_f32x4_add(wasm_v128_load(mix + i), wasm_v128_load(out_buffer + i)));
+#elif defined(__AVX2__)
+        int n = samples & ~7;
+        for (; i < n; i += 8)
+            _mm256_storeu_ps(out_buffer + i, _mm256_add_ps(_mm256_loadu_ps(mix + i), _mm256_loadu_ps(out_buffer + i)));
+#endif
+        for (; i < samples; ++i) out_buffer[i] += mix[i];
+    }
 }
-#if defined(__AVX512F__)
-int n = samples & ~15; // multiple of 16
-                                                                                                                                                                                                                                                                for (; i < n; i += 16) {
-                                                                                                                                                                                                                                                                __m512 a = _mm512_loadu_ps(mix + i);
-                                                                                                                                                                                                                                                                __m512 b = _mm512_loadu_ps(out_buffer + i);
-                                                                                                                                                                                                                                                                _mm512_storeu_ps(out_buffer + i, _mm512_add_ps(a, b));
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                #elif defined(__AVX2__)
-                                                                                                                                                                                                                                                                int n = samples & ~7; // multiple of 8
-                                                                                                                                                                                                                                                                for (; i < n; i += 8) {
-                                                                                                                                                                                                                                                                __m256 a = _mm256_loadu_ps(mix + i);
-                                                                                                                                                                                                                                                                __m256 b = _mm256_loadu_ps(out_buffer + i);
-                                                                                                                                                                                                                                                                _mm256_storeu_ps(out_buffer + i, _mm256_add_ps(a, b));
-                                                                                                                                                                                                                                                                }
-#elif defined(__wasm_simd128__)
-int n = samples & ~3;
-for (; i < n; i += 4) {
-v128_t a = wasm_v128_load(mix + i);
-v128_t b = wasm_v128_load(out_buffer + i);
-wasm_v128_store(out_buffer + i, wasm_f32x4_add(a, b));
-}
-                                                                                                                                                                                                                                                                #endif
-                                                                                                                                                                                                                                                                for (; i < samples; ++i) out_buffer[i] += mix[i];
-                                                                                                                                                                                                                                                                }
 
                                                                                                                                                                                                                                                                 #ifdef GPUMIX
                                                                                                                                                                                                                                                                 if (g_gpu_mix_available && gpu_mix_is_active()) {

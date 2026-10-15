@@ -1542,7 +1542,7 @@ MainWindow::MainWindow(QObject* parent)
     synthWorkers_ = std::clamp<int>(static_cast<int>(std::lround(
         wasmidi_setting_number("synthWorkers", synthWorkers_))), 0, 256);
     synthNoteSharding_ = std::clamp<int>(static_cast<int>(std::lround(
-        wasmidi_setting_number("synthNoteSharding", synthNoteSharding_))), 0, 2);
+        wasmidi_setting_number("synthNoteSharding", synthNoteSharding_))), 0, 3);
     synthStealScoreCache_ = wasmidi_setting_number(
         "synthStealScoreCache", synthStealScoreCache_ ? 1.0 : 0.0) != 0.0;
     synthFastNoteOff_ = wasmidi_setting_number(
@@ -2841,7 +2841,7 @@ void MainWindow::setSynthNoteSharding(int value)
         std::clamp(
             value,
             0,
-            2);
+            3);
 
     if (synthNoteSharding_ == clamped)
         return;

@@ -71,7 +71,7 @@
         // voice.c runtime tuning envs.
         workers: 0,            // 0 = auto
         workerCount: 0,        // actual source-selected worker count
-        noteSharding: 0,       // 0 auto, 1 channel, 2 hash
+        noteSharding: 0,       // 0 auto, 1 channel, 2 hash, 3 single
         stealScoreCache: true,
         debugMetrics: false,
         fastNoteOff: true,
@@ -475,7 +475,7 @@
                     if (Number.isFinite(data.requestedWorkers))
                         state.workers = Math.max(0, Math.round(data.requestedWorkers));
                     if (Number.isFinite(data.noteSharding))
-                        state.noteSharding = Math.max(0, Math.min(2, Math.round(data.noteSharding)));
+                        state.noteSharding = Math.max(0, Math.min(3, Math.round(data.noteSharding)));
                     if (typeof data.stealScoreCache === "boolean")
                         state.stealScoreCache = data.stealScoreCache;
                     if (typeof data.debugMetrics === "boolean")
@@ -1068,7 +1068,7 @@
                 Math.max(
                     0,
                     Math.min(
-                        2,
+                        3,
                         Number(options.noteSharding) |
                         0));
         }

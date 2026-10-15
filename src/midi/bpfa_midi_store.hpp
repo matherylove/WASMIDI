@@ -41,7 +41,7 @@ public:
         uint16_t reserved;
     };
 
-    BpfaMidiStore() = default;
+    BpfaMidiStore();
     BpfaMidiStore(const BpfaMidiStore&) = delete;
     BpfaMidiStore& operator=(const BpfaMidiStore&) = delete;
 
@@ -88,6 +88,34 @@ public:
     bool compressedSource() const { return fileBytes_.empty() && !onDemand_ && !sourceChunks_.empty(); }
     bool sourceSlotValid(uint16_t slot, uint64_t begin) const;
     uint64_t storedSourceBytes() const { return storedSourceBytes_; }
+
+    // Parallel load (HANDOFF sec. 60). A helper indexes a contiguous range of tracks
+    // and exports a blob; the main store merges the blobs in track order.
+    struct PartialPlan {
+        uint16_t format = 1;
+        uint16_t trackCount = 0;
+        uint16_t ticksPerBeat = 0;
+        uint16_t firstTrack = 0;
+        uint16_t endTrack = 0;
+        uint64_t firstChunkPosition = 0;
+        uint64_t rangeBegin = 0;
+        uint64_t rangeEnd = 0;
+        uint32_t blockSize = 64u * 1024u;
+        bool compress = true;
+        uint64_t snapshotBudget = 0;
+    };
+    bool indexPartial(uint64_t size, MidiReadAt readAt, void* readUser, const PartialPlan& plan,
+                      MidiParseProgress progress = nullptr, void* progressUser = nullptr);
+    const std::vector<uint8_t>& partialBlob() const { return partialBlob_; }
+    void releasePartialBlob() { std::vector<uint8_t>().swap(partialBlob_); }
+
+    bool beginMerge(uint64_t size, uint16_t format, uint16_t trackCount, uint16_t ticksPerBeat,
+                    uint32_t blockSize, bool compressed);
+    bool mergeReadRaw(MidiReadAt readAt, void* readUser, MidiParseProgress progress = nullptr,
+                      void* progressUser = nullptr);
+    bool mergePartial(const uint8_t* blob, std::size_t size);
+    bool finishMerge(MidiDocument& metadata);
+    static uint32_t blockSizeForTracks(uint32_t trackCount);
 
     std::size_t noteRecordCount() const { return notes_.size(); }
     std::size_t longNoteCount() const { return longNotes_.size(); }
@@ -165,8 +193,25 @@ private:
     void mergePop(MergeCursor& m);
     void buildNoteBlocks();
     void buildColorTables();
-    bool ingestSource(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
-                      void* progressUser);
+    // Single pass (HANDOFF sec. 59): the scan pulls bytes and each 8 MiB window is
+    // read, deduplicated and compressed the first time the scan reaches it.
+    struct IngestState;
+    void beginIngest(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
+                     void* progressUser);
+    bool ingestNextWindow();
+    bool finishIngest();
+    std::unique_ptr<IngestState> ingest_;
+    PartialPlan partial_;
+    bool partialActive_ = false;
+    uint64_t chunkBase_ = 0;
+    std::vector<uint64_t> chunkKeys_;
+    std::vector<uint8_t> partialBlob_;
+    MidiDocument mergeOut_;
+    uint64_t mergeTotalNotes_ = 0;
+    uint64_t mergeTotalControls_ = 0;
+    bool merging_ = false;
+    void exportPartial(const MidiDocument& out, const std::vector<uint64_t>& notesPerTrack, uint64_t totalControls);
+    void finalizeIndex(MidiDocument& out, uint64_t totalNotes, uint64_t totalControls, MidiDocument& metadata);
     bool copySource(uint64_t position, uint8_t* destination, std::size_t length) const;
     struct SourceChunk {
         uint64_t physicalOffset;

@@ -3819,4 +3819,235 @@ seeks; zstd: synth).
 **Prueba pedida:** repetir `parser-bench.html` con The Nuker 3. Si el escaneo baja a
 ~2× del host (~150 s), la causa era esta.
 
-Última revisión entregada: `wasmidi-main-rev65-v8-tierup.zip`.
+Revisión anterior entregada: `wasmidi-main-rev65-v8-tierup.zip`.
+
+---
+
+## 59. Revisión 66 — una sola pasada en modo zstd (paso 1 de 2)
+
+**Medición del usuario (rev. 65, otra PC: 24 núcleos, `deviceMemory` 32, The Nuker 4,
+20.937 MB):** compresión 103,2 s (203 MB/s, igual que antes), escaneo 197,4 s
+(106 MB/s; la rev. 64 en la otra PC daba 26 MB/s) → total 301 s. El arreglo de Liftoff
+(§58) funcionó: el escaneo quedó ~2× del nativo, lo esperable. Nota: Chrome 155 informa
+`deviceMemory` 32, no está topado en 8 como se asumió en §54.
+
+**Pedido del usuario:** hacer las dos mejoras propuestas: una sola pasada y carga en
+paralelo con varios Web Workers. Esta revisión es la primera.
+
+**Cambio (`bpfa_midi_store.{hpp,cpp}`):** en modo zstd ya no se comprime todo el archivo
+y después se lo vuelve a descomprimir para escanearlo:
+
+- `beginIngest` prepara el estado (`IngestState`: ventana de 8 MiB, mapa de
+  deduplicación, contexto de compresión) sin leer nada.
+- `sourceBlock` ingiere ventanas a demanda: cuando el escaneo pide una posición más
+  allá de la frontera, `ingestNextWindow` lee la ventana, deduplica y comprime sus
+  bloques, y el escaneo lee **directo de la ventana cruda** (slot `0xfffd`, inválido
+  para cursores persistentes). Lo que queda detrás de la frontera (un evento que cruza el
+  borde, el running status que retrocede un byte) sale del bloque comprimido.
+- Las cabeceras `MTrk` se leen dentro del bucle de escaneo, en orden de archivo, para no
+  saltar adelante; `finishIngest` comprime lo que quede tras la última pista.
+- Progreso: una sola etapa "BPFA: reading, compressing and scanning" (por bytes).
+- Constructor y destructor fuera de línea (`IngestState` es un tipo incompleto en el
+  header).
+
+**Medición (host):** Hypernova en zstd sin cambio apreciable (~3,7-4,1 s en ambas
+versiones: con bloques de 64 KiB la descompresión era barata). Nuker 3: 123 s contra
+129 s, pero en host la descompresión del 7z en Python comparte el único núcleo, así que
+la medición no es limpia. Lo que se elimina es descomprimir todo el archivo durante el
+escaneo: para Nuker con bloques de 8 KiB son ~16 s nativos, más en wasm. Estimación
+para el navegador: −10-20%. La ganancia grande la tiene que dar el paralelismo.
+
+**Verificación:** `check.sh` 16/16 IDENTICAL; Hypernova en zstd (synth, teclado con
+seeks) idénticos.
+
+**Paso 2 (siguiente): carga en paralelo.** Diseño: el worker del parser lee las
+cabeceras de pista, reparte pistas contiguas (balanceadas por bytes) entre N workers
+auxiliares con el mismo módulo wasm; cada uno ingiere y escanea su rango (los bloques
+cuyo inicio cae en su rango) y devuelve un blob con bloques comprimidos + hashes e
+índice por pista (checkpoints, snapshots, primeras notas, tempos, selectores, SysEx,
+contadores). El worker principal los incorpora en orden de pista y deduplica entre rangos
+con el mismo criterio que hoy, así el resultado coincide con la carga de un hilo.
+
+Revisión anterior entregada: `wasmidi-main-rev66-single-pass.zip`.
+
+---
+
+## 60. Revisión 67 — carga en paralelo con Web Workers (paso 2 de 2)
+
+**Medición del usuario (rev. 66, PC 1, The Nuker 3):** 277,3 s en una sola etapa
+("reading, compressing and scanning"), contra 691,7 s de la rev. 64 (−60% entre §58 y
+§59).
+
+**Diseño:**
+
+1. El worker del parser lee la cabecera y la posición de cada `MTrk`
+   (`wmp_track_table_js`: lecturas de 8 bytes) y reparte las pistas en rangos contiguos
+   balanceados por bytes: `min(núcleos − 2, 12, pistas)` helpers. Sin al menos 2 rangos,
+   archivos < 128 MiB o < 4 núcleos, carga normal de un hilo.
+2. Cada helper (`web/midi-parser-helper.js`, mismo módulo wasm) recibe el `File` y su
+   plan, y corre `BpfaMidiStore::indexPartial`: la misma pasada única de §59 limitada a
+   su rango. Un bloque de fuente pertenece al helper cuyo rango contiene el inicio del
+   bloque; el helper lee hasta terminar el último bloque propio. En modo crudo los
+   helpers solo escanean (sin guardar bloques; conservan la ventana anterior para los
+   retrocesos de un byte) y el worker principal lee el archivo entero mientras tanto.
+3. El helper exporta un blob (`exportPartial`): bloques propios (hash, tamaño, palabra
+   de almacenamiento y bytes comprimidos), y por pista rango de bytes, `maxTick`, máscara
+   de canales, notas, primera nota, checkpoints y snapshots; además controles, alturas,
+   tempos, eventos de estado y SysEx. Presupuesto de snapshots proporcional a sus bytes.
+4. El worker principal fusiona los blobs **en orden de pista** (`mergePartial`):
+   deduplica cada bloque contra todos los anteriores con el mismo criterio que la carga
+   de un hilo (hash + comparación de bytes descomprimidos), copia los bytes comprimidos
+   sin recomprimir, y agrega tempos, estados y SysEx; `finishMerge` hace el mismo cierre
+   que `index()` (`finalizeIndex`, compartido).
+5. Si algo falla en cualquier helper: se terminan todos y se carga en un hilo.
+
+**Archivos:** `bpfa_midi_store.{hpp,cpp}` (`PartialPlan`, `indexPartial`,
+`exportPartial`, `beginMerge`, `mergeReadRaw`, `mergePartial`, `finishMerge`,
+`finalizeIndex`, `blockSizeForTracks`, base de bloques `chunkBase_`, ingesta acotada a
+un rango); `midi_worker_core.cpp` (exports `wmp_track_table_js`, `wmp_partial_*`,
+`wmp_merge_*`; agregados en CMake); `midi-parser-worker.js` (`parallelParse`, progreso
+ponderado por bytes con la etapa "BPFA: parallel load (N workers)"); CI copia el helper.
+
+**Verificación (host, `tools/feeder_check/bpfa_parallel_sim.hpp` simula la partición,
+los parciales y la fusión en un proceso):**
+
+- `check.sh`: 24 IDENTICAL, 0 DIFFER, incluidos synth, renderer, teclado y páginas con 3
+  helpers en modo crudo y zstd contra el parser original.
+- Hypernova con 6 helpers, crudo y zstd: synth, renderer y teclado con seeks idénticos.
+- Fuente comprimida idéntica en tamaño (68,21 MB) con 1, 4 y 8 helpers: la
+  deduplicación entre rangos equivale a la de un hilo.
+- Costo total de CPU de la división (simulada en serie): +15-25% sobre un hilo
+  (bloque de borde repetido, serialización, fusión). En paralelo el tiempo de pared
+  esperado es ~(un hilo / helpers) + fusión.
+
+**No verificable acá:** el arranque real de Workers y el wasm en cada helper, la memoria
+pico (cada helper tiene sus bloques comprimidos hasta que el principal los copia), y la
+ganancia. Medir con `parser-bench.html`.
+
+**Medición del usuario (rev. 67, PC 1: 16 núcleos, `deviceMemory` 32, The Nuker 3):**
+
+| Etapa | Tiempo |
+|---|---|
+| Opening MIDI as a paged source (incluye la tabla de pistas: 9679 lecturas de 8 bytes en serie con `FileReaderSync`) | 2,98 s |
+| BPFA: parallel load (12 workers) | 38,3 s |
+| BPFA: merging partial indexes | 0,17 s |
+| **Total** | **42,2 s** |
+
+Evolución en la misma PC y archivo: 691,7 s (rev. 64) → 277,3 s (rev. 66) → **42,2 s**
+(rev. 67): 16× menos. Pendiente menor: la tabla de pistas (~7% del total) es una
+cadena de lecturas dependientes (cada cabecera dice dónde está la siguiente).
+
+Revisión anterior entregada: `wasmidi-main-rev67-parallel-load.zip` (+ nota de medición).
+
+---
+
+## 61. Revisión 68 — ideas de Kestrel/SVMS, parte 1: admisión, tope de robos y salida
+
+**Contexto:** el usuario pidió leer Kestrel (MPL-2.0, síntesis en GPU offline),
+SuperVirtualMIDISynth V3 (GPL-3, synth realtime para Black MIDI) y Kasaria (GPL-2,
+basado en Timidity) y luego implementar todas las ideas, con la GPU como alternativa
+seleccionable a la CPU. Solo se toman ideas (licencias GPL). Orden acordado:
+
+1. **Esta revisión:** admisión por bloque, tope de robos, limitador + bloqueador de DC.
+2. Multinúcleo estilo SVMS: un hilo procesa eventos en orden, el render se reparte en
+   tandas de 256 voces tomadas de un contador atómico, reducción en orden fijo
+   (determinismo); umbral para no paralelizar bloques chicos.
+3. Síntesis por WebGPU (estilo Kestrel) con interruptor GPU/CPU.
+
+**Cambios (`snappy_wasm_core.c`, `Voice/voice.{c,h}`, `CMakeLists.txt`):**
+
+- **Admisión por bloque (Kestrel, "admission decides who never starts"):** en
+  `ssw_render_queued_into`, antes de despachar, se cuentan los note-ons del bloque con
+  un histograma de velocity. Si superan `max_voices × g_admission_percent / 100`
+  (default 25%), se fija un umbral de velocity: entran todos los de velocity mayor y,
+  del umbral, los primeros que quepan en orden. Cada (canal, tecla) tiene una FIFO de
+  "entró / no entró" en corridas (`ssw_note_fifo`, O(1) en el caso común); el note-off
+  que el motor emparejaría (FIFO, como `SSW_NOTEOFF_FIFO`) con un note-on descartado
+  también se descarta, así no quedan notas colgadas. Se limpia en `ssw_reset`.
+  Exports: `ssw_set_admission_percent`, `ssw_admission_dropped`.
+- **Tope de robos por ciclo (Kestrel `--steal-percent`):** en `worker_cycle`, cada
+  worker puede robar como mucho `max_voices × 25% / workers` voces por ciclo; pasado eso
+  la nota entrante se descarta en vez de cortar otra voz (evita la "lluvia de ataques
+  de 85 ms" en zonas saturadas). `voice_set_steal_cap_percent`,
+  `ssw_set_steal_cap_percent` (0 = sin tope).
+- **Salida (Kestrel):** con "Soft clip" activado (el default), en lugar de la curva de
+  soft clip de `voice.c` se aplica en el core un pasa-altos Butterworth de 2.º orden a
+  15 Hz (bloqueador de DC) y un limitador brickwall con 2 ms de anticipación a
+  −0,3 dBFS (mínimo deslizante de la ganancia necesaria, ataque que llega a destino
+  antes del pico, release de 80 ms, clamp final). `voice_set_output_soft_clip_enabled`
+  queda siempre en 0. Agrega 2 ms de latencia.
+
+**Medición (host, Hypernova 100-104 s, 1024 voces, 1 worker, límite de render
+apagado):**
+
+| | Costo vs tiempo real | Bloque máx. | Robos/s | Descartes en el motor/s |
+|---|---|---|---|---|
+| rev. 67 | 1,57× | 144 ms | 77-259k | 0,7-1,1M |
+| rev. 68 solo limitador (admisión y tope en 0) | 1,49× | — | — | — |
+| **rev. 68** | **0,67×** | 24,8 ms | 19-62k | <1k |
+
+La admisión descartó 6,58M note-ons en 4 s antes de que llegaran a las voces. Nivel
+medio con admisión y tope: +0,7 dB respecto de sin ellos (las voces duran más); peor
+ventana de 50 ms: 0,9 dB más baja. El pico de salida queda en 0,966 (antes saturaba a
+1,0 en la conversión a 16 bits).
+
+**Hallazgo:** el motor **no es determinístico ni con 1 worker**: el presupuesto de
+cortes por bloque (`ssw_update_render_budget`) depende del tiempo medido, así que dos
+corridas idénticas difieren. Es lo que la parte 2 (render con reducción en orden fijo)
+y una opción de render determinístico deberían resolver para poder verificar audio
+byte a byte como el parser.
+
+**Sin cambios de UI:** el botón "Soft clip" ahora significa "limitador + DC blocker".
+
+Revisión anterior entregada: `wasmidi-main-rev68-admission-limiter.zip`.
+
+---
+
+## 62. Revisión 69 — etapa 2: multinúcleo estilo SVMS y modo determinístico
+
+**Lo que ya había (relevado al implementar):** el render de SSv2 ya repartía voces
+dinámicamente (cola global `g_render_queue` + contador atómico `g_render_pop`), pero:
+(a) cada worker tomaba ~1-2 tandas grandes (`pop_chunk` ≈ voces/workers), así que un
+worker desalojado con su tanda frenaba a todos; (b) cada worker mezclaba en su propio
+búfer y el orden de la cola dependía de qué worker llegaba primero, así que la suma de
+punto flotante cambiaba con el timing; (c) los eventos se procesan repartidos por
+tecla (`g_note_worker_map`), así que el worker de las teclas saturadas marca el tiempo
+del bloque (§23, §40).
+
+**Cambios (`Voice/voice.{c,h}`, `snappy_wasm_core.c`, UI):**
+
+1. **Tiles fijos de 256 voces** (`RENDER_TILE_VOICES`): cada tanda tomada del contador
+   mezcla en su propio búfer de tile (`g_tile_mix`, reservado en
+   `ensure_worker_mix_capacity`), y `voice_render_float` suma los tiles **en orden de
+   tile**. Un worker desalojado retiene a lo sumo 256 voces.
+2. **Cola en orden fijo:** el último productor arma `g_render_queue` recorriendo los
+   workers 0..W−1 (`build_render_queue_ordered`); antes cada productor reservaba su
+   tramo con un `InterlockedAdd` en el orden en que llegaba.
+3. **Reparto "single" (SVMS):** `SS_NOTE_SHARDING=single` / sharding 3: todos los eventos
+   van al worker 0 y todos los workers comparten los tiles de render. **Auto lo elige con
+   ≤ 4096 voces** (con la admisión de §61 entran como mucho 25% de las voces por bloque,
+   así que un hilo alcanza). El tope de robos usa `g_event_worker_count` (1 en single).
+   UI: el botón "Sharding" cicla Auto/Channel/Hash/Single; bridge, worker y
+   `mainwindow.cpp` aceptan 0-3.
+4. **Modo determinístico** (`ssw_set_deterministic`, exportado): un render por bloque
+   (sin cortes según el tiempo medido), limitador de tiempo de render apagado, cola
+   ordenada por `voice_age`. Pensado para verificar audio.
+
+**Verificación (host, Hypernova 100-102 s, 1024 voces, sharding single + determinístico):**
+dos corridas con 1 worker → **WAV idénticos**; 1 contra 4 y 1 contra 8 workers →
+**WAV idénticos**. Es la primera vez que el audio de WasmiSynth se puede comparar byte a
+byte. Sin modo determinístico (default) el nivel y los picos coinciden con rev. 68
+(79,5-79,6 dB, pico 0,966) y el costo en host es el mismo (~0,64× con 4 workers en 1
+núcleo; el host no mide paralelismo real).
+
+Cómo reproducir: `tools/host_bench/midibench.c` con `SHARD=3 DET=1 VOICES=1024` y
+distinta cantidad de workers; comparar los WAV con `cmp`.
+
+**No hecho:** que el hilo que llama a `voice_render_float` también tome tiles (SVMS lo
+hace). Requiere un `worker_data` extra para el coordinador; con tiles de 256 la ganancia
+es un núcleo más, no la eliminación de esperas.
+
+**Prueba pedida:** en el navegador, Hypernova y The Nuker 3 con 1024 voces y Sharding
+Auto (= Single) contra Hash; ver si desaparecen los tirones por workers.
+
+Última revisión entregada: `wasmidi-main-rev69-svms-multicore.zip`.

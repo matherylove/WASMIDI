@@ -1215,9 +1215,10 @@ Item {
                             enabled: !root.mainWindow.isPlaying
                             text: root.mainWindow.synthNoteSharding === 1 ? "Channel"
                                 : root.mainWindow.synthNoteSharding === 2 ? "Hash"
+                                : root.mainWindow.synthNoteSharding === 3 ? "Single"
                                 : "Auto"
                             onClicked: root.mainWindow.synthNoteSharding =
-                                (root.mainWindow.synthNoteSharding + 1) % 3
+                                (root.mainWindow.synthNoteSharding + 1) % 4
                         }
 
                         FlatButton {
