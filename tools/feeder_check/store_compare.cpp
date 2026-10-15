@@ -1,7 +1,6 @@
 // Synth stream of the current mapped store vs BpfaMidiStore (HANDOFF sec. 43). Build with/without -DUSE_BPFA.
 #include "midi_mapped_store.hpp"
 #include "bpfa_midi_store.hpp"
-#include "bpfa_parallel_sim.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -29,15 +28,7 @@ int main(int argc, char** argv) {
 #endif
     MidiDocument meta;
     auto t0 = std::chrono::steady_clock::now();
-    #ifdef USE_BPFA
-    const char* parallelEnv = getenv("BPFA_PARALLEL");
-    const bool indexed = parallelEnv
-        ? bpfaParallelIndex(store, g_size, readAt, nullptr, meta, unsigned(atoi(parallelEnv)), getenv("BPFA_ZSTD") != nullptr)
-        : store.index(g_size, readAt, nullptr, meta);
-#else
-    const bool indexed = store.index(g_size, readAt, nullptr, meta);
-#endif
-    if (!indexed) { fprintf(stderr, "index failed: %s\n", store.error()); return 1; }
+    if (!store.index(g_size, readAt, nullptr, meta)) { fprintf(stderr, "index failed: %s\n", store.error()); return 1; }
     fprintf(stderr, "index %.0f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 #ifdef USE_BPFA
     fprintf(stderr, "bpfa notes %zu long %zu memory %.1f MB\n", store.noteRecordCount(), store.longNoteCount(), store.memoryBytes() / 1048576.0);

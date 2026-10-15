@@ -1,9 +1,7 @@
 // Visual pages (sequential 64-screen warming plus seeks): current store vs BpfaMidiStore (HANDOFF sec. 45).
 #include "midi_mapped_store.hpp"
 #include "bpfa_midi_store.hpp"
-#include "bpfa_parallel_sim.hpp"
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fcntl.h>
@@ -23,15 +21,7 @@ int main(int argc, char** argv) {
     MidiMappedStore store;
 #endif
     MidiDocument meta;
-    #ifdef USE_BPFA
-    const char* parallelEnv = getenv("BPFA_PARALLEL");
-    const bool indexed = parallelEnv
-        ? bpfaParallelIndex(store, g_size, readAt, nullptr, meta, unsigned(atoi(parallelEnv)), getenv("BPFA_ZSTD") != nullptr)
-        : store.index(g_size, readAt, nullptr, meta);
-#else
-    const bool indexed = store.index(g_size, readAt, nullptr, meta);
-#endif
-    if (!indexed) { fprintf(stderr, "index failed\n"); return 1; }
+    if (!store.index(g_size, readAt, nullptr, meta)) { fprintf(stderr, "index failed\n"); return 1; }
     const MidiDocument& md = store.metadata();
     const uint32_t span = (uint32_t)std::max(1.0, std::ceil(md.secondsToTick(0.1) - md.secondsToTick(0.0)));
     long notes = 0; std::vector<VisualNote> page;

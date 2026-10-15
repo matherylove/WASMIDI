@@ -49,7 +49,6 @@ FILES = [
     "web/coi-serviceworker.js",
     "web/midi-parser-worker.js",
     "web/parser-bench.html",
-    "web/midi-parser-helper.js",
     "web/snappysynth-audio-worklet.js",
     "web/snappysynth-worker.js",
     "web/snappysynth_bridge.js",

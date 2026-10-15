@@ -1,9 +1,7 @@
 // Renderer sweep: current mapped store vs BpfaMidiStore (HANDOFF sec. 44). Build with/without -DUSE_BPFA.
 #include "midi_mapped_store.hpp"
 #include "bpfa_midi_store.hpp"
-#include "bpfa_parallel_sim.hpp"
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fcntl.h>
@@ -24,15 +22,7 @@ int main(int argc, char** argv) {
     MidiMappedStore store;
 #endif
     MidiDocument meta;
-    #ifdef USE_BPFA
-    const char* parallelEnv = getenv("BPFA_PARALLEL");
-    const bool indexed = parallelEnv
-        ? bpfaParallelIndex(store, g_size, readAt, nullptr, meta, unsigned(atoi(parallelEnv)), getenv("BPFA_ZSTD") != nullptr)
-        : store.index(g_size, readAt, nullptr, meta);
-#else
-    const bool indexed = store.index(g_size, readAt, nullptr, meta);
-#endif
-    if (!indexed) { fprintf(stderr, "index failed\n"); return 1; }
+    if (!store.index(g_size, readAt, nullptr, meta)) { fprintf(stderr, "index failed\n"); return 1; }
     const MidiDocument& md = store.metadata();
     uint32_t tick = (uint32_t)std::max(0.0, std::floor(md.secondsToTick(startSec)));
     store.resetRenderCursor(tick, perTrack != 0);

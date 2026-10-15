@@ -156,40 +156,6 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
     g_dispatch_accum_us = 0.0;
     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
 
-    /* Block admission (rev. 68): velocity threshold so at most `admit` note-ons
-     * of this block are dispatched. */
-    int admit_threshold = -1, admit_quota = 0;
-    if (g_admission_percent > 0) {
-        const long admit = (long)g_max_voices * g_admission_percent / 100 > 0
-            ? (long)g_max_voices * g_admission_percent / 100 : 1;
-        uint32_t histogram[128];
-        long note_ons = 0;
-        memset(histogram, 0, sizeof(histogram));
-        for (ssw_event_block* b = g_event_head; b; b = b->next) {
-            int stop = 0;
-            for (size_t i = b->index; i < b->count; ++i) {
-                const ssw_scheduled_event* ev = &b->events[i];
-                if (ev->sample_frame >= block_end_frame) { stop = 1; break; }
-                if ((ev->message & 0xf0u) == 0x90u && ((ev->message >> 16) & 0x7fu)) {
-                    ++histogram[(ev->message >> 16) & 0x7fu];
-                    ++note_ons;
-                }
-            }
-            if (stop) break;
-        }
-        if (note_ons > admit) {
-            long above = 0;
-            for (int v = 127; v >= 0; --v) {
-                if (above + (long)histogram[v] > admit) {
-                    admit_threshold = v;
-                    admit_quota = (int)(admit - above);
-                    break;
-                }
-                above += histogram[v];
-            }
-        }
-    }
-
     while (g_event_head) {
         ssw_event_block* block = g_event_head;
         while (block->index < block->count) {
@@ -244,22 +210,6 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
                 }
 
-                if (command == 0x90u || command == 0x80u) {
-                    const int key = (ch << 7) | (int)((event->message >> 8) & 0x7fu);
-                    const int velocity = (int)((event->message >> 16) & 0x7fu);
-                    if (command == 0x90u && velocity) {
-                        int kept = 1;
-                        if (admit_threshold >= 0) {
-                            if (velocity < admit_threshold) kept = 0;
-                            else if (velocity == admit_threshold) kept = admit_quota-- > 0;
-                        }
-                        ssw_note_fifo_push(key, kept);
-                        if (!kept) { ++g_admission_dropped; ++block->index; continue; }
-                    } else if (!ssw_note_fifo_pop(key)) {
-                        ++block->index;
-                        continue;
-                    }
-                }
                 {
 #if SSW_COLLAPSE_CONTROLLER_BURSTS
                     /* Skip a controller value that a later one in this same run
@@ -295,7 +245,6 @@ events_done:
             remaining);
         g_render_cursor += remaining;
     }
-    if (g_soft_clip) ssw_output_stage((float*)out_ptr, frames);
     g_song_frame = block_end_frame;
     g_song_time_seconds =
         (double)g_song_frame /
