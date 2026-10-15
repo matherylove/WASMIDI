@@ -165,6 +165,7 @@ jobs:
           cp web/coi-serviceworker.js site/
           cp web/snappysynth_bridge.js site/
           cp web/snappysynth-worker.js site/
+          cp web/snappysynth-webgpu.js site/
           cp web/synth-feeder-worker.js site/
           cp web/snappysynth-audio-worklet.js site/
 
