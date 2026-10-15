@@ -229,6 +229,7 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 
                 if (boundary > segment_start) {
                     const int segment_frames = boundary - segment_start;
+                    voice_set_frame_base_for_wgpu(g_wgpu_js_base + segment_start);
                     voice_render_float(
                         ((float*)out_ptr) +
                             (size_t)segment_start * (size_t)channels,
@@ -290,12 +291,13 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 events_done:
     if (segment_start < frames) {
         const int remaining = frames - segment_start;
+        voice_set_frame_base_for_wgpu(g_wgpu_js_base + segment_start);
         voice_render_float(
             ((float*)out_ptr) + (size_t)segment_start * (size_t)channels,
             remaining);
         g_render_cursor += remaining;
     }
-    if (g_soft_clip) ssw_output_stage((float*)out_ptr, frames);
+    if (g_soft_clip && !voice_wgpu_enabled()) ssw_output_stage((float*)out_ptr, frames);
     g_song_frame = block_end_frame;
     g_song_time_seconds =
         (double)g_song_frame /

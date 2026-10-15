@@ -50,6 +50,7 @@ FILES = [
     "web/midi-parser-worker.js",
     "web/parser-bench.html",
     "web/midi-parser-helper.js",
+    "web/snappysynth-webgpu.js",
     "web/snappysynth-audio-worklet.js",
     "web/snappysynth-worker.js",
     "web/snappysynth_bridge.js",

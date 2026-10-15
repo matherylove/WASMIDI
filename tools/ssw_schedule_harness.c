@@ -24,6 +24,9 @@ static int g_max_voices = 1024;
 static unsigned g_admission_dropped = 0;
 static int g_soft_clip = 0;
 static int g_ssw_deterministic = 0;
+static int g_wgpu_js_base = 0;
+#define voice_set_frame_base_for_wgpu(f) ((void)(f))
+static int voice_wgpu_enabled(void) { return 0; }
 static void ssw_note_fifo_push(int key, int kept) { (void)key; (void)kept; }
 static int ssw_note_fifo_pop(int key) { (void)key; return 1; }
 static void ssw_output_stage(float* buffer, int frames) { (void)buffer; (void)frames; }
