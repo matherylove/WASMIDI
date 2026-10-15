@@ -25,122 +25,6 @@ function rawSourceLimitBytes(wholeFileCopied) {
     return Math.max(0, Math.min(heapRoom, ramRoom));
 }
 
-// Parallel load (HANDOFF sec. 60): helper Workers index contiguous track ranges and
-// this Worker merges their partial indexes in track order.
-const PARALLEL_MIN_BYTES = 128 * 1024 * 1024;
-const PARALLEL_MAX_HELPERS = 12;
-
-async function parallelParse(Module, file, total, compressed) {
-    const cores = Number(self.navigator && self.navigator.hardwareConcurrency) || 1;
-    if (total < PARALLEL_MIN_BYTES || cores < 4 ||
-        typeof Module._wmp_track_table_js !== "function" ||
-        typeof Module._wmp_merge_begin_js !== "function")
-        return false;
-    const count = Number(Module._wmp_track_table_js(total));
-    if (count < 6)
-        return false;
-    const tablePtr = Number(Module._wmp_track_table_ptr_js());
-    const table = Array.from(new Float64Array(Module.HEAPU8.buffer, tablePtr, count));
-    const [format, trackCount, ticksPerBeat, blockSize] = table;
-    const chunk = table.slice(4);
-    const helpersWanted = Math.min(cores - 2, PARALLEL_MAX_HELPERS, trackCount);
-    if (helpersWanted < 2)
-        return false;
-    const cuts = [0];
-    for (let k = 1; k < helpersWanted; ++k) {
-        const target = total * k / helpersWanted;
-        let t = cuts[cuts.length - 1];
-        while (t < trackCount && chunk[t] < target) ++t;
-        if (t > cuts[cuts.length - 1] && t < trackCount)
-            cuts.push(t);
-    }
-    cuts.push(trackCount);
-    const parts = cuts.length - 1;
-    if (parts < 2)
-        return false;
-
-    if (!Module._wmp_merge_begin_js(total, format, trackCount, ticksPerBeat, blockSize, compressed ? 1 : 0))
-        return false;
-
-    const stage = "BPFA: parallel load (" + parts + " workers)";
-    const helpers = [];
-    const percent = new Array(parts).fill(0);
-    const weight = [];
-    const results = [];
-    const helperUrl = new URL(
-        "midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
-        WASMIDI_MIDI_PARSER_BASE_URL).href;
-    try {
-        for (let k = 0; k < parts; ++k) {
-            const rangeBegin = k === 0 ? 0 : chunk[cuts[k]];
-            const rangeEnd = chunk[cuts[k + 1]];
-            weight.push((rangeEnd - rangeBegin) / total);
-            const helper = new Worker(helperUrl);
-            helpers.push(helper);
-            results.push(new Promise((resolve, reject) => {
-                helper.onmessage = event => {
-                    const m = event.data || {};
-                    if (m.type === "progress") {
-                        percent[k] = Math.max(0, Math.min(100, (Number(m.percent) - 15) / 0.79));
-                        let done = 0;
-                        for (let i = 0; i < parts; ++i) done += weight[i] * percent[i];
-                        progress(Math.floor(15 + 0.79 * done), stage);
-                    } else if (m.type === "partial-done") {
-                        resolve(m.blob);
-                    } else if (m.type === "partial-error") {
-                        reject(new Error(m.message || "Parallel MIDI helper failed"));
-                    }
-                };
-                helper.onerror = event => reject(new Error(
-                    (event && event.message) || "Parallel MIDI helper crashed"));
-            }));
-            helper.postMessage({
-                type: "partial",
-                file,
-                baseUrl: WASMIDI_MIDI_PARSER_BASE_URL,
-                version: WASMIDI_MIDI_PARSER_BOOTSTRAP,
-                size: total,
-                format,
-                trackCount,
-                ticksPerBeat,
-                firstTrack: cuts[k],
-                endTrack: cuts[k + 1],
-                firstChunkPosition: chunk[cuts[k]],
-                rangeBegin,
-                rangeEnd,
-                blockSize,
-                compress: compressed,
-                snapshotBudget: Math.floor(16 * 1024 * 1024 * (rangeEnd - rangeBegin) / total)
-            });
-        }
-        progress(15, stage);
-        if (!compressed && !Module._wmp_merge_read_raw_js())
-            throw new Error(parserErrorText(Module, "Could not read MIDI source"));
-        for (let k = 0; k < parts; ++k) {
-            const blob = await results[k];
-            helpers[k].terminate();
-            helpers[k] = null;
-            const ptr = Number(Module._wmp_merge_buffer_js(blob.byteLength));
-            if (!ptr)
-                throw new Error(parserErrorText(Module, "Could not allocate the parallel merge buffer"));
-            Module.HEAPU8.set(new Uint8Array(blob), ptr);
-            results[k] = null;
-            if (!Module._wmp_merge_part_js())
-                throw new Error(parserErrorText(Module, "Could not merge a partial MIDI index"));
-        }
-        progress(93, "BPFA: merging partial indexes");
-        if (!Module._wmp_merge_finish_js())
-            throw new Error(parserErrorText(Module, "Could not finish the parallel MIDI load"));
-        return true;
-    } catch (error) {
-        console.warn("[WASMIDI MIDI parser] parallel load failed; falling back to one thread", error);
-        return false;
-    } finally {
-        for (const helper of helpers)
-            if (helper) helper.terminate();
-    }
-}
-
 function fastSourceLimitBytes() {
     // MPWGL2 reads the whole MIDI once and then parses a contiguous Uint8Array,
     // which is much faster than repeated Blob.slice/FileReaderSync crossings.
@@ -1227,11 +1111,10 @@ self.onmessage = async event => {
             ? "Parsing MIDI from memory"
             : "Opening MIDI as a paged source");
 
-        const rawLimit = rawSourceLimitBytes(!!self.__wasmidiMidiParserWholeFile);
         if (typeof Module._wmp_set_raw_source_limit_js === "function")
-            Module._wmp_set_raw_source_limit_js(rawLimit);
-        const ok = await parallelParse(Module, file, total, total > rawLimit) ||
-            Module._wmp_parse_file_js(total);
+            Module._wmp_set_raw_source_limit_js(
+                rawSourceLimitBytes(!!self.__wasmidiMidiParserWholeFile));
+        const ok = Module._wmp_parse_file_js(total);
         if (!ok) {
             const parserText = parserErrorText(Module, "Could not parse MIDI");
             const readText = String(self.__wasmidiMidiParserReadError || "");

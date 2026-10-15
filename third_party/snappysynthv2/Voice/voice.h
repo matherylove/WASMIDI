@@ -103,7 +103,6 @@ typedef struct {
 
 VoiceStats GetVoiceStats(void);
 int voice_get_worker_count(void);
-void voice_set_steal_cap_percent(int percent);
 int voice_get_worker_thread_failures(void);
 int voice_get_detected_cores(void);
 int voice_get_path_fast(void);
