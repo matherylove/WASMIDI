@@ -73,3 +73,24 @@ g++ -O2 -std=c++17 -DUSE_BPFA $ZSTD_FLAGS -I../../src -I../../src/midi -o page_c
 ./page_compare_bpfa /tmp/feeder_synth.mid /tmp/pb.bin 0 3 1.5 10 2>/dev/null
 cmp -s /tmp/pa.bin /tmp/pb.bin && echo "visual pages IDENTICAL" || echo "visual pages DIFFER"
 rm -f page_compare_old page_compare_bpfa
+
+# Parallel load simulated on the host (HANDOFF sec. 60): raw and zstd, 3 helpers
+for t in store_compare render_compare live_compare page_compare; do
+  g++ -O2 -std=c++17 -DUSE_BPFA $ZSTD_FLAGS -I../../src -I../../src/midi -I. -o ${t}_par $t.cpp $SRCS $ZSTD_LIBS || exit 1
+  g++ -O2 -std=c++17 $ZSTD_FLAGS -I../../src -I../../src/midi -I. -o ${t}_ref $t.cpp $SRCS $ZSTD_LIBS || exit 1
+done
+for mode in raw zstd; do
+  if [ $mode = zstd ]; then export BPFA_ZSTD=1; else unset BPFA_ZSTD; fi
+  export BPFA_PARALLEL=3
+  ./store_compare_ref /tmp/feeder_synth.mid 0 30 0 /tmp/a.bin 2>/dev/null; ./store_compare_par /tmp/feeder_synth.mid 0 30 0 /tmp/b.bin 2>/dev/null
+  cmp -s /tmp/a.bin /tmp/b.bin && echo "parallel $mode synth IDENTICAL" || echo "parallel $mode synth DIFFER"
+  ./render_compare_ref /tmp/feeder_synth.mid 0 40 1 /tmp/a.bin 2>/dev/null; ./render_compare_par /tmp/feeder_synth.mid 0 40 1 /tmp/b.bin 2>/dev/null
+  cmp -s /tmp/a.bin /tmp/b.bin && echo "parallel $mode render IDENTICAL" || echo "parallel $mode render DIFFER"
+  ./live_compare_ref /tmp/feeder_synth.mid /tmp/a.bin 0 5 2.5 30 1 2>/dev/null; ./live_compare_par /tmp/feeder_synth.mid /tmp/b.bin 0 5 2.5 30 1 2>/dev/null
+  cmp -s /tmp/a.bin /tmp/b.bin && echo "parallel $mode live IDENTICAL" || echo "parallel $mode live DIFFER"
+  ./page_compare_ref /tmp/feeder_synth.mid /tmp/a.bin 0 3 1.5 10 2>/dev/null; ./page_compare_par /tmp/feeder_synth.mid /tmp/b.bin 0 3 1.5 10 2>/dev/null
+  cmp -s /tmp/a.bin /tmp/b.bin && echo "parallel $mode pages IDENTICAL" || echo "parallel $mode pages DIFFER"
+  unset BPFA_PARALLEL
+done
+unset BPFA_ZSTD
+rm -f *_par *_ref

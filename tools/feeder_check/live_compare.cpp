@@ -1,6 +1,7 @@
 // Live/keyboard snapshots with playback frames and seeks: current store vs BpfaMidiStore (HANDOFF sec. 44).
 #include "midi_mapped_store.hpp"
 #include "bpfa_midi_store.hpp"
+#include "bpfa_parallel_sim.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,7 +26,15 @@ int main(int argc, char** argv) {
     if (getenv("BPFA_ZSTD")) store.setRawSourceLimit(0);
 #endif
     MidiDocument meta;
-    if (!store.index(g_size, readAt, nullptr, meta)) { fprintf(stderr, "index failed\n"); return 1; }
+    #ifdef USE_BPFA
+    const char* parallelEnv = getenv("BPFA_PARALLEL");
+    const bool indexed = parallelEnv
+        ? bpfaParallelIndex(store, g_size, readAt, nullptr, meta, unsigned(atoi(parallelEnv)), getenv("BPFA_ZSTD") != nullptr)
+        : store.index(g_size, readAt, nullptr, meta);
+#else
+    const bool indexed = store.index(g_size, readAt, nullptr, meta);
+#endif
+    if (!indexed) { fprintf(stderr, "index failed\n"); return 1; }
     const MidiDocument& md = store.metadata();
     double ms = 0;
     auto frame = [&](double sec, bool force) {

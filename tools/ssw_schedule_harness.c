@@ -18,6 +18,15 @@ static double g_render_limit_ema_us = 0.0;
 static int t_admit_budget;
 static int voice_get_admit_budget_us(void) { return t_admit_budget; }
 static void voice_set_admit_budget_us(int us) { t_admit_budget = us; }
+/* rev. 68 admission/output stage: admission off and output stage a no-op here. */
+static int g_admission_percent = 0;
+static int g_max_voices = 1024;
+static unsigned g_admission_dropped = 0;
+static int g_soft_clip = 0;
+static int g_ssw_deterministic = 0;
+static void ssw_note_fifo_push(int key, int kept) { (void)key; (void)kept; }
+static int ssw_note_fifo_pop(int key) { (void)key; return 1; }
+static void ssw_output_stage(float* buffer, int frames) { (void)buffer; (void)frames; }
 static int voice_get_admit_key_cap(int w) { (void)w; return 0; }
 static void voice_set_admit_key_cap(int w, int v) { (void)w; (void)v; }
 static int voice_get_admit_key_max(int w) { (void)w; return 0; }
