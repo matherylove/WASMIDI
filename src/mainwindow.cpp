@@ -1425,6 +1425,12 @@ EM_JS(void, wasmidi_snappy_configure,
     });
 });
 
+EM_JS(void, wasmidi_snappy_set_gpu, (int enabled), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.setGpu)
+        b.setGpu(!!enabled);
+});
+
 EM_JS(void, wasmidi_snappy_set_overlap_gain, (int enabled), {
     const b = globalThis.WasmidiSnappyBridge;
     if (b && b.setOverlapGain)
@@ -1553,6 +1559,7 @@ MainWindow::MainWindow(QObject* parent)
         "synthSoftClip", synthSoftClip_ ? 1.0 : 0.0) != 0.0;
     synthOverlapGain_ = wasmidi_setting_number(
         "synthOverlapGain", synthOverlapGain_ ? 1.0 : 0.0) != 0.0;
+    synthGpu_ = wasmidi_setting_number("synthGpu", synthGpu_ ? 1.0 : 0.0) != 0.0;
 
     for (int i = 0; i < channelColors_.size(); ++i) {
         const QByteArray key = QByteArray("channelColor.") + QByteArray::number(i);
@@ -1592,6 +1599,7 @@ MainWindow::MainWindow(QObject* parent)
 #ifdef __EMSCRIPTEN__
     wasmidi_snappy_set_volume(volume_);
     wasmidi_snappy_set_overlap_gain(synthOverlapGain_ ? 1 : 0);
+    wasmidi_snappy_set_gpu(synthGpu_ ? 1 : 0);
     applySynthConfig();
     publishSynthPrebufferConfig();
 #endif
@@ -2919,6 +2927,20 @@ void MainWindow::setSynthSoftClip(bool enabled)
     applySynthConfig();
 }
 
+void MainWindow::setSynthGpu(bool enabled)
+{
+    if (synthGpu_ == enabled)
+        return;
+
+    synthGpu_ = enabled;
+    WASMIDI_PERSIST_SETTING("synthGpu", synthGpu_ ? 1 : 0);
+    emit synthConfigChanged();
+
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_set_gpu(synthGpu_ ? 1 : 0);
+#endif
+}
+
 void MainWindow::setSynthOverlapGain(bool enabled)
 {
     if (synthOverlapGain_ == enabled)
@@ -4147,6 +4169,7 @@ void MainWindow::pollSynthState()
         applySynthConfig();
         wasmidi_snappy_set_volume(volume_);
         wasmidi_snappy_set_overlap_gain(synthOverlapGain_ ? 1 : 0);
+    wasmidi_snappy_set_gpu(synthGpu_ ? 1 : 0);
         publishSynthPrebufferConfig();
     }
 

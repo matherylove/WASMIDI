@@ -263,6 +263,24 @@ void ssw_set_steal_cap_percent(int percent) { voice_set_steal_cap_percent(percen
  * splits), render-time limiter off, render queue sorted by voice age. With
  * "single" sharding the mix does not depend on worker count or timing. */
 static int g_ssw_deterministic = 0;
+/* ---- WebGPU offload glue (rev. 70, HANDOFF sec. 63) ---- */
+static void ssw_output_stage(float* buffer, int frames);
+static int g_wgpu_js_base = 0;
+#define voice_set_frame_base_for_wgpu(f) voice_wgpu_set_frame_base(f)
+int ssw_wgpu_set_enabled(int enabled) { return voice_wgpu_set_enabled(enabled); }
+void ssw_wgpu_begin_block(void) { voice_wgpu_begin_block(); }
+void ssw_wgpu_set_frame_cap(int frames) { voice_wgpu_set_frame_cap(frames); }
+void ssw_wgpu_set_frame_base(int frames) { g_wgpu_js_base = frames < 0 ? 0 : frames; }
+uintptr_t ssw_wgpu_requests_ptr(void) { return (uintptr_t)voice_wgpu_requests(); }
+int ssw_wgpu_request_count(void) { return voice_wgpu_request_count(); }
+int ssw_wgpu_collect_samples(uintptr_t table, int max_entries, uintptr_t total) {
+    return voice_wgpu_collect_samples((uint32_t*)table, max_entries, (uint32_t*)total);
+}
+float ssw_global_mix_gain(void) { return voice_global_mix_gain(); }
+void ssw_output_stage_apply(uintptr_t buffer, int frames) {
+    if (buffer && frames > 0) ssw_output_stage((float*)buffer, frames);
+}
+
 void ssw_set_deterministic(int enabled) {
     g_ssw_deterministic = enabled ? 1 : 0;
     voice_set_deterministic(g_ssw_deterministic);
@@ -1174,8 +1192,9 @@ static int ssw_render_to_buffer(float* out_buffer,
     /* voice_render_float() owns output initialization/first-worker copy just
      * like the native engine. Clearing here as well only doubles memory
      * bandwidth on every device block. */
+    voice_set_frame_base_for_wgpu(g_wgpu_js_base);
     voice_render_float(out_buffer, frames);
-    if (g_soft_clip) ssw_output_stage(out_buffer, frames);
+    if (g_soft_clip && !voice_wgpu_enabled()) ssw_output_stage(out_buffer, frames);
     g_render_cursor += frames;
     return 1;
 }
@@ -1527,6 +1546,7 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 
                 if (boundary > segment_start) {
                     const int segment_frames = boundary - segment_start;
+                    voice_set_frame_base_for_wgpu(g_wgpu_js_base + segment_start);
                     voice_render_float(
                         ((float*)out_ptr) +
                             (size_t)segment_start * (size_t)channels,
@@ -1588,12 +1608,13 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 events_done:
     if (segment_start < frames) {
         const int remaining = frames - segment_start;
+        voice_set_frame_base_for_wgpu(g_wgpu_js_base + segment_start);
         voice_render_float(
             ((float*)out_ptr) + (size_t)segment_start * (size_t)channels,
             remaining);
         g_render_cursor += remaining;
     }
-    if (g_soft_clip) ssw_output_stage((float*)out_ptr, frames);
+    if (g_soft_clip && !voice_wgpu_enabled()) ssw_output_stage((float*)out_ptr, frames);
     g_song_frame = block_end_frame;
     g_song_time_seconds =
         (double)g_song_frame /

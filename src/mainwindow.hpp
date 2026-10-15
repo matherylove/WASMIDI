@@ -106,6 +106,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(bool synthValidateState READ synthValidateState WRITE setSynthValidateState NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthSoftClip READ synthSoftClip WRITE setSynthSoftClip NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthOverlapGain READ synthOverlapGain WRITE setSynthOverlapGain NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthGpu READ synthGpu WRITE setSynthGpu NOTIFY synthConfigChanged)
 
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
     Q_PROPERTY(float dominantHue READ dominantHue NOTIFY neuralVisualChanged)
@@ -200,6 +201,7 @@ public:
     bool synthValidateState() const { return synthValidateState_; }
     bool synthSoftClip() const { return synthSoftClip_; }
     bool synthOverlapGain() const { return synthOverlapGain_; }
+    bool synthGpu() const { return synthGpu_; }
 
     QVariantList channelColorList() const;
     float dominantHue() const { return dominantHue_; }
@@ -266,6 +268,7 @@ public:
     void setSynthValidateState(bool enabled);
     void setSynthSoftClip(bool enabled);
     void setSynthOverlapGain(bool enabled);
+    void setSynthGpu(bool enabled);
 
 signals:
     void playingChanged();
@@ -514,6 +517,7 @@ private:
     bool synthValidateState_ = false;
     bool synthSoftClip_ = true;
     bool synthOverlapGain_ = false;
+    bool synthGpu_ = false;
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;
     bool synthWasStarved_ = false;

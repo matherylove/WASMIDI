@@ -11,6 +11,7 @@ typedef struct {
     int has_loop;
     int loop_start;
     int loop_end;
+    int gpu_offset_plus_one; /* WebGPU sample pool offset (int16 units) + 1; 0 = not uploaded */
 } wav_data;
 
 wav_data* wav_load(const char* path);

@@ -80,6 +80,8 @@
         // Voice renderer runtime switches.
         softClip: true,
         overlapGain: false,
+        gpu: false,
+        gpuStatus: "off",
 
         volume: 1.00
     };
@@ -494,6 +496,13 @@
                         state.soundfontLoaded
                             ? "SF2 ready"
                             : "SnappySynthV2 ready — load an SF2");
+                    break;
+
+                case "gpu":
+                    state.gpuStatus = String(data.status || "off");
+                    updateStatus("WasmiSynth GPU: " + state.gpuStatus);
+                    if (state.gpuStatus.startsWith("unavailable"))
+                        console.warn("[WASMIDI WasmiSynth] GPU", state.gpuStatus);
                     break;
 
                 case "error": {
@@ -948,6 +957,12 @@
         }
     }
 
+    function setGpu(enabled) {
+        state.gpu = !!enabled;
+        if (worker)
+            worker.postMessage({ type: "gpu", enabled: state.gpu });
+    }
+
     function setOverlapGain(enabled) {
         state.overlapGain =
             !!enabled;
@@ -1196,6 +1211,7 @@
         clearSoundfonts,
         setVolume,
         setOverlapGain,
+        setGpu,
         setPrebuffer,
         configure,
         getAudioClock

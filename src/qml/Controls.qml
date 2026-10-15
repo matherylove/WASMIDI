@@ -827,6 +827,16 @@ Item {
                     }
 
                     FlatButton {
+                        Layout.preferredWidth: 44
+                        implicitHeight: 21
+                        text: root.mainWindow.synthGpu ? "GPU" : "CPU"
+                        normalColor: root.mainWindow.synthGpu ? "#2a194b" : "#110e20"
+                        borderColor: root.mainWindow.synthGpu ? "#6b48a8" : "#352550"
+                        textColor: root.mainWindow.synthGpu ? "#c4b5fd" : "#746a87"
+                        onClicked: root.mainWindow.synthGpu = !root.mainWindow.synthGpu
+                    }
+
+                    FlatButton {
                         Layout.preferredWidth: 68
                         implicitHeight: 21
                         enabled: !root.mainWindow.isPlaying

@@ -91,6 +91,7 @@ typedef struct {
     float           vor_base_gain_unit;
     float           vor_original_volume_unit;
     #endif
+    uint32_t        wgpu_serial;            // rev. 70: last WebGPU block that rendered this voice
 } voice;
 
 typedef struct {
@@ -105,6 +106,15 @@ VoiceStats GetVoiceStats(void);
 int voice_get_worker_count(void);
 void voice_set_steal_cap_percent(int percent);
 void voice_set_deterministic(int enabled);
+int voice_wgpu_set_enabled(int enabled);
+int voice_wgpu_enabled(void);
+void voice_wgpu_begin_block(void);
+void voice_wgpu_set_frame_cap(int frames);
+void voice_wgpu_set_frame_base(int frames);
+void *voice_wgpu_requests(void);
+int voice_wgpu_request_count(void);
+int voice_wgpu_collect_samples(uint32_t *table, int max_entries, uint32_t *total_int16);
+float voice_global_mix_gain(void);
 int voice_get_worker_thread_failures(void);
 int voice_get_detected_cores(void);
 int voice_get_path_fast(void);

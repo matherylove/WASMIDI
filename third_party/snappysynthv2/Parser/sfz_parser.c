@@ -1583,7 +1583,7 @@ static wav_data* resample_wav_data(wav_data* original, int target_sample_rate) {
     float ratio = (float)target_sample_rate / (float)original->sample_rate;
     int new_num_samples = (int)(original->num_samples * ratio);
 
-    wav_data* resampled = (wav_data*)malloc(sizeof(wav_data));
+    wav_data* resampled = (wav_data*)calloc(1, sizeof(wav_data));
     if (!resampled) return original;
 
     resampled->sample_rate = target_sample_rate;

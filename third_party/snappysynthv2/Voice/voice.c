@@ -476,6 +476,35 @@ static int    g_tile_mix_tiles = 0;
 static int    g_tile_mix_frames = 0;
 static volatile LONG g_deterministic = 0;
 void voice_set_deterministic(int enabled) { InterlockedExchange(&g_deterministic, enabled ? 1 : 0); }
+
+/* ---- WebGPU voice offload (rev. 70, HANDOFF sec. 63) ------------------------
+ * Simple sounding voices (decay/sustain, no filter, no portamento, no pending
+ * note-off) are not rendered here: their parameters go to g_wgpu_requests, the
+ * JS side renders them on the GPU, and the CPU only advances their state with
+ * the same per-sample arithmetic as its own render loop. */
+typedef struct {
+    uint32_t sample_offset, sample_channels, loop_active, env_state;
+    uint32_t out_offset, frames, startup, voice_id;
+    uint32_t filter_enabled, filter_reset, segment, sustain_down;
+    int32_t pending_off;
+    uint32_t pad0, pad1, pad2;
+    float position, pitch, gain_l, gain_r;
+    float env, decay_dec, sustain, attack_inc;
+    float release_alpha, loop_start, loop_end, playback_end;
+    float b0, b1, b2, a1;
+    float a2, z1l, z2l, z1r;
+    float z2r, pad3, pad4, pad5;
+} wgpu_voice_request; /* 160 bytes; mirrored by the WGSL struct in snappysynth-webgpu.js */
+static uint32_t g_wgpu_serial = 1;
+static volatile LONG g_wgpu_frames = 0;
+static LONG g_wgpu_frame_cap = 0x7fffffff;
+static uint32_t g_wgpu_segment = 0;
+static volatile LONG g_wgpu_enabled = 0;
+static wgpu_voice_request *g_wgpu_requests = NULL;
+static int g_wgpu_capacity = 0;
+static volatile LONG g_wgpu_count = 0;
+static int g_wgpu_frame_base = 0;
+
 static int  g_render_queue_cap = 0;
 static volatile LONG g_render_size = 0;
 static volatile LONG g_render_pop = 0;
@@ -3996,6 +4025,132 @@ static DWORD wait_for_worker_cycle(LONG render_cycle, DWORD timeout_ms) {
 #if SSW_WORKER_CYCLE_TRAMPOLINE && (defined(__GNUC__) || defined(__clang__))
 __attribute__((noinline))
 #endif
+/* Returns 0 = render on the CPU, 1 = offloaded, 2 = offloaded and finished (OFF). */
+static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int check_key_off_counter) {
+    const sfz_region *region = v->region;
+    const wav_data *sample = region->is_resampled ? region->resampled_data : region->sample_data;
+    if (!sample || !sample->data || sample->gpu_offset_plus_one <= 0 || channels != 2) return 0;
+    const int s_num = sample->num_samples, s_ch = sample->num_channels;
+    const int ch = v->owner_channel;
+    if (s_ch < 1 || s_ch > 2 || ch < 0 || ch >= MIDI_CHANNEL_COUNT) return 0;
+    const channel_render_state *ch_render = &g_channel_render[ch];
+    if (v->env_state == ENV_OFF || v->kill_now) return 0;
+    if (v->startup_samples >= frames) return 0;
+    if (fabsf(v->portamento_offset) > 0.0001f && fabsf(v->portamento_step) > 0.0f) return 0;
+#ifdef VOR
+    if (fabsf(v->vor_gain_scale - v->vor_gain_target) > 0.00001f) return 0;
+    if (v->pending_note_off_samples >= 0 && v->vor_stack_count > 1) return 0;
+#endif
+    const int sample_start = (v->sample_start >= 0 && v->sample_start < s_num) ? v->sample_start : 0;
+    const int sample_end = (v->sample_end > sample_start && v->sample_end <= s_num) ? v->sample_end : s_num;
+    const int loop_start = (v->loop_start >= sample_start && v->loop_start < sample_end) ? v->loop_start : sample_start;
+    const int loop_end = (v->loop_end > loop_start && v->loop_end <= sample_end) ? v->loop_end : sample_end;
+    const int loop_active = (v->loop_mode == 1 || v->loop_mode == 2) && loop_end > loop_start;
+    const float pitch = v->pitch_multiplier * ch_render->bend_pitch_mul;
+    float pos = v->position < (float)sample_start ? (float)sample_start : v->position;
+    if (!loop_active && pos + pitch * (float)frames >= (float)(sample_end - 1)) return 0;
+    /* Stay within the GPU's scratch rows (voice-frames per block). */
+    if (InterlockedAdd(&g_wgpu_frames, frames) > g_wgpu_frame_cap) return 0;
+    const LONG slot = InterlockedIncrement(&g_wgpu_count) - 1;
+    if (slot >= g_wgpu_capacity) return 0;
+    /* Block-start note-off handling, as the CPU loop does it. */
+    const int sustain_down = g_channel_sustain_snapshot[ch];
+    int env_state = v->env_state;
+    if (check_key_off_counter && !v->note_off_received && v->pending_note_off_samples < 0 &&
+        env_state != ENV_RELEASE && v->key >= 0 && v->key < MIDI_KEY_COUNT && v->key_order_id > 0 &&
+        g_key_off_counter && g_key_off_counter[ch][v->key] >= v->key_order_id) {
+        v->note_off_received = 1;
+        if (!sustain_down) env_state = ENV_RELEASE;
+    }
+    if (v->note_off_received && !sustain_down && env_state != ENV_RELEASE) env_state = ENV_RELEASE;
+#ifdef VOR
+    const float base_gain = v->base_gain * ch_render->gain_mul * v->vor_gain_scale;
+#else
+    const float base_gain = v->base_gain * ch_render->gain_mul;
+#endif
+    const float attack_inc = v->env_attack_inc >= 0.0f ? v->env_attack_inc : ch_render->attack_inc;
+    const float decay_dec = v->env_decay_dec >= 0.0f ? v->env_decay_dec : g_decay_dec;
+    const float release_alpha = v->env_release_seconds >= 0.0f
+        ? region_release_seconds_to_alpha(clampf(v->env_release_seconds * ch_render->release_time_scale, 0.0f, 3.2f))
+        : (v->env_release_alpha >= 0.0f ? v->env_release_alpha : ch_render->release_alpha);
+    const int filter_enabled = v->region_filter_enabled || ch_render->filter_enabled;
+    float c_b0 = 0.0f, c_b1 = 0.0f, c_b2 = 0.0f, c_a1 = 0.0f, c_a2 = 0.0f;
+    if (filter_enabled) {
+        c_b0 = v->region_filter_enabled ? v->region_b0 : ch_render->b0;
+        c_b1 = v->region_filter_enabled ? v->region_b1 : ch_render->b1;
+        c_b2 = v->region_filter_enabled ? v->region_b2 : ch_render->b2;
+        c_a1 = v->region_filter_enabled ? v->region_a1 : ch_render->a1;
+        c_a2 = v->region_filter_enabled ? v->region_a2 : ch_render->a2;
+        if (v->region_filter_enabled && ch_render->filter_enabled) {
+            float cutoff = v->region_cutoff_hz, resonance = v->region_resonance_q;
+            if (cutoff <= 0.0f || ch_render->cutoff_hz < cutoff) cutoff = ch_render->cutoff_hz;
+            if (ch_render->resonance_q > resonance) resonance = ch_render->resonance_q;
+            compute_static_lpf(cutoff, resonance, &c_b0, &c_b1, &c_b2, &c_a1, &c_a2);
+        }
+    }
+    wgpu_voice_request *r = &g_wgpu_requests[slot];
+    memset(r, 0, sizeof(*r));
+    r->sample_offset = (uint32_t)(sample->gpu_offset_plus_one - 1);
+    r->sample_channels = (uint32_t)s_ch;
+    r->loop_active = (uint32_t)loop_active;
+    r->env_state = (uint32_t)env_state;
+    r->out_offset = (uint32_t)g_wgpu_frame_base;
+    r->frames = (uint32_t)frames;
+    r->startup = (uint32_t)(v->startup_samples > 0 ? v->startup_samples : 0);
+    r->voice_id = (uint32_t)vid;
+    r->filter_enabled = (uint32_t)filter_enabled;
+    /* GPU-resident filter state continues only across consecutive GPU blocks. */
+    r->filter_reset = (v->wgpu_serial == g_wgpu_serial || v->wgpu_serial + 1u == g_wgpu_serial) ? 0u : 1u;
+    r->segment = g_wgpu_segment;
+    r->sustain_down = (uint32_t)sustain_down;
+    r->pending_off = v->pending_note_off_samples;
+    r->position = pos;
+    r->pitch = pitch;
+    r->gain_l = base_gain * ch_render->pan_l * v->region_pan_l;
+    r->gain_r = base_gain * ch_render->pan_r * v->region_pan_r;
+    r->env = v->env_level;
+    r->decay_dec = decay_dec;
+    r->sustain = DEFAULT_SUSTAIN_LEVEL;
+    r->attack_inc = attack_inc;
+    r->release_alpha = release_alpha;
+    r->loop_start = (float)loop_start;
+    r->loop_end = (float)loop_end;
+    r->playback_end = (float)(loop_active ? loop_end : sample_end);
+    r->b0 = c_b0; r->b1 = c_b1; r->b2 = c_b2; r->a1 = c_a1; r->a2 = c_a2;
+    r->z1l = v->z1_l; r->z2l = v->z2_l; r->z1r = v->z1_r; r->z2r = v->z2_r;
+    v->wgpu_serial = g_wgpu_serial;
+    /* Same per-sample state arithmetic as the GPU kernel, without samples. */
+    float env = v->env_level;
+    int pending = v->pending_note_off_samples;
+    for (int f = (int)r->startup; f < frames; ++f) {
+        if (pending > 0 && --pending == 0) {
+            pending = -1;
+            if (!v->note_off_received && env_state != ENV_OFF && env_state != ENV_RELEASE) {
+                v->note_off_received = 1;
+                if (!sustain_down) env_state = ENV_RELEASE;
+            }
+        }
+        if (env_state == ENV_ATTACK) {
+            env += attack_inc;
+            if (env >= 1.0f) { env = 1.0f; env_state = ENV_DECAY; }
+        } else if (env_state == ENV_DECAY) {
+            env -= decay_dec;
+            if (env <= DEFAULT_SUSTAIN_LEVEL) { env = DEFAULT_SUSTAIN_LEVEL; env_state = ENV_SUSTAIN; }
+        } else if (env_state == ENV_RELEASE) {
+            env *= release_alpha;
+            if (env <= VOICE_SILENCE) { env_state = ENV_OFF; break; }
+        }
+        pos += pitch;
+        if (loop_active && pos >= (float)loop_end) pos -= (float)(loop_end - loop_start);
+    }
+    v->pending_note_off_samples = pending;
+    v->startup_samples = 0;
+    v->position = pos;
+    v->env_level = env;
+    v->env_state = env_state;
+    return env_state == ENV_OFF ? 2 : 1;
+}
+
 static int voice_age_less(const void *a, const void *b) {
     const int va = *(const int*)a, vb = *(const int*)b;
     if (va < 0 || vb < 0) return (va < 0) - (vb < 0);
@@ -4814,6 +4969,7 @@ int need_compact = (wd->release_count > 0);
                                                                                                                                                                                                                                                                 // Consumer phase: work-stealing across all voices (pop in chunks to reduce atomics)
                                                                                                                                                                                                                                                                 // Chunk size scales with total voice count: fewer atomic ops per worker at high loads.
 LONG pop_chunk = RENDER_TILE_VOICES;
+const int wgpu_block = (int)load_relaxed_long(&g_wgpu_enabled) && g_wgpu_requests && channels == 2;
 LONG render_size = load_relaxed_long(&g_render_size);
 const size_t tile_stride = (size_t)g_tile_mix_frames * (size_t)channels;
 int ss_worker_counted = 0;
@@ -4851,6 +5007,7 @@ if (channels == 2) {
 fast_batch = render_fast_stereo_sustain_batch(
     k, end, mix, frames, render_cycle, check_key_off_counter);
 #elif defined(__wasm_simd128__)
+if (!wgpu_block)
 fast_batch = render_fast_stereo_sustain_batch_wasm(
     k, end, mix, frames, render_cycle, check_key_off_counter);
 #endif
@@ -4870,6 +5027,13 @@ if (!v->region || !v->region->sample_data) {
 v->env_state = ENV_OFF;
 need_compact = 1;
 continue;
+}
+if (wgpu_block) {
+    const int offloaded = wgpu_try_offload(v, vid, frames, channels, check_key_off_counter);
+    if (offloaded) {
+        if (offloaded == 2 || v->env_state != ENV_SUSTAIN || v->note_off_received) need_compact = 1;
+        continue;
+    }
 }
 
 #ifdef GPUMIX
@@ -7187,6 +7351,11 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
                                                                                                                                                                                                                                                                 static void mix_apply_gain_and_limit(float *buf, int samples) {
                                                                                                                                                                                                                                                                 const int ch = g_audio.num_channels;
                                                                                                                                                                                                                                                                 if (ch < 1) return;
+if (load_relaxed_long(&g_wgpu_enabled)) {
+    /* GPU mode: the core limiter runs after the GPU voices are added. */
+    for (int i = 0; i < samples; ++i) buf[i] *= g_global_mix_gain;
+    return;
+}
 
                                                                                                                                                                                                                                                                 static float env = 1.0f;
 
@@ -7659,3 +7828,73 @@ int voice_get_detected_cores(void) {
 int voice_get_worker_count(void) {
     return g_worker_count;
 }
+
+float voice_global_mix_gain(void) { return g_global_mix_gain; }
+
+int voice_wgpu_set_enabled(int enabled) {
+    if (enabled) {
+        const int want = max_voices > 0 ? max_voices * 8 : 0;
+        if (want > g_wgpu_capacity) {
+            wgpu_voice_request *requests = (wgpu_voice_request*)realloc(g_wgpu_requests, sizeof(wgpu_voice_request) * (size_t)want);
+            if (!requests) return 0;
+            g_wgpu_requests = requests;
+            g_wgpu_capacity = want;
+        }
+    }
+    InterlockedExchange(&g_wgpu_enabled, enabled && g_wgpu_requests ? 1 : 0);
+    return (int)load_relaxed_long(&g_wgpu_enabled);
+}
+
+/* Table of every sample buffer the regions use, 4 x u32 per entry: {address low,
+ * address high, int16 count, pool offset}. Assigns pool offsets; JS uploads the
+ * data in that layout. */
+int voice_wgpu_collect_samples(uint32_t *table, int max_entries, uint32_t *total_int16) {
+    uint32_t total = 0;
+    int count = 0;
+    if (!instrument) { if (total_int16) *total_int16 = 0; return 0; }
+    for (int i = 0; i < instrument->num_regions; ++i) {
+        sfz_region *region = &instrument->regions[i];
+        wav_data *list[2] = {region->sample_data, region->is_resampled ? region->resampled_data : NULL};
+        for (int j = 0; j < 2; ++j) {
+            wav_data *w = list[j];
+            if (w) w->gpu_offset_plus_one = 0;
+        }
+    }
+    for (int i = 0; i < instrument->num_regions; ++i) {
+        sfz_region *region = &instrument->regions[i];
+        wav_data *list[2] = {region->sample_data, region->is_resampled ? region->resampled_data : NULL};
+        for (int j = 0; j < 2; ++j) {
+            wav_data *w = list[j];
+            if (!w || !w->data || w->num_samples <= 0 || w->num_channels < 1 || w->gpu_offset_plus_one) continue;
+            const uint32_t n = (uint32_t)w->num_samples * (uint32_t)w->num_channels;
+            if (count >= max_entries || total + n + 2u < total) continue;
+            w->gpu_offset_plus_one = (int)total + 1;
+            table[count * 4 + 0] = (uint32_t)(uintptr_t)w->data;
+            table[count * 4 + 1] = (uint32_t)((uint64_t)(uintptr_t)w->data >> 32);
+            table[count * 4 + 2] = n;
+            table[count * 4 + 3] = total;
+            ++count;
+            total += n + 2u; /* two guard samples for interpolation past the end */
+            total = (total + 1u) & ~1u; /* even offsets: 4-byte aligned GPU uploads */
+        }
+    }
+    if (total_int16) *total_int16 = total;
+    return count;
+}
+
+void voice_wgpu_set_frame_cap(int frames) { g_wgpu_frame_cap = frames > 0 ? frames : 0x7fffffff; }
+void voice_wgpu_begin_block(void) {
+    InterlockedExchange(&g_wgpu_count, 0);
+    InterlockedExchange(&g_wgpu_frames, 0);
+    ++g_wgpu_serial;
+    if (g_wgpu_serial == 0) g_wgpu_serial = 2;
+    g_wgpu_segment = 0;
+}
+/* Called once per voice_render_float segment: requests of a segment form one GPU pass. */
+void voice_wgpu_set_frame_base(int frames) { g_wgpu_frame_base = frames; ++g_wgpu_segment; }
+void *voice_wgpu_requests(void) { return g_wgpu_requests; }
+int voice_wgpu_request_count(void) {
+    const int n = (int)load_relaxed_long(&g_wgpu_count);
+    return n < g_wgpu_capacity ? n : g_wgpu_capacity;
+}
+int voice_wgpu_enabled(void) { return (int)load_relaxed_long(&g_wgpu_enabled); }

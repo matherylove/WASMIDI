@@ -4050,4 +4050,74 @@ es un núcleo más, no la eliminación de esperas.
 **Prueba pedida:** en el navegador, Hypernova y The Nuker 3 con 1024 voces y Sharding
 Auto (= Single) contra Hash; ver si desaparecen los tirones por workers.
 
-Última revisión entregada: `wasmidi-main-rev69-svms-multicore.zip`.
+Revisión anterior entregada: `wasmidi-main-rev69-svms-multicore.zip`.
+
+---
+
+## 63. Revisión 70 — etapa 3: render de voces por WebGPU con interruptor CPU/GPU
+
+**Modelo (híbrido, inspirado en Kestrel y en el `GPUMIX` original de SSv2):** el CPU sigue
+siendo el dueño de las voces (eventos, admisión, robos, note-offs) y decide, voz por voz y
+segmento por segmento, cuáles van a la GPU. Para esas, en vez de renderizar, escribe una
+petición de 160 bytes (`wgpu_voice_request`) y **avanza su estado con la misma aritmética
+por muestra** que usa el shader (posición con loop, envolvente ataque/decay/sustain/release,
+note-off pendiente), así el CPU nunca espera a la GPU para decidir el bloque siguiente. La
+GPU devuelve solo audio.
+
+**Qué va a la GPU (`wgpu_try_offload`, `Voice/voice.c`):** voces con sample en el pool de
+la GPU, salida estéreo, sample mono/estéreo, sin portamento en curso, sin `kill_now`, sin
+fundido VOR, sin note-off pendiente sobre un apilado VOR (>1), con `startup` menor al
+segmento, que no se salgan del sample sin loop en este segmento. Incluye ataque, release,
+note-off pendiente (no-VOR) y **filtro**: el estado del biquad vive en la GPU por voz
+(`filters[voice_id]`) y continúa entre bloques GPU consecutivos; si la voz no se renderizó
+en la GPU en el bloque anterior, se reinicia con el estado del CPU (`filter_reset`).
+Limitación conocida: si una voz filtrada vuelve al CPU (p. ej. por `kill_now`), el CPU usa su
+último estado propio del filtro.
+
+**Piezas:**
+
+- `Voice/voice.{c,h}`: `wgpu_voice_request`, `wgpu_try_offload`, capacidad
+  `max_voices × 8` peticiones, tope de voz-frames por bloque (`voice_wgpu_set_frame_cap`,
+  para no exceder el scratch de la GPU), serial de bloque y número de segmento,
+  `voice_wgpu_collect_samples` (tabla {dirección baja/alta, int16, offset} con offsets
+  pares y 2 muestras de guarda), campo `wgpu_serial` en `voice`, `gpu_offset_plus_one` en
+  `wav_data` (el `malloc` del resample de SFZ pasó a `calloc`). En modo GPU se salta el lote
+  rápido WASM SIMD (para que las voces pasen por la descarga) y `mix_apply_gain_and_limit`
+  aplica solo la ganancia global (el limitador del core corre después de sumar la GPU).
+- `snappy_wasm_core.c`: base de frames por segmento (`ssw_wgpu_set_frame_base` + inicio del
+  segmento), sin etapa de salida en C en modo GPU, exports `ssw_wgpu_*`,
+  `ssw_global_mix_gain`, `ssw_output_stage_apply` (en CMake).
+- `web/snappysynth-webgpu.js` (nuevo, desplegado por el CI): `WasmiSynthGpu`. Shader WGSL
+  `renderVoices` (un hilo por petición, recorre sus frames con interpolación lineal,
+  filtro, envolvente; escribe filas empaquetadas en `scratch`) y `reduceMix` (un hilo por
+  muestra de salida, suma las peticiones en orden fijo). Una pasada por segmento (el filtro
+  avanza en orden), luego la reducción, copia a un búfer de lectura y `mapAsync`. Pool de
+  samples en un storage buffer (u32 con dos int16); si no entra en
+  `maxStorageBufferBindingSize`, se informa y se queda en CPU. Errores de dispositivo
+  (`lost`, `onuncapturederror`) apagan la GPU.
+- `web/snappysynth-worker.js`: `setupGpu`/`disableGpu`, y `renderOneBlockGpu`: el bloque se
+  renderiza en el ring pero **no se publica** hasta que llega su parte GPU; entonces se suma,
+  se aplica la etapa de salida y se publica en orden (hasta 8 bloques en vuelo; el espacio
+  libre descuenta los no publicados). Un seek (generación del ring) descarta los pendientes.
+  Al volver a CPU se terminan primero los bloques GPU pendientes. Se rehace al cargar otro
+  soundfont o reinicializar el core.
+- Bridge (`setGpu`, estado `gpuStatus`, se muestra como "WasmiSynth GPU: …"),
+  `mainwindow` (`synthGpu`, persistido, reaplicado cuando el synth queda listo) y botón
+  **CPU/GPU** en el panel WASMISYNTH (junto a "Stack gain").
+
+**Verificación (host, `tools/host_bench/midibench.c` con `GPUEMU=1`, que emula el shader en
+C con el mismo algoritmo):**
+
+- Hypernova 40-44 s: 460.867 voz-bloques en la "GPU"; 100-102 s: 345.228.
+- Nivel CPU vs CPU+GPU: 79,54/79,65 dB y 79,48/79,49 dB.
+- Forma de onda: correlación **1,000** (zona liviana) y **0,987** (zona densa) alineando
+  **127 muestras**: en modo GPU se saltea el limitador con anticipación de `voice.c`, así que
+  la salida sale ~2,9 ms antes que en modo CPU.
+- Modo determinístico: idéntico con 1 y 4 workers, tanto en CPU como con la GPU emulada.
+- Arneses del CI (scheduler con stubs nuevos, rebalanceo, worker cycle) OK.
+
+**No verificable acá:** que el WGSL compile en Chrome, el pipeline WebGPU real, la latencia
+del `mapAsync` y la ganancia de rendimiento. Probar con el botón GPU y mirar el estado del
+panel ("active (N MB of samples on the GPU)" o el motivo de "unavailable") y la consola.
+
+Última revisión entregada: `wasmidi-main-rev70-webgpu.zip`.

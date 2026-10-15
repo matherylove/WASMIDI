@@ -6,6 +6,130 @@ importScripts("./snappysynth-core.js?v=13.12.0");
 
 let Module = null;
 let coreReady = false;
+
+// ---- WebGPU voice rendering (HANDOFF sec. 63) ----------------------------
+// Blocks rendered with GPU voices stay unpublished in the ring until their GPU
+// part is added, then are published in order.
+let gpuWanted = false;
+let gpuEngine = null;
+let gpuActive = false;
+let gpuStatus = "off";
+let gpuPending = [];
+let gpuPendingFrames = 0;
+let gpuWriteFrame = -1;
+let gpuSetupSerial = 0;
+
+function setGpuStatus(status) {
+    if (status === gpuStatus) return;
+    gpuStatus = status;
+    postState("gpu", { status });
+}
+
+function disableGpu(status) {
+    if (Module && coreReady && Module._ssw_wgpu_set_enabled) Module._ssw_wgpu_set_enabled(0);
+    gpuActive = false;
+    setGpuStatus(status || "off");
+}
+
+async function setupGpu() {
+    const serial = ++gpuSetupSerial;
+    if (!gpuWanted) { disableGpu("off"); return; }
+    if (!Module || !coreReady || !soundfontLoaded || !Module._ssw_wgpu_set_enabled) return;
+    try {
+        if (!self.WasmiSynthGpu)
+            importScripts("./snappysynth-webgpu.js?v=13.12.0");
+        const voices = Math.max(1, Number(maxVoices) | 0);
+        const frames = Math.max(1, preferredRenderFrames() | 0);
+        if (!gpuEngine || gpuEngine.lost || gpuEngine.maxVoices !== voices || gpuEngine.blockFrames < frames) {
+            if (gpuEngine) { try { gpuEngine.destroy(); } catch (_) {} }
+            gpuEngine = null;
+            const made = await self.WasmiSynthGpu.create(voices, Math.max(frames, 2048));
+            if (serial !== gpuSetupSerial) return;
+            if (!made.gpu) { disableGpu("unavailable: " + made.reason); return; }
+            gpuEngine = made.gpu;
+        }
+        const reason = gpuEngine.uploadSamples(Module,
+            n => Module._malloc(n), p => Module._free(p));
+        if (reason) { disableGpu("unavailable: " + reason); return; }
+        Module._ssw_wgpu_set_frame_cap(Math.floor(gpuEngine.scratchFrames * 0.95));
+        if (!Module._ssw_wgpu_set_enabled(1)) { disableGpu("unavailable: out of memory"); return; }
+        gpuActive = true;
+        setGpuStatus("active (" + Math.round(gpuEngine.poolBytes / 1048576) + " MB of samples on the GPU)");
+    } catch (error) {
+        disableGpu("unavailable: " + (error && error.message ? error.message : String(error)));
+    }
+}
+
+function dropGpuPending() {
+    gpuPending = [];
+    gpuPendingFrames = 0;
+    gpuWriteFrame = -1;
+}
+
+function flushGpuPending() {
+    const header = ringHeader();
+    if (!header || !Module) { dropGpuPending(); return; }
+    while (gpuPending.length && gpuPending[0].done) {
+        const entry = gpuPending.shift();
+        if (entry.generation !== Atomics.load(header, RING_GENERATION)) { dropGpuPending(); return; }
+        const stride = Math.max(1, synthChannels);
+        const ptr = audioRingPcmPtr + entry.writeFrame * stride * 4;
+        if (entry.result && stride === 2) {
+            const pcm = Module.HEAPF32.subarray(ptr >>> 2, (ptr >>> 2) + entry.frames * 2);
+            const add = entry.result;
+            for (let i = 0; i < add.length && i < pcm.length; ++i) pcm[i] += add[i];
+        }
+        Module._ssw_output_stage_apply(ptr, entry.frames);
+        const nextWrite = entry.writeFrame + entry.frames >= audioRingCapacityFrames
+            ? 0 : entry.writeFrame + entry.frames;
+        Atomics.store(header, RING_WRITE, nextWrite);
+        Atomics.add(header, RING_AVAILABLE, entry.frames);
+        gpuPendingFrames -= entry.frames;
+    }
+    if (!gpuPending.length) gpuWriteFrame = -1;
+}
+
+function renderOneBlockGpu(frames) {
+    const header = ringHeader();
+    if (!header || !audioRingPcmPtr) return false;
+    const available = Atomics.load(header, RING_AVAILABLE);
+    if (audioRingCapacityFrames - available - gpuPendingFrames < frames) return false;
+    if (gpuPending.length > 8) return false;
+    const writeFrame = gpuWriteFrame >= 0 ? gpuWriteFrame : Atomics.load(header, RING_WRITE);
+    if (writeFrame < 0 || writeFrame + frames > audioRingCapacityFrames) return false;
+    const generation = Atomics.load(header, RING_GENERATION);
+    const blockStart = renderSongTime;
+    const outPtr = audioRingPcmPtr + writeFrame * Math.max(1, synthChannels) * 4;
+    if (gpuActive) Module._ssw_wgpu_begin_block();
+    if (!renderQueuedWithSysex(outPtr, blockStart, frames))
+        throw new Error("SnappySynthV2 shared-ring render failed.");
+    if (generation !== Atomics.load(header, RING_GENERATION)) return false;
+    const entry = { writeFrame, frames, generation, done: false, result: null };
+    gpuPending.push(entry);
+    gpuPendingFrames += frames;
+    gpuWriteFrame = writeFrame + frames >= audioRingCapacityFrames ? 0 : writeFrame + frames;
+    let work;
+    try {
+        work = gpuActive && gpuEngine ? gpuEngine.submit(Module, frames) : Promise.resolve(null);
+    } catch (error) {
+        work = Promise.reject(error);
+    }
+    work.then(result => { entry.result = result; entry.done = true; flushGpuPending(); },
+              error => {
+                  entry.done = true;
+                  disableGpu("unavailable: " + (error && error.message ? error.message : String(error)));
+                  flushGpuPending();
+              });
+    renderSongTime = blockStart + frames / sampleRateHz;
+    pendingNeedFrames = Math.max(0, pendingNeedFrames - frames);
+    ++pcmBlocksRendered;
+    const now = performance.now();
+    if (now - lastStatsReport > 250) {
+        lastStatsReport = now;
+        postState("stats", { activeVoices: Module._ssw_active_voices(), renderSongTime, gpu: gpuStatus });
+    }
+    return true;
+}
 let audioPort = null;
 
 let sampleRateHz = 44100;
@@ -175,6 +299,7 @@ function resetAudioRing() {
         return;
 
     Atomics.add(header, RING_GENERATION, 1);
+    dropGpuPending();
     Atomics.store(header, RING_READ, 0);
     Atomics.store(header, RING_WRITE, 0);
     Atomics.store(header, RING_AVAILABLE, 0);
@@ -642,6 +767,9 @@ function initCore() {
     applyCoreSettings();
     coreReady = true;
     allocateAudioRing();
+    dropGpuPending();
+    gpuActive = false;
+    if (gpuWanted) void setupGpu();
 }
 
 function reinitializeCore() {
@@ -756,6 +884,7 @@ function renderQueuedWithSysex(outPtr, blockStart, frames) {
             Math.round((event.time - blockStart) * sampleRateHz)));
 
         if (frame > cursorFrame) {
+            if (gpuActive) Module._ssw_wgpu_set_frame_base(cursorFrame);
             if (!Module._ssw_render_queued_into(
                     outPtr + cursorFrame * strideBytes,
                     frame - cursorFrame)) {
@@ -773,6 +902,7 @@ function renderQueuedWithSysex(outPtr, blockStart, frames) {
     }
 
     if (cursorFrame < frames) {
+        if (gpuActive) Module._ssw_wgpu_set_frame_base(cursorFrame);
         return !!Module._ssw_render_queued_into(
             outPtr + cursorFrame * strideBytes,
             frames - cursorFrame);
@@ -781,6 +911,10 @@ function renderQueuedWithSysex(outPtr, blockStart, frames) {
 }
 
 function renderOneBlock(frames) {
+    if (gpuActive || gpuPending.length) {
+        if (!gpuActive) return false; // finish the GPU blocks before CPU-only ones
+        return renderOneBlockGpu(frames);
+    }
     const blockStart =
         renderSongTime;
 
@@ -1185,6 +1319,7 @@ onmessage = async event => {
             Module._ssw_set_song_time(0.0);
             resetEventQueue();
             resetAudioRing();
+            if (gpuWanted) void setupGpu();
             // SF2 sample/preset allocation may grow Shared WebAssembly.Memory.
             // Refresh the AudioWorklet's memory object without copying PCM.
             publishAudioRing(true);
@@ -1209,6 +1344,7 @@ onmessage = async event => {
             Module._ssw_clear_soundfonts();
             unmountAllSoundfonts();
             soundfontLoaded = false;
+            if (gpuActive) disableGpu(gpuWanted ? "waiting for a soundfont" : "off");
             renderSongTime = 0.0;
             Module._ssw_set_song_time(0.0);
             resetAudioRing();
@@ -1353,6 +1489,12 @@ onmessage = async event => {
 
         if (data.type === "volume") {
             volume = Math.max(0.0, Math.min(1.0, Number(data.value) || 0.0));
+            return;
+        }
+
+        if (data.type === "gpu") {
+            gpuWanted = !!data.enabled;
+            void setupGpu();
             return;
         }
 
