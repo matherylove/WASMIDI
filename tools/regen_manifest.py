@@ -22,6 +22,8 @@ FILES = [
     "src/keyboard.hpp",
     "src/mainwindow.cpp",
     "src/mainwindow.hpp",
+    "src/midi/bpfa_midi_store.cpp",
+    "src/midi/bpfa_midi_store.hpp",
     "src/midi/midi_document_codec.cpp",
     "src/midi/midi_document_codec.hpp",
     "src/midi/midi_mapped_store.cpp",

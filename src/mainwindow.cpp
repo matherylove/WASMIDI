@@ -905,7 +905,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         installComplete = true;
                         const synthBridge = globalThis.WasmidiSnappyBridge;
                         if (synthBridge && typeof synthBridge.setLocalMidiSource === 'function')
-                            synthBridge.setLocalMidiSource(file);
+                            synthBridge.setLocalMidiSource(file, primaryWorker);
 
                         // Make the JS transaction terminal as well as the C++
                         // transaction. This is intentionally after mappedState is

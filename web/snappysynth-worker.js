@@ -1087,7 +1087,10 @@ function localReset(time) {
     localGeneration = (localGeneration + 1) >>> 0;
     localInFlight = false;
     if (!localActive || !feederPort) return;
-    feederPort.postMessage({ type: "reset", generation: localGeneration, time });
+    // The parser feed applies this engine's block admission (HANDOFF sec. 70).
+    feederPort.postMessage({ type: "reset", generation: localGeneration, time,
+        voices: maxVoices, sampleRate: sampleRateHz, blockFrames: preferredRenderFrames(),
+        velocityFloor: localVelocityFloor });
     localRequestFill();
 }
 
@@ -1099,7 +1102,8 @@ function localRequestFill() {
         type: "fill",
         generation: localGeneration,
         target: Math.max(safeUntil, renderSongTime) + LOCAL_AHEAD_SECONDS,
-        velocityFloor: localVelocityFloor
+        velocityFloor: localVelocityFloor,
+        voices: maxVoices
     });
 }
 

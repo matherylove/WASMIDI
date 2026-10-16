@@ -245,6 +245,98 @@ function makeHugeSparseMidiSource(payloadBytes = 240 * 1024 * 1024) {
     };
 }
 
+// Synth feed (HANDOFF sec. 70): the sequential feed and a second module instance acting
+// as a decode helper (compressed slabs shared as SharedArrayBuffers) must produce the same
+// events, and admission must keep every note-off paired.
+function feedWords(Module) {
+    const count = sizeNumber(Module._wmp_event_batch_count_js());
+    if (!count) return [];
+    const ptr = sizeNumber(Module._wmp_event_batch_ptr_js());
+    return Array.from(new Uint32Array(Module.HEAPU8.buffer, ptr, count * 2));
+}
+
+async function synthFeedSmoke(Module, createParser, denseMidi) {
+    for (const name of ["_wmp_feed_config_js", "_wmp_feed_reset_js", "_wmp_feed_build_js",
+        "_wmp_feed_safe_seconds_js", "_wmp_feed_complete_js", "_wmp_feed_block_js",
+        "_wmp_feed_block_seconds_js", "_wmp_feed_buffer_js", "_wmp_feed_buffer_size_js",
+        "_wmp_feed_buffer_ptr_js", "_wmp_feed_image_js", "_wmp_source_slab_count_js",
+        "_wmp_source_slab_ptr_js", "_wmp_source_slab_bytes_js", "_wmp_feed_request_js",
+        "_wmp_feed_stitch_js", "_wmp_feed_helper_init_js", "_wmp_feed_decode_js"]) {
+        if (typeof Module[name] !== "function")
+            throw new Error("Missing generated export " + name);
+    }
+    // Compressed source, as for multi-GB files.
+    Module._wmp_set_raw_source_limit_js(0);
+    if (!parsePaged(Module, denseMidi))
+        throw new Error("Feed smoke could not parse: " + parserErrorText(Module, "?"));
+    const run = (voices, admission) => {
+        Module._wmp_feed_config_js(voices, admission, 48000, 512, 0, 4);
+        Module._wmp_feed_reset_js(0);
+        const words = [];
+        let guard = 0;
+        do {
+            if (!Module._wmp_feed_build_js(10, 1 << 20))
+                throw new Error("Feed build failed: " + parserErrorText(Module, "?"));
+            words.push(...feedWords(Module));
+        } while (!Module._wmp_feed_complete_js() && ++guard < 10000);
+        return words;
+    };
+    // Admission off: every note survives (600k copies of one key fold into stacks).
+    const all = run(1024, 0);
+    let ons = 0, offs = 0;
+    for (let i = 1; i < all.length; i += 2) {
+        const m = all[i] >>> 0, n = (m >>> 24) + 1, type = m & 0xf0;
+        if (type === 0x90) ons += n; else if (type === 0x80) offs += n;
+    }
+    if (ons !== 600000 || offs !== 600000)
+        throw new Error("Feed without admission lost notes: " + ons + " on / " + offs + " off");
+    const admitted = run(1024, 25);
+
+    // Helper instance.
+    if (!Module._wmp_feed_image_js())
+        throw new Error("Feed image unavailable with a compressed source");
+    const image = Module.HEAPU8.slice(sizeNumber(Module._wmp_feed_buffer_ptr_js()),
+        sizeNumber(Module._wmp_feed_buffer_ptr_js()) + sizeNumber(Module._wmp_feed_buffer_size_js()));
+    const slabBytes = sizeNumber(Module._wmp_source_slab_bytes_js());
+    const slabs = [];
+    for (let i = 0; i < sizeNumber(Module._wmp_source_slab_count_js()); ++i) {
+        const ptr = sizeNumber(Module._wmp_source_slab_ptr_js(i));
+        const sab = new SharedArrayBuffer(slabBytes);
+        new Uint8Array(sab).set(Module.HEAPU8.subarray(ptr, ptr + slabBytes));
+        slabs.push(sab);
+    }
+    const Helper = await createParser({ noInitialRun: true, noExitRuntime: true, print() {}, printErr() {} });
+    globalThis.__wasmidiFeedSlabs = slabs;
+    globalThis.__wasmidiFeedSlabBytes = slabBytes;
+    Helper.HEAPU8.set(image, sizeNumber(Helper._wmp_feed_buffer_js(image.length)));
+    if (!Helper._wmp_feed_helper_init_js(image.length))
+        throw new Error("Feed helper init failed: " + parserErrorText(Helper, "?"));
+    Module._wmp_feed_config_js(1024, 25, 48000, 512, 0, 4);
+    Module._wmp_feed_reset_js(0);
+    const parallel = [];
+    let block = Number(Module._wmp_feed_block_js());
+    for (let guard = 0; guard < 10000 && !Module._wmp_feed_complete_js(); ++guard) {
+        if (!Module._wmp_feed_request_js(block, 4, 2))
+            throw new Error("Feed request failed: " + parserErrorText(Module, "?"));
+        const request = Module.HEAPU8.slice(sizeNumber(Module._wmp_feed_buffer_ptr_js()),
+            sizeNumber(Module._wmp_feed_buffer_ptr_js()) + sizeNumber(Module._wmp_feed_buffer_size_js()));
+        Helper.HEAPU8.set(request, sizeNumber(Helper._wmp_feed_buffer_js(request.length)));
+        if (!Helper._wmp_feed_decode_js(request.length))
+            throw new Error("Feed helper decode failed: " + parserErrorText(Helper, "?"));
+        const result = Helper.HEAPU8.slice(sizeNumber(Helper._wmp_feed_buffer_ptr_js()),
+            sizeNumber(Helper._wmp_feed_buffer_ptr_js()) + sizeNumber(Helper._wmp_feed_buffer_size_js()));
+        Module.HEAPU8.set(result, sizeNumber(Module._wmp_feed_buffer_js(result.length)));
+        if (!Module._wmp_feed_stitch_js(result.length))
+            throw new Error("Feed stitch failed: " + parserErrorText(Module, "?"));
+        parallel.push(...feedWords(Module));
+        block += 8;
+    }
+    if (parallel.length !== admitted.length || parallel.some((w, i) => w !== admitted[i]))
+        throw new Error("Feed helper output differs from the sequential feed (" +
+            parallel.length + " vs " + admitted.length + " words)");
+    Module._wmp_set_raw_source_limit_js(512 * 1024 * 1024);
+}
+
 async function main() {
     const jsPath = path.resolve(
         process.argv[2] ||
@@ -521,6 +613,8 @@ async function main() {
         throw new Error(
             "Mapped parser could not stream a bounded playback batch.");
     }
+
+    await synthFeedSmoke(Module, createParser, denseMidi);
 
     Module._wmp_reset_render_cursor_js(0, 1);
     if (!Module._wmp_build_render_sweep_js(1, 65536) ||

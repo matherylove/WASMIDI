@@ -353,6 +353,8 @@ typedef struct {
     uint8_t vor_fast_input_velocity[MIDI_CHANNEL_COUNT][MIDI_KEY_COUNT];
 #endif
 
+    int compact_pending;
+
     // Cache-aligned padding to prevent false sharing
     char padding[64];
 } worker_data;
@@ -4230,6 +4232,30 @@ static void build_render_queue_ordered(void) {
     g_render_size = n;
 }
 
+/* rev. 74 (HANDOFF sec. 70): runs at the start of the next cycle, once every worker
+ * has finished rendering the tiles that hold this worker's voices. */
+static void compact_worker_voices(worker_data *wd, int ss_profile) {
+    const int refresh_steal_scores = (g_steal_score != NULL);
+    wd->release_count = 0;
+    wd->release_hint_vid = -1;
+    wd->release_best_idx = -1;
+    wd->release_best_score = FLT_MAX;
+    for (int i = 0; i < wd->active_count; ) {
+        int vid = wd->active[i];
+        voice *v = &voices[vid];
+        if (v->env_state == ENV_OFF) {
+            active_remove_swap(wd, i);
+            if (ss_profile) InterlockedAdd(&g_voices_recycled_total, 1);
+            free_voice(wd, vid);
+        } else {
+            if (refresh_steal_scores && voice_steal_score_needs_refresh(v)) update_voice_steal_score(vid, v);
+            v->in_release_pool = 0;
+            if (v->env_state == ENV_RELEASE && !v->kill_now) releasepool_add(wd, vid);
+            ++i;
+        }
+    }
+}
+
 static int worker_cycle(int widx, worker_data *wd) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
 const int ss_profile = debug_metrics_on();
@@ -4258,6 +4284,10 @@ if (ss_profile) QueryPerformanceCounter(&ss_cycle_begin);
                                                                                                                                                                                                                                                                 if (load_relaxed_long(&g_quit_flag)) return SSW_WORKER_CYCLE_QUIT;
                                                                                                                                                                                                                                                                 int frames_this_block = (g_worker_mix_cap_frames != NULL) ? g_worker_mix_cap_frames[widx] : 0;
                                                                                                                                                                                                                                                                 LONG render_cycle = load_relaxed_long(&g_cycle_id);
+    if (wd->compact_pending) {
+        wd->compact_pending = 0;
+        compact_worker_voices(wd, ss_profile);
+    }
 
                                                                                                                                                                                                                                                                 // Give back what this cycle cannot use, so a sibling at zero can refill
                                                                                                                                                                                                                                                                 // from the global pool instead of stealing a sounding voice or dropping
@@ -4954,30 +4984,7 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 int frames = g_worker_mix_cap_frames[widx];
                                                                                                                                                                                                                                                                 int channels = g_audio.num_channels;
 
-                                                                                                                                                                                                                                                                 if (wd->active_count == 0) {
-                                                                                                                                                                                                                                                                 if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 0;
-                                                                                                                                                                                                                                                                 wd->last_key_off_epoch = load_relaxed_long(&g_key_off_epoch);
-if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
-if (widx < SSW_ADMIT_MAX_WORKERS) {
-    InterlockedExchange(&g_admit_key_max[widx], admit_key_max);
-    LARGE_INTEGER admit_work_t1, admit_work_freq;
-    QueryPerformanceCounter(&admit_work_t1);
-    QueryPerformanceFrequency(&admit_work_freq);
-    InterlockedExchange(&g_admit_work_us[widx],
-        (LONG)((admit_work_t1.QuadPart - admit_work_t0.QuadPart) * 1000000 / admit_work_freq.QuadPart));
-}
-                                                                                                                                                                                                                                                                LONG producers_done = InterlockedIncrement(&g_render_producers_done);
-                                                                                                                                                                                                                                                                if (producers_done == g_worker_count) {
-                                                                                                                                                                                                                                                                build_render_queue_ordered();
-                                                                                                                                                                                                                                                                rebuild_channel_render_cache();
-                                                                                                                                                                                                                                                                SetEvent(g_render_producers_ready);
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                WaitForSingleObject(g_render_producers_ready, 500);
-                                                                                                                                                                                                                                                                SetEvent(g_render_producers_ready);
-                                                                                                                                                                                                                                                                publish_worker_done(widx, render_cycle);
-                                                                                                                                                                                                                                                                return SSW_WORKER_CYCLE_CONTINUE;
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                // zero buffer
+                                                                                                                                                                                                                                                                 // zero buffer
                                                                                                                                                                                                                                                                 if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 1;
                                                                                                                                                                                                                                                                 
                                                                                                                                                                                                                                                                 validate_worker_state("post_events", widx, wd);
@@ -5016,7 +5023,6 @@ if (widx < SSW_ADMIT_MAX_WORKERS) {
 int step_now = (int)load_relaxed_long(&g_render_decimate_step);
 if (step_now < 1) step_now = 1;
 const int decimate_mask_block = step_now - 1;
-const int refresh_steal_scores = (g_steal_score != NULL);
 const LONG key_off_epoch = load_relaxed_long(&g_key_off_epoch);
 const int check_key_off_counter = (key_off_epoch != wd->last_key_off_epoch);
 int need_compact = (wd->release_count > 0);
@@ -6413,29 +6419,9 @@ if (wgpu_tile_count > 0) wgpu_flush_tile(widx, wgpu_tile_count, frames); // end 
 
 wd->last_key_off_epoch = key_off_epoch;
 
-// Rebuild the release pool while compacting to avoid a second full active pass.
-if (need_compact) {
-wd->release_count = 0;
-wd->release_hint_vid = -1;
-wd->release_best_idx = -1;
-                                                                                                                                                                                                                                                                wd->release_best_score = FLT_MAX;
-                                                                                                                                                                                                                                                                for (int i=0; i<wd->active_count; ) {
-                                                                                                                                                                                                                                                                int vid = wd->active[i];
-                                                                                                                                                                                                                                                                voice *v = &voices[vid];
-                                                                                                                                                                                                                                                                if (v->env_state == ENV_OFF) {
-                                                                                                                                                                                                                                                                active_remove_swap(wd, i);
-if (ss_profile) InterlockedAdd(&g_voices_recycled_total, 1);
-                                                                                                                                                                                                                                                                free_voice(wd, vid);
-} else {
-if (refresh_steal_scores && voice_steal_score_needs_refresh(v)) update_voice_steal_score(vid, v);
-v->in_release_pool = 0;
-                                                                                                                                                                                                                                                                if (v->env_state == ENV_RELEASE && !v->kill_now) {
-                                                                                                                                                                                                                                                                releasepool_add(wd, vid);
-                                                                                                                                                                                                                                                                }
-                                                                                                                                                                                                                                                                ++i;
-}
-}
-}
+/* Other workers may still be rendering this worker's voices (shared tiles). */
+(void)need_compact;
+wd->compact_pending = 1;
 
 validate_worker_state("post_compact", widx, wd);
 // Flush local active-count delta once per cycle — replaces per-voice

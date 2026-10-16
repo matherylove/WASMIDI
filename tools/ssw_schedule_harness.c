@@ -27,8 +27,8 @@ static int g_ssw_deterministic = 0;
 static int g_wgpu_js_base = 0;
 #define voice_set_frame_base_for_wgpu(f) ((void)(f))
 static int voice_wgpu_enabled(void) { return 0; }
-static void ssw_note_fifo_push(int key, int kept) { (void)key; (void)kept; }
-static int ssw_note_fifo_pop(int key) { (void)key; return 1; }
+static void ssw_note_fifo_push(int key, int kept, uint32_t count) { (void)key; (void)kept; (void)count; }
+static uint32_t ssw_note_fifo_pop(int key, uint32_t count) { (void)key; return count; }
 static void ssw_output_stage(float* buffer, int frames) { (void)buffer; (void)frames; }
 static int voice_get_admit_key_cap(int w) { (void)w; return 0; }
 static void voice_set_admit_key_cap(int w, int v) { (void)w; (void)v; }

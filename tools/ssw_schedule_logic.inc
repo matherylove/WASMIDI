@@ -254,11 +254,18 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                             if (velocity < admit_threshold) kept = 0;
                             else if (velocity == admit_threshold) kept = admit_quota-- > 0;
                         }
-                        ssw_note_fifo_push(key, kept);
+                        ssw_note_fifo_push(key, kept, ((event->message >> 24) & 0xffu) + 1u);
                         if (!kept) { ++g_admission_dropped; ++block->index; continue; }
-                    } else if (!ssw_note_fifo_pop(key)) {
-                        ++block->index;
-                        continue;
+                    } else {
+                        const uint32_t stack = command == 0x80u ? ((event->message >> 24) & 0xffu) + 1u : 1u;
+                        const uint32_t kept = ssw_note_fifo_pop(key, stack);
+                        if (!kept) {
+                            ++block->index;
+                            continue;
+                        }
+                        if (kept != stack)
+                            block->events[block->index].message =
+                                (event->message & 0x00ffffffu) | ((kept - 1u) << 24);
                     }
                 }
                 {
