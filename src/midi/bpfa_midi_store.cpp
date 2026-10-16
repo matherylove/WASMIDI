@@ -462,6 +462,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 2048u, LiveSnapshotBudgetKeys * (tracks_[t].byteEnd - tracks_[t].byteBegin) / snapshotBytes);
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
+            storage.channelEnd = storage.byteBegin;
             uint64_t events = 0, order = 0;
             FirstNote& first = firstNotes_[t];
             first.closeOrder.fill(std::numeric_limits<uint64_t>::max());
@@ -566,6 +567,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 }
                 ++order;
                 ++events;
+                storage.channelEnd = d.position;
                 if ((events % CheckpointEventInterval) == 0)
                     storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
                 if ((events % snapshotInterval) == 0 && openCount <= SnapshotMaxNotes &&
@@ -852,7 +854,7 @@ void BpfaMidiStore::mergeReset(MergeCursor& m, uint32_t startTick, bool notesOnl
         const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
         Cursor& c = m.cursors[t];
         c.position = cp.byteOffset;
-        c.end = storage.byteEnd;
+        c.end = cursorEnd(storage);
         c.tick = cp.tick;
         c.runningStatus = cp.runningStatus;
         c.finished = false;
@@ -1546,6 +1548,7 @@ bool BpfaMidiStore::exportFeedImage(std::vector<uint8_t>& blob) const
     for (const TrackStorage& t : tracks_) {
         putPod(blob, t.byteBegin);
         putPod(blob, t.byteEnd);
+        putPod(blob, t.channelEnd);
     }
     putArray(blob, sourceChunks_.data(), sourceChunks_.size());
     return true;
@@ -1570,6 +1573,7 @@ bool BpfaMidiStore::importFeedImage(const uint8_t* data, std::size_t size, FeedS
     for (TrackStorage& t : tracks_) {
         t.byteBegin = in.get<uint64_t>();
         t.byteEnd = in.get<uint64_t>();
+        t.channelEnd = in.get<uint64_t>();
     }
     in.array(sourceChunks_, std::size_t(chunkCount));
     if (!in.ok) { error_ = "Truncated feed image"; return false; }
@@ -1632,7 +1636,7 @@ bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std
         c.nextIndex = in.get<uint64_t>();
         c.tick = in.get<uint32_t>();
         c.runningStatus = uint8_t(in.get<uint32_t>());
-        c.end = tracks_[t].byteEnd;
+        c.end = cursorEnd(tracks_[t]);
         c.finished = false;
         c.block = nullptr;
         bool ok = in.ok && c.position >= tracks_[t].byteBegin && c.position <= c.end && decodeNext(c, false);
@@ -1942,12 +1946,25 @@ bool BpfaMidiStore::decodeVisualLocal(uint32_t endTick)
     return true;
 }
 
+namespace {
+// The live snapshot reads the stream a roll lookahead behind the sweep: ~13 M words/s at
+// 830 s of The Nuker 4, so 8 M words dropped its words every few seconds (HANDOFF sec. 78).
+constexpr std::size_t VisualPlanWords = std::size_t(32) << 20;
+constexpr std::size_t VisualRetainWords = std::size_t(48) << 20;
+} // namespace
+
+bool BpfaMidiStore::visualRoomAhead() const
+{
+    const uint64_t from = liveOnStream_ ? std::min(livePos_, renderPos_) : renderPos_;
+    const uint64_t head = visBase_ + visEvents_.size();
+    return from >= head || head - from < VisualPlanWords;
+}
+
 // Drops the words both readers have passed. The live snapshot runs behind the sweep, so
 // the words after its position (all of them until it joins the stream) stay unless the
 // stream grows past VisualRetainWords.
 void BpfaMidiStore::visualTrim()
 {
-    constexpr std::size_t VisualRetainWords = std::size_t(8) << 20;
     uint64_t keep = renderPos_;
     if (liveOnStream_) {
         keep = std::min(keep, livePos_);
@@ -2026,7 +2043,7 @@ bool BpfaMidiStore::buildRenderSweepStream(uint32_t endTick, std::size_t maxWord
     if (!valid_ || !visValid_) return false;
     endTick = std::min(endTick, metadata_.maxTick);
     maxWords = std::max<std::size_t>(1, maxWords);
-    if (visualAutoDecode_ && !visDone_ && visHead_ <= endTick)
+    if (visualAutoDecode_ && !visDone_ && visHead_ <= endTick && visualRoomAhead())
         decodeVisualLocal(visualSpanEnd(visHead_, maxWords));
     std::size_t consumed = 0;
     while (consumed < maxWords) {
@@ -2095,7 +2112,7 @@ bool BpfaMidiStore::decodeVisualRequest(const uint8_t* data, std::size_t size, s
         c.nextIndex = in.get<uint64_t>();
         c.tick = in.get<uint32_t>();
         c.runningStatus = uint8_t(in.get<uint32_t>());
-        c.end = tracks_[t].byteEnd;
+        c.end = cursorEnd(tracks_[t]);
         c.finished = false;
         c.block = nullptr;
         bool ok = in.ok && c.position >= tracks_[t].byteBegin && c.position <= c.end && decodeNext(c, false);
@@ -2275,7 +2292,7 @@ void BpfaMidiStore::rebuildVisualStateAt(uint32_t targetTick, VisualState& state
     for (uint16_t t = 0; t < tracks_.size(); ++t) {
         Cursor c;
         c.position = tracks_[t].byteBegin;
-        c.end = tracks_[t].byteEnd;
+        c.end = cursorEnd(tracks_[t]);
         const auto& snaps = tracks_[t].snapshots;
         auto snap = std::lower_bound(snaps.begin(), snaps.end(), targetTick,
             [](const VisualSnapshot& v, uint32_t tick) { return v.resume.tick < tick; });
@@ -2512,7 +2529,7 @@ void BpfaMidiStore::liveRebuildAt(uint32_t targetTick)
         if (tracks_[t].maxTick < targetTick) continue;
         Cursor c;
         c.position = tracks_[t].byteBegin;
-        c.end = tracks_[t].byteEnd;
+        c.end = cursorEnd(tracks_[t]);
         const auto& snaps = tracks_[t].snapshots;
         auto snap = std::lower_bound(snaps.begin(), snaps.end(), targetTick,
             [](const VisualSnapshot& v, uint32_t tick) { return v.resume.tick < tick; });
@@ -2635,7 +2652,7 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
                 const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
                 Cursor c;
                 c.position = cp.byteOffset;
-                c.end = tracks_[t].byteEnd;
+                c.end = cursorEnd(tracks_[t]);
                 c.tick = cp.tick;
                 c.runningStatus = cp.runningStatus;
                 c.nextIndex = cp.eventIndex;
@@ -3294,6 +3311,7 @@ void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uin
         const TrackStorage& tr = tracks_[t];
         w.put(tr.byteBegin);
         w.put(tr.byteEnd);
+        w.put(tr.channelEnd);
         w.put(tr.maxTick);
         w.put(out.activeChannelMasks[t]);
         w.put(notesPerTrack[t]);
@@ -3509,6 +3527,7 @@ bool BpfaMidiStore::mergePartial(const uint8_t* data, std::size_t size)
             TrackStorage& tr = tracks_[t];
             tr.byteBegin = r.get<uint64_t>();
             tr.byteEnd = r.get<uint64_t>();
+            tr.channelEnd = r.get<uint64_t>();
             tr.maxTick = r.get<uint32_t>();
             mergeOut_.activeChannelMasks[t] = r.get<uint32_t>();
             mergeTotalNotes_ += r.get<uint64_t>();

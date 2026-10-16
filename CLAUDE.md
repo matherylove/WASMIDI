@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§77). Este archivo resume el estado al cierre de la rev. 81 y dice
+`HANDOFF.md` (§1-§78). Este archivo resume el estado al cierre de la rev. 82 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 81)
+## Estado actual (rev. 82)
 
 Rendimiento medido por el usuario:
 
@@ -183,6 +183,12 @@ Rendimiento medido por el usuario:
   roll se queda sin cuadros. "Stack gain" encendido por defecto (las copias de eco plegadas suman
   su volumen en vez de sonar como una nota) y su bajada de ganancia va a la GPU y al render de 4
   voces. Workers en Auto reservan los helpers del parser (24 hilos → 14 workers).
+- Rev. 82 (HANDOFF §78): el roll se atrasaba en 829-858 s de The Nuker 4 porque cada tramo de
+  los helpers releía entera la pista de tempo (1,9 MB sin eventos de canal). Los cursores ahora
+  terminan en el último evento de canal de cada pista (`channelEnd`). El flujo visual guarda
+  hasta 48 M palabras y no planea más con 32 M detrás del teclado (con 8 M el teclado se
+  congelaba ~1 s cada 3 s). Chromium, archivo entero, 826-840 s: roll atrasado 846 → 0
+  cuadros, teclado 60/s.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -209,7 +215,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§75)
+## Pendientes abiertos (ver HANDOFF §67-§78)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -218,8 +224,8 @@ Mecanismos activos y cómo desactivarlos:
    decodificación repartida para el synth. Hecho en la rev. 75: etapa 2, roll/teclado/
    gráficos desde el flujo visual con helpers. Rev. 78: render de 4 voces por vectores.
    Medido por el usuario con la canción entera: 6144 voces estables en el 5900X (meta 24576
-   = 1024 × 24 workers) y el roll se atrasa en 830-858 s con 8 helpers (faltan las líneas
-   `[WASMIDI visual]` de ese tramo). Rev. 79: modo GPU con todas las voces y suma por cuadro.
+   = 1024 × 24 workers) y el roll se atrasaba en 830-858 s con 8 helpers (arreglado en la
+   rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
    Falta: medir el modo GPU en GPU real y Auto (Hash) contra Single en las PCs; helpers
    con fuente cruda; saltos justo después del pico (las densidades del reset decodifican
