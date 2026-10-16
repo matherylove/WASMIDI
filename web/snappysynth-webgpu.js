@@ -23,7 +23,7 @@ struct Req {
   release_alpha: f32, loop_start: f32, loop_end: f32, playback_end: f32,
   b0: f32, b1: f32, b2: f32, a1: f32,
   a2: f32, z1l: f32, z2l: f32, z1r: f32,
-  z2r: f32, pad3: f32, pad4: f32, pad5: f32,
+  z2r: f32, vor_scale: f32, vor_target: f32, pad5: f32,
 }
 struct Params { first: u32, count: u32, block_frames: u32, total: u32, gain: f32, cols: u32, p1: f32, p2: f32 }
 
@@ -53,6 +53,7 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
   var z = filters[r.voice_id];
   if (r.filter_reset == 1u) { z = vec4<f32>(r.z1l, r.z2l, r.z1r, r.z2r); }
   var alive = true;
+  var vs = r.vor_scale;
   for (var f = 0u; f < r.frames; f = f + 1u) {
     var vl = 0.0;
     var vr = 0.0;
@@ -93,8 +94,9 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         vl = fl;
       }
-      vl = vl * r.gain_l * env * params.gain;
-      vr = vr * r.gain_r * env * params.gain;
+      vl = vl * r.gain_l * env * vs * params.gain;
+      vr = vr * r.gain_r * env * vs * params.gain;
+      vs = r.vor_target + (vs - r.vor_target) * r.release_alpha;
       if (pending > 0) {
         pending = pending - 1;
         if (pending == 0) {

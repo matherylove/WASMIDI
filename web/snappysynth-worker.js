@@ -156,7 +156,7 @@ let validateState = false;    // source default OFF
 let softClip = true;          // source realtime default ON
 
 let volume = 1.00;
-let vorMode = 1; // 1 = one-voice loudness for exact overlap
+let vorMode = 0; // 0 = stacked copies sum their gain, 1 = one-voice loudness
 
 let soundfontFiles = [];
 let soundfontPaths = [];
@@ -740,8 +740,10 @@ function initCore() {
             (typeof navigator !== "undefined" && navigator.hardwareConcurrency)
                 ? Number(navigator.hardwareConcurrency) | 0
                 : 0;
-        // Leave cores for UI, MIDI parser/prefetch, visual cache and audio (HANDOFF §25).
-        const reserve = reported >= 8 ? 4 : (reported >= 4 ? 2 : 0);
+        // Leave cores for the UI, the MIDI parser, the audio thread and the parser's decode
+        // helpers (cores / 3, as feedHelperCount in midi-parser-worker.js; HANDOFF §77).
+        const helpers = reported >= 6 ? Math.min(8, Math.floor(reported / 3)) : 0;
+        const reserve = reported >= 8 ? helpers + 2 : (reported >= 4 ? 2 : 0);
         return Math.max(1, Math.min(256, (reported || 1) - reserve));
     })();
 

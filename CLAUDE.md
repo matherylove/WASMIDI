@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§76). Este archivo resume el estado al cierre de la rev. 80 y dice
+`HANDOFF.md` (§1-§77). Este archivo resume el estado al cierre de la rev. 81 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 80)
+## Estado actual (rev. 81)
 
 Rendimiento medido por el usuario:
 
@@ -179,6 +179,10 @@ Rendimiento medido por el usuario:
   worker sus teclas y su pool; Single dejaba la fase de eventos en un hilo). Búsqueda de
   regiones SFZ sin borrar ~200 KB por nota. Host, pico, 24576 voces, 4 workers: lado CPU del
   modo GPU 0,87× → 0,62×. Con Hash el WAV no es byte a byte repetible; para eso, Single + `DET`.
+- Rev. 81 (HANDOFF §77): el usuario llega a 12288 voces estables en el 5900X; a 24576 cruje y el
+  roll se queda sin cuadros. "Stack gain" encendido por defecto (las copias de eco plegadas suman
+  su volumen en vez de sonar como una nota) y su bajada de ganancia va a la GPU y al render de 4
+  voces. Workers en Auto reservan los helpers del parser (24 hilos → 14 workers).
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -196,6 +200,7 @@ Mecanismos activos y cómo desactivarlos:
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |
 | Tope de robos por ciclo (25%) | `ssw_set_steal_cap_percent(0)` |
 | Limitador + bloqueador de DC | botón "Soft clip" apagado |
+| Suma de volumen de las pilas VOR / eco (rev. 81) | botón "Stack gain" (WASMIDI) o casilla Echo (Audio) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |

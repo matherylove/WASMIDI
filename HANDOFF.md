@@ -5045,3 +5045,69 @@ ahora corre en Hash), build local completo.
   fase de eventos se reparte 24 veces, cosa que acá no se puede medir.
 - Si el reparto por teclas queda desbalanceado en algún MIDI (todas las notas en pocas teclas),
   ese worker frena el bloque; Single no tiene ese problema.
+
+## 77. Revisión 81 — Las copias de eco plegadas suman su volumen ("Stack gain" encendido y barato)
+
+**Reporte del usuario (rev. 80, Ryzen 9 5900X):** 12288 voces estables en WASMIDI y WASMIDI
+Audio (antes 6144); a 24576 el audio cruje. En WASMIDI el roll se queda sin cuadros en varias
+partes mientras el audio va bien. Las notas combinadas por el plegado de eco suenan más bajo que
+en el original.
+
+**Causa del volumen:** una voz VOR que junta N note-ons idénticos suena con el volumen de **una**
+nota cuando "Stack gain" está apagado (`ssw_set_vor_mode(1)`, el default heredado de
+SnappySynthV2). Con el plegado de la rev. 74 casi todas las copias de The Nuker 4 llegan como una
+pila, así que una nota con 50 copias suena igual que una sola, cuando en un synth sin VOR suena
+como 50 voces en fase (N veces la amplitud). Antes del plegado parte de las copias no llegaba a
+apilarse y sonaba por separado.
+
+Con "Stack gain" encendido (modo 0) la pila ya sumaba, pero salía cara: cuando una copia recibe
+su note-off, la ganancia de la pila baja hacia la nueva cantidad de copias a la velocidad del
+release (`vor_gain_scale` → `vor_gain_target`), y mientras dura esa bajada la voz no iba a la
+GPU ni al render de 4 voces. En el pico de The Nuker 4 con 24576 voces el modo GPU mandaba 0,8 M
+peticiones en vez de 4,5 M y el lado CPU pasaba de 0,6× a 3,3×.
+
+**Cambios:**
+
+1. **La bajada de ganancia de la pila va a la GPU** (`wgpu_try_offload`, `snappysynth-webgpu.js`):
+   la petición lleva `vor_scale` y `vor_target` (antes `pad3`/`pad4`); el kernel multiplica cada
+   cuadro por la escala y la acerca al objetivo con `release_alpha`, como el bucle de la CPU, y la
+   CPU avanza la escala en forma cerrada (`target + (scale − target)·alpha^n`). Las voces que no
+   bajan mandan 1 y 1. `midibench GPUEMU` sigue el kernel.
+2. **La bajada de ganancia en el render de 4 voces** (`voice_quad_render`, `voice_run_scalar`):
+   un vector por carril con la escala, el objetivo y el alpha; los carriles que no bajan llevan
+   1 (multiplicar por 1 es exacto, así que el modo 1 da el mismo WAV byte a byte). Las voces que
+   bajan no usan el diezmado del release, igual que el bucle genérico.
+3. **"Stack gain" encendido por defecto** en WASMIDI (`synthOverlapGain_`, guardado ahora con la
+   clave `synthStackGain` para que el default nuevo llegue aunque se hubiera tocado el botón
+   antes), en el bridge y en el worker. WASMIDI Audio tiene la casilla "Stack gain" (Echo).
+4. **Workers en Auto dejan lugar a los helpers del parser** (`snappysynth-worker.js`): con ≥ 8
+   núcleos se reservan los helpers de decodificación (núcleos / 3, hasta 8) + 2, en vez de 4
+   fijos. 24 hilos: 14 workers (antes 20); 16: 9 (antes 12). Con el reparto Hash (rev. 80) todos
+   los workers trabajan a la vez y competían con los helpers que alimentan el roll. Un valor
+   explícito de Workers sigue mandando.
+5. `pipeline_bench` y `midibench`: `VORMODE` (0 suma, 1 una nota).
+
+**Medición (host, pico de The Nuker 4, 2 s, 4 workers, `DET=1`):**
+
+| | Modo 1 (una nota) | Modo 0 antes | Modo 0 ahora |
+|---|---|---|---|
+| 24576 voces, modo GPU (lado CPU) | 0,58-0,60× | 3,30× (0,8 M peticiones) | 0,88× (4,5 M peticiones) |
+| 24576 voces, modo CPU | 2,27-2,68× | 3,51-3,87× | 2,93× |
+| 6144 voces, modo CPU, Single | 0,73-0,85× | 1,29× | 1,00× |
+
+Lo que queda del costo del modo 0 está en los robos: `steal_voice_fast` cuesta ~8,5 k
+instrucciones por llamada contra ~3 k en modo 1 (callgrind, mismas llamadas). Con la suma, las
+pilas viejas son tan fuertes como las nuevas y el robo tiene que recorrer más voces; en modo 1
+la pila entrante contaba N veces y la víctima una sola, así que robaba enseguida.
+
+**Audio:** modo 1 con los cambios: WAV **idéntico** al de la rev. 80 (6144 voces, Single, `DET`).
+Modo 0, GPU emulada contra CPU (1024 voces): nivel dentro de 1,5% y espectro a 0,49 dB de media,
+lo mismo que el modo GPU sin pilas (§75).
+
+**Pendiente / no verificado:**
+
+- En las PCs del usuario: si el eco suena como el original, y los crujidos a 24576 con Workers
+  en Auto (ahora menos workers) contra 24.
+- El roll sin cuadros: faltan las líneas `[WASMIDI visual]` (`?visualdebug=1`) y saber si era
+  modo CPU o GPU (en GPU, el kernel del synth y el WebGL del roll comparten la GPU).
+- Abaratar el robo en modo 0.

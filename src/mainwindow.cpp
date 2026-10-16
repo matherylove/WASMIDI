@@ -1561,7 +1561,7 @@ MainWindow::MainWindow(QObject* parent)
     synthSoftClip_ = wasmidi_setting_number(
         "synthSoftClip", synthSoftClip_ ? 1.0 : 0.0) != 0.0;
     synthOverlapGain_ = wasmidi_setting_number(
-        "synthOverlapGain", synthOverlapGain_ ? 1.0 : 0.0) != 0.0;
+        "synthStackGain", synthOverlapGain_ ? 1.0 : 0.0) != 0.0;
     synthGpu_ = wasmidi_setting_number("synthGpu", synthGpu_ ? 1.0 : 0.0) != 0.0;
 
     for (int i = 0; i < channelColors_.size(); ++i) {
@@ -2950,7 +2950,7 @@ void MainWindow::setSynthOverlapGain(bool enabled)
         return;
 
     synthOverlapGain_ = enabled;
-    WASMIDI_PERSIST_SETTING("synthOverlapGain", synthOverlapGain_ ? 1 : 0);
+    WASMIDI_PERSIST_SETTING("synthStackGain", synthOverlapGain_ ? 1 : 0);
     emit synthConfigChanged();
 
 #ifdef __EMSCRIPTEN__

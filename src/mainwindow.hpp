@@ -516,7 +516,7 @@ private:
     bool synthFastNoteOff_ = true;
     bool synthValidateState_ = false;
     bool synthSoftClip_ = true;
-    bool synthOverlapGain_ = false;
+    bool synthOverlapGain_ = true;
     bool synthGpu_ = false;
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;
