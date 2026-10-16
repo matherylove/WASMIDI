@@ -166,6 +166,7 @@ jobs:
           cp web/snappysynth_bridge.js site/
           cp web/snappysynth-worker.js site/
           cp web/snappysynth-webgpu.js site/
+          cp web/audio.html web/audio.css web/wasmidi-audio.js site/
           cp web/synth-feeder-worker.js site/
           cp web/snappysynth-audio-worklet.js site/
 
@@ -206,6 +207,11 @@ jobs:
               html)
 
           p.write_text(html, encoding="utf-8")
+          # WASMIDI Audio (HANDOFF sec. 64): same fingerprint on its assets.
+          audio = Path("site/audio.html")
+          audio.write_text(
+              audio.read_text(encoding="utf-8").replace("?v=dev", f"?v={version}"),
+              encoding="utf-8")
           Path("site/build-id.txt").write_text(
               os.environ.get("GITHUB_SHA", "dev") + "\n",
               encoding="utf-8")
