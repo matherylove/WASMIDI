@@ -18,6 +18,7 @@ constexpr uint64_t SnapshotEventInterval = 131072;
 constexpr std::size_t SnapshotMaxNotes = 65536;
 constexpr uint64_t SnapshotBudgetNotes = 16ull * 1024ull * 1024ull;
 constexpr uint64_t SnapshotMinTrackNotes = 4096;
+constexpr uint64_t LiveSnapshotBudgetKeys = 4ull * 1024ull * 1024ull;
 #ifndef WASMIDI_BPFA_NOTE_STORE
 #define WASMIDI_BPFA_NOTE_STORE 0
 #endif
@@ -341,6 +342,7 @@ std::size_t BpfaMidiStore::memoryBytes() const
     for (const auto& t : tracks_) {
         bytes += t.checkpoints.capacity() * sizeof(TrackCheckpoint);
         for (const auto& v : t.snapshots) bytes += sizeof(VisualSnapshot) + v.notes.capacity() * sizeof(SnapshotNote);
+        for (const auto& v : t.liveSnapshots) bytes += sizeof(LiveSnapshotPoint) + v.keys.capacity() * sizeof(LiveSnapshotKey);
     }
     for (const auto& s : sysex_) bytes += s.data.capacity() + sizeof(SysExRef);
     return bytes;
@@ -455,6 +457,9 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                                                          snapshotBudget * uint64_t(length) / snapshotBytes);
             }
             uint64_t snapshotInterval = SnapshotEventInterval, snapshotNotesUsed = 0;
+            uint64_t liveInterval = SnapshotEventInterval, liveKeysUsed = 0;
+            const uint64_t liveBudget = std::max<uint64_t>(
+                2048u, LiveSnapshotBudgetKeys * (tracks_[t].byteEnd - tracks_[t].byteBegin) / snapshotBytes);
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
             uint64_t events = 0, order = 0;
@@ -584,6 +589,29 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                         for (uint32_t node = openHead[key]; node != NoNode; node = openPool[node].next)
                             snapshot.notes.push_back(openPool[node].note);
                     storage.snapshots.push_back(std::move(snapshot));
+                }
+                if ((events % liveInterval) == 0) {
+                    uint32_t keys = 0;
+                    for (uint32_t key = 0; key < openHead.size(); ++key) keys += openHead[key] != NoNode;
+                    while (liveKeysUsed + keys > liveBudget) {
+                        liveInterval *= 2u;
+                        liveKeysUsed = 0;
+                        auto& points = storage.liveSnapshots;
+                        points.erase(std::remove_if(points.begin(), points.end(), [&](const LiveSnapshotPoint& v) {
+                            return v.resume.eventIndex % liveInterval != 0; }), points.end());
+                        for (const LiveSnapshotPoint& v : points) liveKeysUsed += v.keys.size();
+                    }
+                    if ((events % liveInterval) == 0) {
+                        liveKeysUsed += keys;
+                        LiveSnapshotPoint point;
+                        point.resume = {d.position, events, d.tick, d.runningStatus};
+                        point.keys.reserve(keys);
+                        for (uint32_t key = 0; key < openHead.size(); ++key)
+                            if (openHead[key] != NoNode)
+                                point.keys.push_back({uint16_t(key), 0, activeCounts[key],
+                                                      openPool[openTail[key]].note.startTick});
+                        storage.liveSnapshots.push_back(std::move(point));
+                    }
                 }
                 out.activeChannelMasks[t] |= (1u << channel);
                 if (type == 0x90 && d2 != 0) {
@@ -2476,6 +2504,53 @@ void BpfaMidiStore::applyLiveEvent(uint32_t tick, uint32_t message, uint16_t tra
 // Same state and output as buildLiveSnapshotMerge; steady-state events come from the visual
 // stream when it covers them (the renderer sweep keeps it ahead of playback), else from
 // the merge cursor.
+// rebuildVisualStateAt for the live keys only: the open notes of the snapshot, then the
+// track's events before targetTick folded (decodeTrackUntil) into counts.
+void BpfaMidiStore::liveRebuildAt(uint32_t targetTick)
+{
+    for (uint16_t t = 0; t < tracks_.size(); ++t) {
+        if (tracks_[t].maxTick < targetTick) continue;
+        Cursor c;
+        c.position = tracks_[t].byteBegin;
+        c.end = tracks_[t].byteEnd;
+        const auto& snaps = tracks_[t].snapshots;
+        auto snap = std::lower_bound(snaps.begin(), snaps.end(), targetTick,
+            [](const VisualSnapshot& v, uint32_t tick) { return v.resume.tick < tick; });
+        const auto& points = tracks_[t].liveSnapshots;
+        auto point = std::lower_bound(points.begin(), points.end(), targetTick,
+            [](const LiveSnapshotPoint& v, uint32_t tick) { return v.resume.tick < tick; });
+        const TrackCheckpoint* resume = nullptr;
+        if (point != points.begin() &&
+            (snap == snaps.begin() || (point - 1)->resume.eventIndex >= (snap - 1)->resume.eventIndex)) {
+            const LiveSnapshotPoint& use = *(point - 1);
+            for (const LiveSnapshotKey& k : use.keys)
+                applyLiveEvent(k.tailStart, 0x90u | uint32_t(k.key >> 7) | (uint32_t(k.key & 127u) << 8) | (1u << 16),
+                               t, k.total);
+            resume = &use.resume;
+        } else if (snap != snaps.begin()) {
+            const VisualSnapshot& use = *(snap - 1);
+            for (const SnapshotNote& note : use.notes)
+                applyLiveEvent(note.startTick, 0x90u | uint32_t(note.key >> 7) | (uint32_t(note.key & 127u) << 8) |
+                               (uint32_t(std::max<uint8_t>(1, note.velocity)) << 16), t, 1u);
+            resume = &use.resume;
+        }
+        if (resume) {
+            c.position = resume->byteOffset;
+            c.tick = resume->tick;
+            c.runningStatus = resume->runningStatus;
+            c.nextIndex = resume->eventIndex;
+        }
+        if (!decodeNext(c, false) || c.eventTick >= targetTick) continue;
+        liveWords_.clear();
+        decodeTrackUntil(c, targetTick, liveWords_);
+        for (const FeedWord& w : liveWords_) {
+            const uint32_t m = w.packed & 0x00ffffffu;
+            applyLiveEvent(w.tick, m, t, ((m & 0xe0u) == 0x80u) ? (w.packed >> 24) + 1u : 1u);
+        }
+    }
+    std::vector<FeedWord>().swap(liveWords_);
+}
+
 bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
                                             bool forceReset)
 {
@@ -2534,19 +2609,7 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
         liveNps_.clear();
         liveCc_.clear();
         liveNpsCount_ = liveCcCount_ = 0;
-        {
-            VisualState base;
-            rebuildVisualStateAt(wholeTick, base);
-            for (const auto& entry : base.pending) {
-                const uint32_t key = entry.first;
-                const uint16_t track = uint16_t(key >> 11);
-                for (const ActiveVisualNote& note : entry.second) {
-                    // Re-encode with the note's own color: colorByte(track, channel) is that color.
-                    applyLiveEvent(note.startTick, 0x90u | ((key >> 7) & 15u) << 0 | ((key & 127u) << 8) |
-                                   (uint32_t(std::max<uint8_t>(1, note.velocity)) << 16), track, 1u);
-                }
-            }
-        }
+        liveRebuildAt(wholeTick);
         liveCursorValid_ = true;
         const double densityStart = std::min(npsStartTick, ccStartTick);
         const uint32_t densityTick = static_cast<uint32_t>(std::floor(densityStart));
@@ -2563,20 +2626,38 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
             }
             liveCursorSynced_ = false;
         } else {
-            mergeReset(liveCursor_, wholeTick, false);
-            MergeCursor density;
-            mergeReset(density, densityTick, false);
-            while (mergePeek(density, evTick, evMessage, evTrack)) {
-                if (evTick > wholeTick) break;
-                mergePop(density);
-                if (double(evTick) + 1.0e-9 >= densityStart) addDensity(evTick, evMessage, 1u);
+            // Each track decoded folded from its checkpoint; the density points sorted by tick.
+            std::vector<FeedWord> points;
+            for (uint16_t t = 0; t < tracks_.size(); ++t) {
+                const auto& cps = tracks_[t].checkpoints;
+                auto it = std::lower_bound(cps.begin(), cps.end(), densityTick,
+                    [](const TrackCheckpoint& cp, uint32_t at) { return cp.tick < at; });
+                const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+                Cursor c;
+                c.position = cp.byteOffset;
+                c.end = tracks_[t].byteEnd;
+                c.tick = cp.tick;
+                c.runningStatus = cp.runningStatus;
+                c.nextIndex = cp.eventIndex;
+                bool ok = decodeNext(c, false);
+                while (ok && c.eventTick < densityTick) ok = decodeNext(c, false);
+                if (!ok || c.eventTick > wholeTick) continue;
+                liveWords_.clear();
+                decodeTrackUntil(c, wholeTick + 1u, liveWords_);
+                for (const FeedWord& w : liveWords_) {
+                    const uint32_t m = w.packed & 0x00ffffffu;
+                    const uint32_t n = ((m & 0xe0u) == 0x80u) ? (w.packed >> 24) + 1u : 1u;
+                    if (double(w.tick) + 1.0e-9 >= densityStart && (isNoteOn(m) || isControl(m))) points.push_back(w);
+                    if (w.tick == wholeTick) consume(w.tick, m, t, n, false);
+                }
             }
-            while (mergePeek(liveCursor_, evTick, evMessage, evTrack)) {
-                if (evTick > wholeTick) break;
-                mergePop(liveCursor_);
-                consume(evTick, evMessage, evTrack, 1u, false);
+            std::vector<FeedWord>().swap(liveWords_);
+            std::stable_sort(points.begin(), points.end(), [](const FeedWord& x, const FeedWord& y) { return x.tick < y.tick; });
+            for (const FeedWord& w : points) {
+                const uint32_t m = w.packed & 0x00ffffffu;
+                addDensity(w.tick, m, ((m & 0xe0u) == 0x80u) ? (w.packed >> 24) + 1u : 1u);
             }
-            liveCursorSynced_ = true;
+            liveCursorSynced_ = false;
         }
         liveNextTick_ = wholeTick + 1u;
         liveOnStream_ = false;
@@ -3229,6 +3310,12 @@ void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uin
             w.put(uint64_t(v.notes.size()));
             w.bytes(v.notes.data(), v.notes.size() * sizeof(SnapshotNote));
         }
+        w.put(uint64_t(tr.liveSnapshots.size()));
+        for (const LiveSnapshotPoint& v : tr.liveSnapshots) {
+            w.put(v.resume);
+            w.put(uint64_t(v.keys.size()));
+            w.bytes(v.keys.data(), v.keys.size() * sizeof(LiveSnapshotKey));
+        }
     }
     w.put(totalControls);
     w.put(uint8_t(out.hasPitch ? 1 : 0));
@@ -3447,6 +3534,17 @@ bool BpfaMidiStore::mergePartial(const uint8_t* data, std::size_t size)
                 if (!r.ok) break;
                 v.notes.resize(static_cast<std::size_t>(n));
                 std::memcpy(v.notes.data(), p, static_cast<std::size_t>(n * sizeof(SnapshotNote)));
+            }
+            const uint64_t nl = r.ok ? r.get<uint64_t>() : 0;
+            if (r.ok) tr.liveSnapshots.resize(static_cast<std::size_t>(nl));
+            for (LiveSnapshotPoint& v : tr.liveSnapshots) {
+                if (!r.ok) break;
+                v.resume = r.get<TrackCheckpoint>();
+                const uint64_t n = r.get<uint64_t>();
+                p = r.take(static_cast<std::size_t>(n * sizeof(LiveSnapshotKey)));
+                if (!r.ok) break;
+                v.keys.resize(static_cast<std::size_t>(n));
+                std::memcpy(v.keys.data(), p, static_cast<std::size_t>(n * sizeof(LiveSnapshotKey)));
             }
             mergeOut_.maxTick = std::max(mergeOut_.maxTick, tr.maxTick);
         }

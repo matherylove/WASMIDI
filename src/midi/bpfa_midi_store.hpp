@@ -223,12 +223,24 @@ private:
         TrackCheckpoint resume;
         std::vector<SnapshotNote> notes;
     };
+    // Per (channel, key) with open notes: how many, and when the newest one started.
+    struct LiveSnapshotKey {
+        uint16_t key;
+        uint16_t reserved;
+        uint32_t total;
+        uint32_t tailStart;
+    };
+    struct LiveSnapshotPoint {
+        TrackCheckpoint resume;
+        std::vector<LiveSnapshotKey> keys;
+    };
     struct TrackStorage {
         uint64_t byteBegin = 0;
         uint64_t byteEnd = 0;
         uint32_t maxTick = 0;
         std::vector<TrackCheckpoint> checkpoints;
         std::vector<VisualSnapshot> snapshots;
+        std::vector<LiveSnapshotPoint> liveSnapshots;
     };
     struct SysExRef {
         uint32_t tick = 0;
@@ -483,6 +495,8 @@ private:
     bool buildLiveSnapshotStream(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
                                  bool forceReset);
     void applyLiveEvent(uint32_t tick, uint32_t message, uint16_t track, uint32_t count);
+    void liveRebuildAt(uint32_t targetTick);
+    std::vector<FeedWord> liveWords_;
     LiveKey* liveKey(uint32_t key, bool create);
     void liveClearKey(uint32_t key, LiveKey& k);
     void liveReset();
