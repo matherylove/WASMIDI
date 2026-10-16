@@ -201,6 +201,18 @@ private:
     bool ingestNextWindow();
     bool finishIngest();
     std::unique_ptr<IngestState> ingest_;
+public:
+    struct TextEvent { uint32_t tick = 0; uint16_t track = 0; uint8_t type = 0; std::string text; };
+    const std::vector<TextEvent>& textEvents() const { return textEvents_; }
+    // Note-ons per `densityBucketTicks()` ticks, for the NPS graph of WASMIDI Audio.
+    const std::vector<uint32_t>& noteDensity() const { return density_; }
+    uint32_t densityBucketTicks() const { return densityBucketTicks_; }
+private:
+    static constexpr std::size_t MaxTextEvents = 200000;
+    static constexpr std::size_t MaxTextBytes = 256;
+    std::vector<TextEvent> textEvents_;
+    std::vector<uint32_t> density_;
+    uint32_t densityBucketTicks_ = 1;
     PartialPlan partial_;
     bool partialActive_ = false;
     uint64_t chunkBase_ = 0;

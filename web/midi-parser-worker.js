@@ -1163,6 +1163,43 @@ self.onmessage = async event => {
             });
             return;
         }
+        if (message.type === "text-events") {
+            const Module = await getModule();
+            const ptr = Number(Module._wmp_text_events_js());
+            const size = Number(Module._wmp_text_events_size_js());
+            const events = [];
+            if (ptr && size >= 4) {
+                const bytes = Module.HEAPU8.slice(ptr, ptr + size);
+                const view = new DataView(bytes.buffer);
+                const utf8 = new TextDecoder("utf-8", { fatal: true });
+                const latin1 = new TextDecoder("latin1");
+                const count = view.getUint32(0, true);
+                let o = 4;
+                for (let i = 0; i < count && o + 12 <= size; ++i) {
+                    const seconds = view.getFloat64(o, true);
+                    const kind = view.getUint8(o + 8);
+                    const length = view.getUint16(o + 10, true);
+                    const raw = bytes.subarray(o + 12, o + 12 + length);
+                    let text;
+                    try { text = utf8.decode(raw); } catch (_) { text = latin1.decode(raw); }
+                    events.push({ t: seconds, kind, text });
+                    o += 12 + length;
+                }
+            }
+            postMessage({ type: "text-events", events });
+            return;
+        }
+        if (message.type === "density") {
+            const Module = await getModule();
+            const ptr = Number(Module._wmp_density_js());
+            if (!ptr) { postMessage({ type: "density", starts: null, counts: null }); return; }
+            const n = new Float64Array(Module.HEAPU8.buffer, ptr, 1)[0] | 0;
+            const all = new Float64Array(Module.HEAPU8.buffer, ptr, 1 + (n + 1) + n).slice();
+            const starts = all.slice(1, n + 2);
+            const counts = new Float32Array(all.subarray(n + 2));
+            postMessage({ type: "density", starts, counts }, [starts.buffer, counts.buffer]);
+            return;
+        }
         if ((message.type === "synth-reset" || message.type === "synth-pump") &&
             (Number.isFinite(message.seconds) || Number.isFinite(message.endSeconds))) {
             const Module = await getModule();

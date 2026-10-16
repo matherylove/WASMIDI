@@ -432,6 +432,7 @@
                         state.soundfontLoaded
                             ? "SF2 ready"
                             : "SF2 load failed");
+                    settleSoundfontWaiters(state.soundfontLoaded);
                     break;
 
                 case "clock":
@@ -506,6 +507,7 @@
                     break;
 
                 case "error": {
+                    settleSoundfontWaiters(state.soundfontLoaded);
                     const message =
                         String(
                             data.message ||
@@ -618,6 +620,16 @@
         }
     }
 
+    // Resolved by the worker's "soundfont" answer (or an error) so callers know
+    // whether the SF2 actually loaded (HANDOFF sec. 67).
+    let soundfontWaiters = [];
+
+    function settleSoundfontWaiters(loaded) {
+        const waiters = soundfontWaiters;
+        soundfontWaiters = [];
+        for (const resolve of waiters) resolve(!!loaded);
+    }
+
     async function loadSoundfontFile(file) {
         if (!file)
             return false;
@@ -631,12 +643,13 @@
         try {
             await ensureBackend();
 
+            const answered = new Promise(resolve => soundfontWaiters.push(resolve));
             worker.postMessage({
                 type: "loadSoundfont",
                 file
             });
 
-            return true;
+            return await answered;
         } catch (error) {
             updateStatus(
                 error &&
@@ -957,6 +970,11 @@
         }
     }
 
+    // WASMIDI Audio's spectrum visualizer taps the output (HANDOFF sec. 67).
+    function getOutput() {
+        return { context, node };
+    }
+
     function setGpu(enabled) {
         state.gpu = !!enabled;
         if (worker)
@@ -1212,6 +1230,7 @@
         setVolume,
         setOverlapGain,
         setGpu,
+        getOutput,
         setPrebuffer,
         configure,
         getAudioClock

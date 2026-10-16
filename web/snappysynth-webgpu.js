@@ -41,7 +41,7 @@ fn sample16(index: u32) -> f32 {
 fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= params.count) { return; }
   let r = reqs[params.first + gid.x];
-  var pos = r.position;
+  var adv = 0.0;
   var env = r.env;
   var st = r.env_state;
   var pending = r.pending_off;
@@ -53,6 +53,11 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
     var vl = 0.0;
     var vr = 0.0;
     if (alive && f >= r.startup) {
+      // Closed-form position, as the CPU advances the voice state (voice.c).
+      var pos = r.position + r.pitch * adv;
+      if (r.loop_active == 1u && pos >= r.loop_end) {
+        pos = r.loop_start + (pos - r.loop_start) % (r.loop_end - r.loop_start);
+      }
       let i = u32(pos);
       let frac = pos - f32(i);
       var nx = i + 1u;
@@ -97,10 +102,7 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
         env = env * r.release_alpha;
         if (env <= 1.0 / 65536.0) { alive = false; }
       }
-      if (alive) {
-        pos = pos + r.pitch;
-        if (r.loop_active == 1u && pos >= r.loop_end) { pos = pos - (r.loop_end - r.loop_start); }
-      }
+      if (alive) { adv = adv + 1.0; }
     }
     let o = (r.row_start + f) * 2u;
     scratch[o] = vl;

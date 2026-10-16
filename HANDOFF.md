@@ -1,9 +1,21 @@
 # WASMIDI — Handoff completo
 
-**Revisión 40.** Escrito para alguien que llega sin ningún contexto. Leé las
-secciones 1 a 5 antes de tocar código. La sección 5 es la más importante: dice
-dónde está el problema hoy. **La sección 19 (rev. 40) es el cambio más reciente y
-corrige la lectura del Problema A y de todas las capturas previas.**
+**Estado al cierre: revisión 72 (16 de octubre de 2026).** Para retomar el proyecto
+(incluido en Claude Code) leer primero **`CLAUDE.md`** en la raíz: resume el proyecto,
+la forma de trabajo del usuario, el build, la verificación, el estado actual, los
+interruptores de rollback y los pendientes. Después leer **§67** (pendientes abiertos y
+reportes del usuario sin resolver) y, según el tema, las secciones de cada revisión:
+parser §43-§60, synth §61-§63 y §66, WASMIDI Audio §64-§65, renderer §34-§38 y §48.
+
+Las secciones 1 a 14 describen el proyecto hasta la rev. 40 y conservan su texto
+original; **§5 ("estado actual") y §8 son históricas**: el estado vigente está en
+`CLAUDE.md` y en las secciones finales. Este documento solo se edita agregando o
+corrigiendo en el lugar (§7, error 10).
+
+> Texto original de la cabecera (rev. 40): escrito para alguien que llega sin ningún
+> contexto. Leé las secciones 1 a 5 antes de tocar código. La sección 5 es la más
+> importante: dice dónde está el problema hoy. La sección 19 (rev. 40) es el cambio más
+> reciente y corrige la lectura del Problema A y de todas las capturas previas.
 
 ---
 
@@ -47,6 +59,11 @@ decisiva (ver §6).
 ---
 
 ## 2. Restricciones del entorno (crítico)
+
+> Nota rev. 72: esto describe el entorno de chat usado hasta ahora (1 núcleo, sin red,
+> sin Qt6 ni emsdk, con Chromium de Playwright en `/opt/pw-browsers`, ver §65). En otro
+> entorno con red (p. ej. Claude Code en la máquina del usuario o en la nube) puede
+> instalarse emsdk 3.1.56 y Qt 6.8.3 y compilar/medir localmente.
 
 **En el entorno donde se edita este código NO hay Qt6 ni emsdk.** Esto define
 qué se puede afirmar y qué no:
@@ -201,7 +218,7 @@ internos de freelists (refill/rebalance) ya no cuentan como reciclaje.
 
 ---
 
-## 5. ESTADO ACTUAL: dónde está el problema hoy
+## 5. (Histórico, rev. 40) Estado de entonces: dónde estaba el problema
 
 Hay **dos problemas distintos**. Se trataron como uno durante mucho tiempo y eso
 causó la mayor parte de los errores de la sesión.
@@ -394,7 +411,9 @@ stealer sin una medición que lo exija.
 
 ---
 
-## 8. Estado del código: qué está activo
+## 8. (Histórico, rev. 40) Estado del código: qué estaba activo
+
+> El estado vigente de los mecanismos y sus rollbacks está en `CLAUDE.md`.
 
 | Mecanismo | Estado | Nota |
 |---|---|---|
@@ -4205,4 +4224,239 @@ compilado por el CI (artefacto `site/`) subido, se puede correr `parser-bench.ht
 WASMIDI Audio y la app en Chromium headless para medir (servidor con COOP/COEP).
 WebGPU sin GPU real probablemente no esté disponible en headless.
 
-Última revisión entregada: `wasmidi-main-rev71.1-audio-visual-fix.zip`.
+Revisión anterior entregada: `wasmidi-main-rev71.1-audio-visual-fix.zip`.
+
+---
+
+## 66. Revisión 72 — más voces = más trabajo; Auto pasa a Single siempre
+
+**Reporte del usuario (WASMIDI Audio, Hypernova):** mucho más lag con 12 workers y 12288
+voces que con 1 worker y 1024 voces.
+
+**Medición (host, 1 núcleo, Hypernova 100-102 s; con 1 núcleo el tiempo de bloque es el
+CPU total que necesita la configuración, no el que tardaría en paralelo):**
+
+| Workers | Voces | Reparto | CPU por bloque de 11,6 ms | Fase de eventos (ALLOC) |
+|---|---|---|---|---|
+| 1 | 1024 | Auto (Single) | 5,6-7,6 ms | 0,5 ms |
+| 12 | 1024 | Auto (Single) | ~6,9 ms | — |
+| 1 | 12288 | Auto (rev. 71: Hash) | 49-61 ms | 3,1 ms |
+| 12 | 12288 | Hash | 53-65 ms | eventos repartidos y desbalanceados |
+| 12 | 12288 | Single | 48-57 ms | 3,1 ms en un hilo |
+| 12 | 24576 | Hash / Single | 95 / 76 ms | — / 3,2 ms |
+
+Conclusión: **los workers casi no agregan costo** (1 vs 12 workers con 1024 voces: igual),
+pero **12288 voces son ~8× más trabajo de render** que 1024: en Hypernova el pool queda
+lleno (12.279 voces activas) y se roban ~480k voces/s. Para que 12 workers lo absorban
+habría que repartir ~50 ms de CPU por bloque con eficiencia casi perfecta, mientras el
+navegador también corre el parser, el AudioWorklet y el hilo principal; cualquier worker
+desalojado frena el bloque. La comparación justa es misma cantidad de voces con 1 y 12
+workers.
+
+**Cambio (`Voice/voice.c`):** Auto usa **Single** con cualquier cantidad de voces (antes
+solo hasta 4096). Single fue más barato que Hash en todos los casos medidos (48-57 vs
+53-65 ms con 12288; 76 vs 95 ms con 24576) y su fase de eventos es ~3 ms en un hilo.
+Determinístico: con 12288 voces, 1 y 12 workers dan el mismo WAV.
+
+Revisión anterior entregada: `wasmidi-main-rev72-auto-single.zip`.
+
+---
+
+## 67. Cierre de sesión (rev. 72): pendientes abiertos y paso a Claude Code
+
+Sin cambios de código en esta sección. El usuario pidió **no hacer nada todavía**,
+actualizar el handoff para seguir el proyecto en Claude Code y saber qué archivos darle
+como contexto. Se agregó `CLAUDE.md` en la raíz (resumen operativo vigente).
+
+### Reportes del usuario sin resolver (en orden de llegada)
+
+**A. WebGPU con 12 workers va mucho más lento que con 1 worker; con 1 worker rinde
+exactamente igual que CPU.** (Este mensaje quedó sin respuesta en el chat.) Primero
+confirmar qué muestra el panel ("WasmiSynth GPU: active (N MB…)" o "unavailable: …"): si
+con 1 worker la GPU no estaba activa, "rinde igual" se explica solo. Hipótesis a medir,
+en este orden:
+
+1. **Contención de atómicos en el camino de descarga** (`wgpu_try_offload`, rev. 70):
+   cada voz descargada hace `InterlockedAdd(&g_wgpu_frames)` e
+   `InterlockedIncrement(&g_wgpu_count)` desde todos los workers de render; con 1 worker
+   no hay contención. Arreglo probable: reservar tramos de peticiones por worker (un
+   atómico por tile de 256 voces, no por voz).
+2. **False sharing de las peticiones**: 160 bytes por petición, escritas por distintos
+   workers en ranuras contiguas que comparten líneas de caché. Arreglo: tramos por
+   worker o padding a múltiplos de 64 bytes.
+3. **`reduceMix` es O(frames × 2 × peticiones)**: cada muestra de salida recorre todas
+   las peticiones leyendo su struct. Con miles de voces son decenas de millones de
+   iteraciones por bloque. No depende de los workers, pero puede dominar. Arreglo:
+   reducción en árbol por tiles de voces (como Kestrel) o acumular por segmento.
+4. **Costo que el CPU no se ahorra**: el avance de estado por muestra de cada voz
+   descargada (posición, envolvente) sigue en el CPU, y en modo GPU se desactiva el lote
+   SIMD rápido de voces en sustain.
+5. JS: `submit()` copia todas las peticiones con `HEAPU8.buffer.slice` por bloque y
+   espera `mapAsync`; con hasta 8 bloques en vuelo la latencia de la GPU puede vaciar el
+   ring.
+
+Medición sugerida: modo determinístico (`ssw_set_deterministic(1)`), mismas voces,
+1 vs 12 workers, tiempo de `renderQueuedWithSysex` y de `submit` por separado, en
+Chromium. El emulador de host (`GPUEMU=1` en `midibench`) sirve para la parte de CPU.
+
+**B. "¿Dónde están los controles?"** Sin contexto suficiente (puede referirse a WASMIDI
+Audio, al panel de WasmiSynth de la app o a otra cosa). Preguntar antes de actuar.
+
+**C. "Una vez minimizadas no deben estar usando CPU o GPU, pero deben poder reanudarse
+lo antes posible con el menor costo posible."** Aclarar qué se minimiza: la pestaña o
+ventana del navegador (hoy `requestAnimationFrame` se frena solo, pero los workers
+siguen: prefetch del parser, armado de tiles, render del synth por adelantado), paneles
+de la app, o las ventanas de WASMIDI Audio. Si es la pestaña: con audio sonando el synth
+debe seguir; lo visual (tiles, barridos del renderer, snapshots del teclado/gráficos)
+debería pausarse con `visibilitychange` y reanudar desde el estado guardado (caché de
+tiles y snapshots de §48) sin reconstruir todo.
+
+**D. "Optimízalos para que usen lo menos posible en recursos, pero que no se vean
+choppy, con bajos frames o de mala calidad."** Probablemente sobre lo mismo que C (lo
+visual). Aclarar alcance y medir antes (fps, CPU por hilo, GPU) en Chromium.
+
+**E. Bug: "algunas veces, luego de cambiar de synth, el programa descarga la soundfont y
+no puede cargar otra."** Sin investigar. Puntos a revisar: el cambio de backend del synth
+en `mainwindow.cpp` y `snappysynth_bridge.js` (reinicialización del worker, estado
+`soundfontLoaded`, montajes WORKERFS que no se desmontan, `configure` que reinicia el
+core y descarta el SF sin volver a cargarlo, carreras entre `configure` y
+`loadSoundfontFile`). En rev. 70 también se agregó `setupGpu` tras `initCore` y tras la
+carga del SF: verificar que no interfiera. Reproducir primero con los pasos exactos del
+usuario.
+
+### Otros pendientes vigentes
+
+- Confirmar en el navegador que el shader WGSL compila y que el pipeline WebGPU anda
+  (rev. 70, no verificado).
+- Objetivo pedido por el usuario: 60 fps mínimo y 1024 voces constantes en The Nuker 3
+  sin colgarse. Plan propuesto (aceptado en parte): benchmark de reproducción en
+  Chromium; teclado y gráficos sin decodificar (conteos precalculados y barrido del
+  roll); decodificación repartida durante la reproducción usando los Workers de la carga;
+  tiles culleados repartidos (el culling por partes es exacto con la regla de capas).
+  La admisión y el tope de robos (§61) ya cubren la parte del synth.
+- Reconstrucción del teclado en seeks lejanos de The Nuker (~15 s; presupuesto de
+  snapshots agotado).
+- Que el coordinador de `voice_render_float` también tome tiles de render (§62).
+- Montar en el CI un paso de benchmark con Chromium headless.
+- Largo plazo: GUI cosmética (§11), mapeo GM de instrumentos y drums, precisión de CC,
+  carga desde archivos comprimidos (.zip/.7z/.gz/.zst), hash de zstd fijo en
+  `FetchContent`.
+
+### Qué darle a Claude Code
+
+1. **El repositorio** (este árbol, idealmente como el repo de GitHub clonado, con el
+   workflow de Actions). Contiene `CLAUDE.md`, `HANDOFF.md`, el código, las herramientas
+   de verificación y los bancos de prueba.
+2. **Archivos de prueba** (no están en el repo por tamaño/licencia), en una carpeta fuera
+   del repo o en `.gitignore`: `Hypernova.mid` (26 pistas, 960 TPQN; zona densa
+   100-104 s), `MatheryLSD.sf2` (11 regiones), y para carga/escala The Nuker 3 / 4
+   (15,9 / 20,9 GB) si hay disco. El MIDI sintético de `check.sh` se genera solo.
+3. **Opcional, como referencia de solo lectura** (fuera del repo): el SnappySynthV2
+   original, BPFA, Kimrashi, Kestrel, SuperVirtualMIDISynth, Kasaria y el sitio
+   `dekx_cc-main` (estilo visual de dekx.cc). Recordar las licencias (`CLAUDE.md`).
+4. **Si se quiere medir en el navegador**: el sitio compilado por el CI (`site/`, artefacto
+   de Pages) o un entorno con emsdk 3.1.56 + Qt 6.8.3 para compilar.
+
+Los transcripts del chat no hacen falta: todo lo relevante está en este documento.
+
+Última revisión entregada: `wasmidi-main-rev72-handoff-claude-code.zip`.
+
+---
+
+## 67. Revisión 73 — GPU útil, SF2 que no recarga, y WASMIDI Audio con ventanas
+
+**Reportes del usuario:** (1) 12288 voces con 12 workers van más lento que 1024 con 1
+worker; (2) el modo GPU va mucho más lento con 12 workers y con 1 worker rinde igual que
+CPU; (3) a veces, después de cambiar el synth, se descarga la soundfont y no se puede
+cargar otra; (4) WASMIDI Audio: ventanas de letras/marcadores, gráficos estilo Winamp y
+visualizador WebGL2 de espectro en espejo; todas movibles y minimizables menos la
+principal; minimizadas sin usar CPU/GPU. Meta declarada: The Nuker 3 y 4 en tiempo real
+a 1024 voces de principio a fin, sin quedarse sin frames, en un Ryzen 9 5900X.
+
+### GPU (`Voice/voice.c`, `web/snappysynth-webgpu.js`)
+
+Causas: el CPU avanzaba el estado de cada voz descargada **muestra por muestra**
+(costo del mismo orden que renderizarla) y reservaba cada petición con dos atómicos
+compartidos (contención entre 12 workers).
+
+- **Avance en forma cerrada** (`wgpu_env_advance`): ataque/decay lineales, release
+  exponencial con `powf`/`logf`, note-off pendiente partiendo el bloque, posición
+  `pos + pitch·n` con `fmodf` para el loop. O(1) por voz.
+- El shader y el emulador también calculan la posición en forma cerrada (contador de
+  muestras avanzadas), así CPU y GPU coinciden.
+- **Reserva por tile:** cada worker escribe las peticiones de su tile en un búfer propio
+  (`g_wgpu_local[widx]`, 256 entradas) y las copia con un solo `InterlockedAdd` al final
+  del tile (`wgpu_flush_tile`); el lugar se verifica al tomar el tile
+  (`wgpu_tile_has_room`, margen de 256 × (workers+1)).
+- Al reinicializar el core, el JS apaga la descarga hasta que `setupGpu` la reactiva
+  (antes el motor podía seguir descargando voces que nadie renderizaba).
+
+Medición (host, Hypernova 100-102 s, 1 worker, costo del lado CPU sin contar la GPU):
+1024 voces 6,24 → **2,84 ms**; 12288 voces 56,9 → **9,27 ms** por bloque de 11,6 ms.
+Audio con la GPU emulada: mismo nivel (79,48 dB); correlación 0,97 con el modo CPU (la
+posición en forma cerrada es más exacta que la suma sucesiva del CPU y difiere en fase
+en notas largas). Determinístico con 1 y 4 workers.
+
+### SF2 que no se puede recargar (`snappysynth-worker.js`, `snappysynth_bridge.js`)
+
+Camino encontrado: si una reconfiguración (voces, workers, bloque…) hace fallar
+`ssw_init_ex` (p. ej. sin memoria para tantas voces), `initCore` lanzaba, `coreReady`
+quedaba en `false` y **toda** carga de SF2 posterior fallaba con "core is still
+starting"; el bridge ya había marcado la soundfont como descargada.
+
+- El worker guarda la última configuración aceptada (`lastGoodConfig`); si una nueva
+  falla, restaura la anterior, reinicializa y avisa con un error claro.
+- Un `loadSoundfont` que llega mientras el core se reinicia se encola y se procesa al
+  terminar.
+- `loadSoundfontFile` del bridge ahora espera la respuesta real del worker y devuelve si
+  cargó (antes devolvía `true` al enviar el mensaje).
+
+### Letras, marcadores y densidad de notas (parser)
+
+- `bpfa_midi_store`: el escaneo del índice pide al decodificador los metas de texto
+  (0x01, 0x05, 0x06) con `wantText` (los demás decodificadores no los ven, así que no
+  cambia `order`); hasta 200.000 eventos de 256 bytes. Cuenta note-ons por cubetas de
+  `PPQ/8` ticks (`density_`). Ambos van en el blob de la carga paralela (versión 2) y se
+  suman/ordenan al unir. Verificado: Hypernova (6 helpers) densidad idéntica y suma =
+  44.750.713 notas; MIDI sintético con letras/marcadores idéntico en un hilo y paralelo.
+- Exports `wmp_text_events_js`, `wmp_text_events_size_js`, `wmp_density_js` (densidad
+  agrupada a ≤ 262.144 cubetas con sus segundos de inicio); mensajes `text-events` y
+  `density` en el worker del parser (texto UTF-8 con respaldo latin1).
+
+### WASMIDI Audio (`audio.html`, `audio.css`, `wasmidi-audio.js`, bridge `getOutput`)
+
+- **Escritorio de ventanas:** todas se arrastran por la barra de título (pointer
+  capture); las no principales se minimizan con los botones de caption y se reabren con
+  los conmutadores INFO / LYR / GRAPH / VIS de la ventana principal (como EQ/PL de
+  Winamp). Posiciones y estado en `localStorage` (`wasmidiAudioLayout`). Con < 900 px de
+  ancho, apiladas.
+- **Bucle bajo demanda:** `requestAnimationFrame` solo mientras se reproduce o el
+  visualizador está decayendo; si no, un temporizador de 4 Hz para lecturas. Cada
+  ventana solo trabaja si está abierta; al reabrirla se reconstruye desde el estado
+  actual (búsqueda binaria), sin historial acumulado mientras estaba cerrada.
+- **Letras:** línea actual con la parte cantada resaltada y la siguiente; `.kar` (texto
+  0x01, `/` y `\` como saltos, `@` encabezados) o letras 0x05 (`\r`/`\n`). Marcadores
+  en lista, el actual resaltado, clic = seek. El DOM solo cambia cuando cambia la sílaba
+  o el marcador.
+- **Gráficos:** NPS (de la densidad del parser, ventana de 0,25 s), voces, carga y
+  búfer; canvas 2D que se desplaza por copia (`drawImage` sobre sí mismo) a 20 Hz y solo
+  dibuja la columna nueva.
+- **Visualizador:** `AnalyserNode` (FFT 4096) conectado a la salida del AudioWorklet solo
+  mientras la ventana está abierta (desconectado no trabaja en el hilo de audio); 72
+  barras logarítmicas 30 Hz-18 kHz con picos que caen; WebGL2 con un quad instanciado,
+  un `bufferSubData` y 3 draws por cuadro; reflejo inferior más oscuro.
+- Verificado en Chromium headless (`/opt/pw-browsers`): sin errores de página; arrastre,
+  minimizado y persistencia; letras, gráficos y visualizador con datos simulados
+  (`globalThis.__wasmidiAudioTest`).
+
+### Meta The Nuker en tiempo real — estado
+
+WasmiSynth a 1024 voces no es el cuello: en la zona más densa de Hypernova cuesta
+0,58× del tiempo real en un núcleo. El cuello es **alimentarlo**: The Nuker 3 a mitad de
+canción tiene ~44 M eventos/s; el worker del parser los decodifica y envía todos, y el
+synth los encola y recorre todos aunque la admisión deje entrar ~22 mil note-ons/s. Lo
+pendiente para la meta: admisión en el parser (descartar ahí los note-ons que el synth
+no admitiría, con sus note-offs), y decodificación repartida entre los helpers
+persistentes de la carga paralela.
+
+Última revisión entregada: `wasmidi-main-rev73-gpu-audio-windows.zip`.

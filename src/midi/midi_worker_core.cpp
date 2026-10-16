@@ -876,6 +876,86 @@ double wmp_seconds_to_tick_js(double seconds)
 }
 
 double g_documentInfo[6];
+std::vector<uint8_t> g_textBlob;
+std::vector<double> g_densityBlob;
+
+// Lyrics / markers / text: u32 count, then per event f64 seconds, u8 type, u8 0,
+// u16 length, bytes (HANDOFF sec. 67).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_text_events_js()
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        g_textBlob.clear();
+        if (!g_mappedStore.valid()) return 0.0;
+        const auto& md = g_mappedStore.metadata();
+        const auto& events = g_mappedStore.textEvents();
+        auto put = [](const void* p, std::size_t n) {
+            const uint8_t* b = static_cast<const uint8_t*>(p);
+            g_textBlob.insert(g_textBlob.end(), b, b + n);
+        };
+        const uint32_t count = uint32_t(events.size());
+        put(&count, 4);
+        for (const auto& e : events) {
+            const double seconds = md.tickToSeconds(e.tick);
+            const uint8_t type = e.type, zero = 0;
+            const uint16_t length = uint16_t(e.text.size());
+            put(&seconds, 8);
+            put(&type, 1);
+            put(&zero, 1);
+            put(&length, 2);
+            put(e.text.data(), e.text.size());
+        }
+        return pointerToJsAddress(g_textBlob.data());
+    } catch (...) {
+        g_textBlob.clear();
+        return 0.0;
+    }
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_text_events_size_js() { return double(g_textBlob.size()); }
+
+// Note-on density for the NPS graph: [n, start seconds of bucket 0..n, counts 0..n-1].
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_density_js()
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        g_densityBlob.clear();
+        if (!g_mappedStore.valid()) return 0.0;
+        const auto& md = g_mappedStore.metadata();
+        const auto& density = g_mappedStore.noteDensity();
+        const uint64_t bucketTicks = g_mappedStore.densityBucketTicks();
+        const std::size_t factor = std::max<std::size_t>(1, (density.size() + 262143) / 262144);
+        const std::size_t n = (density.size() + factor - 1) / factor;
+        g_densityBlob.resize(1 + (n + 1) + n);
+        g_densityBlob[0] = double(n);
+        for (std::size_t i = 0; i <= n; ++i)
+            g_densityBlob[1 + i] = md.tickToSeconds(uint32_t(std::min<uint64_t>(uint64_t(i) * factor * bucketTicks, md.maxTick)));
+        for (std::size_t i = 0; i < n; ++i) {
+            uint64_t c = 0;
+            for (std::size_t j = i * factor; j < std::min(density.size(), (i + 1) * factor); ++j) c += density[j];
+            g_densityBlob[2 + n + i] = double(c);
+        }
+        return pointerToJsAddress(g_densityBlob.data());
+    } catch (...) {
+        g_densityBlob.clear();
+        return 0.0;
+    }
+#else
+    return 0.0;
+#endif
+}
 
 // [maxTick, durationSeconds, ticksPerBeat, noteCount, trackCount, format]
 #ifdef __EMSCRIPTEN__

@@ -766,10 +766,35 @@ function initCore() {
 
     applyCoreSettings();
     coreReady = true;
+    lastGoodConfig = configSnapshot();
     allocateAudioRing();
     dropGpuPending();
+    // The engine must not offload voices until setupGpu() re-enables it.
+    if (Module._ssw_wgpu_set_enabled) Module._ssw_wgpu_set_enabled(0);
     gpuActive = false;
     if (gpuWanted) void setupGpu();
+    if (pendingSoundfonts.length) {
+        const queued = pendingSoundfonts.splice(0);
+        setTimeout(() => { for (const m of queued) self.onmessage({ data: m }); }, 0);
+    }
+}
+
+// Last configuration ssw_init_ex accepted (HANDOFF sec. 67): a configuration the
+// core cannot materialize (e.g. too many voices for the memory left) must not leave
+// the worker without a core, which made every later SF2 load fail.
+let lastGoodConfig = null;
+const pendingSoundfonts = [];
+
+function configSnapshot() {
+    return { sampleRateHz, synthChannels, bitsPerSample, blockFrames, numBuffers, realtimePriority,
+             maxVoices, minVoices, requestedWorkers, noteSharding, stealScoreCache, fastNoteOff,
+             validateState, softClip };
+}
+
+function restoreConfig(c) {
+    ({ sampleRateHz, synthChannels, bitsPerSample, blockFrames, numBuffers, realtimePriority,
+       maxVoices, minVoices, requestedWorkers, noteSharding, stealScoreCache, fastNoteOff,
+       validateState, softClip } = c);
 }
 
 function reinitializeCore() {
@@ -782,7 +807,17 @@ function reinitializeCore() {
 
     // ssw_init() reinitializes only the voice engine and deliberately preserves
     // the already-loaded merged instrument, matching SnappySynth config reload.
-    initCore();
+    try {
+        initCore();
+    } catch (error) {
+        if (!lastGoodConfig) throw error;
+        const wanted = configSnapshot();
+        restoreConfig(lastGoodConfig);
+        initCore();
+        setError(new Error("WasmiSynth could not apply " + wanted.maxVoices + " voices / " +
+            (wanted.requestedWorkers || "auto") + " workers / block " + wanted.blockFrames +
+            " (" + (error && error.message ? error.message : error) + "); the previous settings were kept."));
+    }
 
     soundfontLoaded =
         Module._ssw_region_count() > 0;
@@ -1290,8 +1325,10 @@ onmessage = async event => {
         }
 
         if (data.type === "loadSoundfont") {
-            if (!Module || !coreReady)
-                throw new Error("SnappySynthV2 core is still starting.");
+            if (!Module || !coreReady) {
+                pendingSoundfonts.push(data);
+                return;
+            }
 
             const file = data.file;
             if (!file)

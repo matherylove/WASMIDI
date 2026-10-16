@@ -207,10 +207,26 @@ input[type=color] { width: 40px; height: 22px; padding: 2px; border: 0; backgrou
 /* ==========================================================================
    WASMIDI Audio — Winamp-style player on top of the Dekxtopia window kit
    ========================================================================== */
-body.wa { min-height: 100dvh; display: flex; justify-content: center; align-items: flex-start; padding: 28px 12px 36px; }
-.wa-stack { position: relative; z-index: 1; width: min(560px, 100%); display: flex; flex-direction: column; gap: 6px; }
-.wa-stack > .win { box-shadow: var(--raised), 0 18px 48px rgba(0, 0, 0, 0.5); }
-.wa-stack .win-menu a.active { color: var(--white); }
+body.wa { min-height: 100dvh; padding: 0; overflow: auto; }
+.wa-desk { position: relative; z-index: 1; min-height: 100dvh; }
+.wa-desk > .win { position: absolute; box-shadow: var(--raised), 0 18px 48px rgba(0, 0, 0, 0.5); }
+.wa-desk > .win[hidden] { display: none; }
+.wa-desk > .win .win-title { cursor: grab; touch-action: none; user-select: none; }
+.wa-desk > .win.dragging .win-title { cursor: grabbing; }
+.wa-desk > .win.focused { z-index: 5; }
+.win-menu a.active { color: var(--white); }
+.cap-btn.min-btn { cursor: pointer; }
+.cap-btn.off { opacity: 0.35; }
+#w-main { width: 560px; }
+#w-info { width: 560px; }
+#w-lyrics { width: 420px; }
+#w-graphs { width: 420px; }
+#w-vis { width: 560px; }
+@media (max-width: 900px) {
+  .wa-desk { display: flex; flex-direction: column; gap: 6px; padding: 10px; }
+  .wa-desk > .win { position: relative; left: auto !important; top: auto !important; width: 100% !important; }
+  .wa-desk > .win .win-title { cursor: default; }
+}
 
 /* LCD */
 .lcd {
@@ -246,12 +262,15 @@ body.wa { min-height: 100dvh; display: flex; justify-content: center; align-item
 .transport button:active { padding: 1px 8px 0 10px; }
 .transport button svg { display: block; }
 .transport .spacer { flex: 1; }
-.transport .vol { display: flex; align-items: center; gap: 6px; width: 150px; }
+.transport .vol { display: flex; align-items: center; gap: 6px; width: 140px; }
 .transport .vol span { font: 15px/1 var(--term); color: var(--faint); }
-.drop-hint { margin-top: 6px; font-size: 11px; color: var(--faint); }
+.toggles { display: flex; gap: 3px; margin-top: 6px; align-items: center; }
+.toggles button { height: 22px; padding: 0 8px; font: 15px/1 var(--term); letter-spacing: 1px; }
+.toggles button[aria-pressed="true"] { color: var(--white); background: var(--accent-2, #2a194b); box-shadow: var(--sunken); }
+.toggles .hint { margin-left: auto; font-size: 11px; color: var(--faint); }
 .wa-main.drag { outline: 1px dotted var(--white); outline-offset: -4px; }
 
-/* Info / playlist window */
+/* Info window */
 .info-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
 .kv { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 2px 8px; }
 .kv dt { color: var(--dim); }
@@ -260,12 +279,23 @@ body.wa { min-height: 100dvh; display: flex; justify-content: center; align-item
 .cfg span { color: var(--dim); }
 .cfg input[type=number], .cfg select { width: 100%; }
 .cfg .row { gap: 6px; }
-.log { margin-top: 8px; height: 120px; overflow: auto; background: var(--field); box-shadow: var(--sunken); padding: 3px 6px; font: 15px/1.2 var(--term); color: var(--dim); }
+.log { margin-top: 8px; height: 110px; overflow: auto; background: var(--field); box-shadow: var(--sunken); padding: 3px 6px; font: 15px/1.2 var(--term); color: var(--dim); }
 .log div.err { color: #fca5a5; }
 .log div.ok { color: #7cf29a; }
 
-@media (max-width: 560px) {
-  .lcd { grid-template-columns: 1fr; }
-  .info-grid { grid-template-columns: 1fr; }
-  .readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
+/* Lyrics window */
+.lyr-now { min-height: 64px; display: grid; place-items: center; text-align: center; padding: 6px 10px; background: #04031a; box-shadow: var(--sunken); font: 26px/1.15 var(--term); color: var(--faint); overflow: hidden; }
+.lyr-now .sung { color: var(--white); text-shadow: 0 0 6px rgba(240, 171, 252, 0.6); }
+.lyr-next { margin-top: 4px; min-height: 22px; text-align: center; font: 18px/1.2 var(--term); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lyr-markers { margin-top: 8px; height: 132px; overflow: auto; background: var(--field); box-shadow: var(--sunken); padding: 2px; }
+.lyr-markers button { display: flex; width: 100%; gap: 8px; justify-content: flex-start; height: 20px; padding: 0 6px; border: 0; box-shadow: none; background: transparent; font: 16px/1 var(--term); color: var(--dim); text-align: left; }
+.lyr-markers button:hover { color: var(--white); }
+.lyr-markers button.now { color: var(--white); background: #2a194b; }
+.lyr-markers button b { color: var(--faint); font-weight: normal; min-width: 44px; }
+.lyr-empty { font: 16px/1.2 var(--term); color: var(--faint); padding: 4px 6px; }
+
+/* Graphs + visualizer */
+.graph-box { position: relative; background: #04031a; box-shadow: var(--sunken); }
+.graph-box canvas { display: block; width: 100%; height: 100%; }
+#graphs-box { height: 236px; }
+#vis-box { height: 170px; }

@@ -47,7 +47,10 @@ static void emu_gpu_render(float *out, int frames) {
         const int ch = (int)q->sample_channels;
         float *z = g_emu_z[q->voice_id & ((1 << 17) - 1)];
         if (q->filter_reset) { z[0] = q->z1l; z[1] = q->z2l; z[2] = q->z1r; z[3] = q->z2r; }
+        float adv = 0.0f;
         for (uint32_t f = q->startup; f < q->frames; ++f) {
+            pos = q->position + q->pitch * adv;
+            if (q->loop_active && pos >= q->loop_end) pos = q->loop_start + fmodf(pos - q->loop_start, q->loop_end - q->loop_start);
             const int i = (int)pos; const float frac = pos - (float)i;
             int nx = i + 1;
             if (q->loop_active && (float)nx >= q->loop_end) nx = (int)q->loop_start;
@@ -71,8 +74,7 @@ static void emu_gpu_render(float *out, int frames) {
             if (st == 0) { env += q->attack_inc; if (env >= 1.0f) { env = 1.0f; st = 1; } }
             else if (st == 1) { env -= q->decay_dec; if (env <= q->sustain) { env = q->sustain; st = 2; } }
             else if (st == 3) { env *= q->release_alpha; if (env <= 1.0f / 65536.0f) break; }
-            pos += q->pitch;
-            if (q->loop_active && pos >= q->loop_end) pos -= q->loop_end - q->loop_start;
+            adv += 1.0f;
         }
     }
 }
@@ -189,7 +191,7 @@ int main(int argc, char **argv) {
         if (cnt) ssw_queue_events(mb, tb, (int)cnt);
         if (gpuemu) { ssw_wgpu_begin_block(); ssw_wgpu_set_frame_base(0); }
         ssw_render_queued_into((uintptr_t)buf, BLOCK);
-        if (gpuemu) { emu_gpu_render(buf, BLOCK); ssw_output_stage_apply((uintptr_t)buf, BLOCK); }
+        if (gpuemu) { if (!getenv("GPUSKIP")) emu_gpu_render(buf, BLOCK); ssw_output_stage_apply((uintptr_t)buf, BLOCK); }
         double w = now(CLOCK_MONOTONIC) - w0, c = now(CLOCK_PROCESS_CPUTIME_ID) - c0;
         if (wf) for (int k = 0; k < BLOCK * 2; ++k) { float v = buf[k]; v = v > 1 ? 1 : v < -1 ? -1 : v; int16_t q = (int16_t)(v * 32767); fwrite(&q, 2, 1, wf); }
         frames_out += BLOCK;

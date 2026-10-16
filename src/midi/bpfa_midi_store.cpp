@@ -44,6 +44,7 @@ struct Decoder {
     uint32_t tick = 0;
     uint8_t runningStatus = 0;
     bool finished = false;
+    bool wantText = false; // index scan only: report lyric/marker/text metas
     const BpfaMidiStore* store = nullptr;
     const uint8_t* block = nullptr;
     uint64_t blockBegin = 0;
@@ -87,7 +88,7 @@ struct Decoder {
     }
 };
 
-enum class Kind { Channel, Tempo, SysEx, End };
+enum class Kind { Channel, Tempo, SysEx, Text, End };
 
 // BPFA ReadNextEvent, extended to report tempo payloads of length >= 3 and every
 // SysEx (WASMIDI keeps them all; the synth decides what it supports).
@@ -99,6 +100,7 @@ struct RawDecoder {
     uint32_t tick = 0;
     uint8_t runningStatus = 0;
     bool finished = false;
+    bool wantText = false;
     const uint8_t* block = nullptr;
 
     bool byte(uint8_t& v) {
@@ -157,6 +159,13 @@ inline __attribute__((always_inline)) Kind readEventImpl(D& d, uint8_t& status, 
                 tempo = (uint32_t(t0) << 16) | (uint32_t(t1) << 8) | t2;
                 d.position += length - 3u;
                 return Kind::Tempo;
+            }
+            if (d.wantText && length && (type == 0x01 || type == 0x05 || type == 0x06)) {
+                status = type;
+                dataOffset = d.position;
+                dataLength = length;
+                d.position += length;
+                return Kind::Text;
             }
             d.position += length;
             continue;
@@ -265,6 +274,9 @@ void BpfaMidiStore::clear()
     sourceCache_.clear();
     sourceCacheAge_ = 0;
     ingest_.reset();
+    std::vector<TextEvent>().swap(textEvents_);
+    std::vector<uint32_t>().swap(density_);
+    densityBucketTicks_ = 1;
     chunkBase_ = 0;
     chunkKeys_.clear();
     std::vector<uint8_t>().swap(partialBlob_);
@@ -371,6 +383,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             trackEnd = out.trackCount;
         }
         if (out.format > 1) { error_ = "Only MIDI Format 0 and 1 are supported"; return false; }
+        densityBucketTicks_ = std::max<uint32_t>(1u, uint32_t(out.ticksPerBeat) / 8u);
         if (out.ticksPerBeat == 0 || (out.ticksPerBeat & 0x8000)) { error_ = "SMPTE timing is not supported"; return false; }
 
         tracks_.resize(out.trackCount);
@@ -439,6 +452,24 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 if (kind == Kind::Tempo) {
                     out.tempoMap.push_back({d.tick, tempo});
                     ++order;
+                    continue;
+                }
+                if (kind == Kind::Text) {
+                    // Lyrics, markers and text for WASMIDI Audio (HANDOFF sec. 67). Not
+                    // counted in `order`: the other decoders never see these events.
+                    if (textEvents_.size() < MaxTextEvents) {
+                        TextEvent te;
+                        te.tick = d.tick;
+                        te.track = t;
+                        te.type = status;
+                        te.text.resize(std::min<uint32_t>(dataLength, MaxTextBytes));
+                        if (!te.text.empty() && !copySource(dataOffset, reinterpret_cast<uint8_t*>(&te.text[0]), te.text.size())) {
+                            finalTick = d.tick;
+                            return true;
+                        }
+                        d.block = nullptr;
+                        textEvents_.push_back(std::move(te));
+                    }
                     continue;
                 }
                 if (kind == Kind::SysEx) {
@@ -519,6 +550,11 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 if (type == 0x90 && d2 != 0) {
                     ++notesPerTrack[t];
                     ++totalNotes;
+                    {
+                        const uint32_t bucket = d.tick / densityBucketTicks_;
+                        if (bucket >= density_.size()) density_.resize(std::size_t(bucket) + 1024u, 0u);
+                        ++density_[bucket];
+                    }
                     out.hasPitch = true;
                     out.minPitch = std::min(out.minPitch, d1);
                     out.maxPitch = std::max(out.maxPitch, d1);
@@ -531,11 +567,13 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             };
             if (!fileBytes_.empty()) {
                 RawDecoder d{fileBytes_.data(), storage.byteBegin, storage.byteEnd};
+                d.wantText = true;
                 auto chunk = [&]() { return scanEvents(d); };
                 runChunked(chunk);
             } else {
                 Decoder d{nullptr, storage.byteBegin, storage.byteEnd};
                 d.store = this;
+                d.wantText = true;
                 auto chunk = [&]() { return scanEvents(d); };
                 runChunked(chunk);
             }
@@ -1754,6 +1792,11 @@ void BpfaMidiStore::finalizeIndex(MidiDocument& out, uint64_t totalNotes, uint64
         if (a.track != b.track) return a.track < b.track;
         return a.order < b.order;
     });
+    std::stable_sort(textEvents_.begin(), textEvents_.end(), [](const TextEvent& a, const TextEvent& b) {
+        if (a.tick != b.tick) return a.tick < b.tick;
+        return a.track < b.track;
+    });
+    density_.resize(std::size_t(out.maxTick / densityBucketTicks_) + 1u, 0u);
     metadata_ = out;
     buildColorTables();
     visualCheckpointSpan_ = std::max<uint32_t>(1u, uint32_t((uint64_t(out.maxTick) + 127u) / 128u));
@@ -1792,7 +1835,7 @@ struct BlobReader {
     }
 };
 constexpr uint32_t BlobMagic = 0x42504d57u;
-constexpr uint32_t BlobVersion = 1;
+constexpr uint32_t BlobVersion = 2;
 }
 
 void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uint64_t>& notesPerTrack,
@@ -1876,6 +1919,17 @@ void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uin
         w.put(uint64_t(x.data.size()));
         w.bytes(x.data.data(), x.data.size());
     }
+    w.put(uint64_t(textEvents_.size()));
+    for (const TextEvent& te : textEvents_) {
+        w.put(te.tick);
+        w.put(te.track);
+        w.put(te.type);
+        w.put(uint32_t(te.text.size()));
+        w.bytes(te.text.data(), te.text.size());
+    }
+    w.put(densityBucketTicks_);
+    w.put(uint64_t(density_.size()));
+    w.bytes(density_.data(), density_.size() * sizeof(uint32_t));
 }
 
 bool BpfaMidiStore::indexPartial(uint64_t size, MidiReadAt readAt, void* readUser, const PartialPlan& plan,
@@ -2098,6 +2152,29 @@ bool BpfaMidiStore::mergePartial(const uint8_t* data, std::size_t size)
             if (!r.ok) break;
             x.data.assign(xp, xp + n);
             sysex_.push_back(std::move(x));
+        }
+        const uint64_t ntext = r.get<uint64_t>();
+        for (uint64_t i = 0; i < ntext && r.ok; ++i) {
+            TextEvent te;
+            te.tick = r.get<uint32_t>();
+            te.track = r.get<uint16_t>();
+            te.type = r.get<uint8_t>();
+            const uint32_t n = r.get<uint32_t>();
+            const uint8_t* tp = r.take(n);
+            if (!r.ok) break;
+            te.text.assign(reinterpret_cast<const char*>(tp), n);
+            if (textEvents_.size() < MaxTextEvents) textEvents_.push_back(std::move(te));
+        }
+        densityBucketTicks_ = std::max<uint32_t>(1u, r.get<uint32_t>());
+        const uint64_t nd = r.get<uint64_t>();
+        const uint8_t* dp = r.take(static_cast<std::size_t>(nd * sizeof(uint32_t)));
+        if (r.ok && nd) {
+            if (density_.size() < nd) density_.resize(static_cast<std::size_t>(nd), 0u);
+            for (uint64_t i = 0; i < nd; ++i) {
+                uint32_t c;
+                std::memcpy(&c, dp + i * 4, 4);
+                density_[i] += c;
+            }
         }
         if (!r.ok) { error_ = "Truncated partial index"; return false; }
         return true;

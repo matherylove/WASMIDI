@@ -4025,8 +4025,59 @@ static DWORD wait_for_worker_cycle(LONG render_cycle, DWORD timeout_ms) {
 #if SSW_WORKER_CYCLE_TRAMPOLINE && (defined(__GNUC__) || defined(__clang__))
 __attribute__((noinline))
 #endif
+/* Advances the envelope `frames` samples in closed form; returns the samples
+ * the voice kept sounding (fewer than `frames` only when it reached OFF). */
+static int wgpu_env_advance(int *state, float *env, int frames, float attack_inc, float decay_dec,
+                            float release_alpha) {
+    int done = 0;
+    while (done < frames) {
+        const int left = frames - done;
+        if (*state == ENV_ATTACK) {
+            const int need = attack_inc > 0.0f ? (int)ceilf((1.0f - *env) / attack_inc) : left + 1;
+            if (need > left) { *env += attack_inc * (float)left; return frames; }
+            *env = 1.0f; *state = ENV_DECAY; done += need > 0 ? need : 1;
+        } else if (*state == ENV_DECAY) {
+            const int need = decay_dec > 0.0f ? (int)ceilf((*env - DEFAULT_SUSTAIN_LEVEL) / decay_dec) : left + 1;
+            if (need > left) { *env -= decay_dec * (float)left; return frames; }
+            *env = DEFAULT_SUSTAIN_LEVEL; *state = ENV_SUSTAIN; done += need > 0 ? need : 1;
+        } else if (*state == ENV_RELEASE) {
+            if (release_alpha <= 0.0f || release_alpha >= 1.0f || *env <= VOICE_SILENCE) {
+                if (*env <= VOICE_SILENCE || release_alpha <= 0.0f) { *state = ENV_OFF; return done; }
+                return frames;
+            }
+            const int need = (int)ceilf(logf(VOICE_SILENCE / *env) / logf(release_alpha));
+            if (need > left) { *env *= powf(release_alpha, (float)left); return frames; }
+            *state = ENV_OFF;
+            return done + (need > 1 ? need - 1 : 0);
+        } else {
+            return frames; /* sustain: nothing changes */
+        }
+    }
+    return frames;
+}
+
+/* Tile-level reservation (rev. 72): requests are staged per worker and copied
+ * into the shared array with one atomic per tile instead of one per voice. */
+static wgpu_voice_request **g_wgpu_local = NULL;
+static int g_wgpu_local_workers = 0;
+
+static int wgpu_tile_has_room(int frames) {
+    const LONG margin = (LONG)RENDER_TILE_VOICES * (LONG)(g_worker_count + 1);
+    if (load_relaxed_long(&g_wgpu_count) + margin > g_wgpu_capacity) return 0;
+    if ((int64_t)load_relaxed_long(&g_wgpu_frames) + (int64_t)margin * frames > (int64_t)g_wgpu_frame_cap) return 0;
+    return 1;
+}
+
+static void wgpu_flush_tile(int widx, int count, int frames) {
+    const LONG base = InterlockedAdd(&g_wgpu_count, count) - count;
+    if (base < 0 || base + count > g_wgpu_capacity) return; /* unreachable: room was checked */
+    memcpy(&g_wgpu_requests[base], g_wgpu_local[widx], sizeof(wgpu_voice_request) * (size_t)count);
+    InterlockedAdd(&g_wgpu_frames, count * frames);
+}
+
 /* Returns 0 = render on the CPU, 1 = offloaded, 2 = offloaded and finished (OFF). */
-static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int check_key_off_counter) {
+static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int check_key_off_counter,
+                             wgpu_voice_request *r) {
     const sfz_region *region = v->region;
     const wav_data *sample = region->is_resampled ? region->resampled_data : region->sample_data;
     if (!sample || !sample->data || sample->gpu_offset_plus_one <= 0 || channels != 2) return 0;
@@ -4049,10 +4100,6 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     const float pitch = v->pitch_multiplier * ch_render->bend_pitch_mul;
     float pos = v->position < (float)sample_start ? (float)sample_start : v->position;
     if (!loop_active && pos + pitch * (float)frames >= (float)(sample_end - 1)) return 0;
-    /* Stay within the GPU's scratch rows (voice-frames per block). */
-    if (InterlockedAdd(&g_wgpu_frames, frames) > g_wgpu_frame_cap) return 0;
-    const LONG slot = InterlockedIncrement(&g_wgpu_count) - 1;
-    if (slot >= g_wgpu_capacity) return 0;
     /* Block-start note-off handling, as the CPU loop does it. */
     const int sustain_down = g_channel_sustain_snapshot[ch];
     int env_state = v->env_state;
@@ -4088,7 +4135,6 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
             compute_static_lpf(cutoff, resonance, &c_b0, &c_b1, &c_b2, &c_a1, &c_a2);
         }
     }
-    wgpu_voice_request *r = &g_wgpu_requests[slot];
     memset(r, 0, sizeof(*r));
     r->sample_offset = (uint32_t)(sample->gpu_offset_plus_one - 1);
     r->sample_channels = (uint32_t)s_ch;
@@ -4119,29 +4165,38 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     r->b0 = c_b0; r->b1 = c_b1; r->b2 = c_b2; r->a1 = c_a1; r->a2 = c_a2;
     r->z1l = v->z1_l; r->z2l = v->z2_l; r->z1r = v->z1_r; r->z2r = v->z2_r;
     v->wgpu_serial = g_wgpu_serial;
-    /* Same per-sample state arithmetic as the GPU kernel, without samples. */
+    /* Closed-form advance of the same state machine the GPU kernel steps
+     * through per sample (rev. 72): O(1) per voice instead of O(frames). */
     float env = v->env_level;
     int pending = v->pending_note_off_samples;
-    for (int f = (int)r->startup; f < frames; ++f) {
-        if (pending > 0 && --pending == 0) {
+    int remaining = frames - (int)r->startup;
+    int advanced = 0;
+    if (pending > 0) {
+        if (pending - 1 >= remaining) {
+            advanced = wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_dec, release_alpha);
+            pending -= remaining;
+            remaining = 0;
+        } else {
+            const int before = pending - 1;
+            advanced = wgpu_env_advance(&env_state, &env, before, attack_inc, decay_dec, release_alpha);
+            remaining -= before;
             pending = -1;
-            if (!v->note_off_received && env_state != ENV_OFF && env_state != ENV_RELEASE) {
-                v->note_off_received = 1;
-                if (!sustain_down) env_state = ENV_RELEASE;
+            if (env_state != ENV_OFF) {
+                if (!v->note_off_received && env_state != ENV_RELEASE) {
+                    v->note_off_received = 1;
+                    if (!sustain_down) env_state = ENV_RELEASE;
+                }
             }
         }
-        if (env_state == ENV_ATTACK) {
-            env += attack_inc;
-            if (env >= 1.0f) { env = 1.0f; env_state = ENV_DECAY; }
-        } else if (env_state == ENV_DECAY) {
-            env -= decay_dec;
-            if (env <= DEFAULT_SUSTAIN_LEVEL) { env = DEFAULT_SUSTAIN_LEVEL; env_state = ENV_SUSTAIN; }
-        } else if (env_state == ENV_RELEASE) {
-            env *= release_alpha;
-            if (env <= VOICE_SILENCE) { env_state = ENV_OFF; break; }
+    }
+    if (remaining > 0 && env_state != ENV_OFF)
+        advanced += wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_dec, release_alpha);
+    if (env_state != ENV_OFF && advanced > 0) {
+        pos += pitch * (float)advanced;
+        if (loop_active && pos >= (float)loop_end) {
+            const float len = (float)(loop_end - loop_start);
+            pos = (float)loop_start + fmodf(pos - (float)loop_start, len);
         }
-        pos += pitch;
-        if (loop_active && pos >= (float)loop_end) pos -= (float)(loop_end - loop_start);
     }
     v->pending_note_off_samples = pending;
     v->startup_samples = 0;
@@ -4969,7 +5024,9 @@ int need_compact = (wd->release_count > 0);
                                                                                                                                                                                                                                                                 // Consumer phase: work-stealing across all voices (pop in chunks to reduce atomics)
                                                                                                                                                                                                                                                                 // Chunk size scales with total voice count: fewer atomic ops per worker at high loads.
 LONG pop_chunk = RENDER_TILE_VOICES;
-const int wgpu_block = (int)load_relaxed_long(&g_wgpu_enabled) && g_wgpu_requests && channels == 2;
+const int wgpu_block = (int)load_relaxed_long(&g_wgpu_enabled) && g_wgpu_requests && channels == 2 &&
+    g_wgpu_local && widx < g_wgpu_local_workers && g_wgpu_local[widx];
+int wgpu_tile_count = 0, wgpu_tile_open = 0;
 LONG render_size = load_relaxed_long(&g_render_size);
 const size_t tile_stride = (size_t)g_tile_mix_frames * (size_t)channels;
 int ss_worker_counted = 0;
@@ -4999,6 +5056,8 @@ LONG end = idx + pop_chunk; if (end > render_size) end = render_size;
 mix = g_tile_mix + (size_t)(idx / RENDER_TILE_VOICES) * tile_stride;
 memset(mix, 0, sizeof(float) * (size_t)frames * (size_t)channels);
 if (ss_profile && !ss_worker_counted) { ss_worker_counted = 1; InterlockedAdd(&g_workers_participating, 1); }
+wgpu_tile_count = 0;
+wgpu_tile_open = wgpu_block && wgpu_tile_has_room(frames);
 for (LONG k = idx; k < end; ++k) {
 #if defined(__AVX2__) || defined(__wasm_simd128__)
 int fast_batch = 0;
@@ -5028,8 +5087,10 @@ v->env_state = ENV_OFF;
 need_compact = 1;
 continue;
 }
-if (wgpu_block) {
-    const int offloaded = wgpu_try_offload(v, vid, frames, channels, check_key_off_counter);
+if (wgpu_tile_open) {
+    const int offloaded = wgpu_try_offload(v, vid, frames, channels, check_key_off_counter,
+                                           &g_wgpu_local[widx][wgpu_tile_count]);
+    if (offloaded) ++wgpu_tile_count;
     if (offloaded) {
         if (offloaded == 2 || v->env_state != ENV_SUSTAIN || v->note_off_received) need_compact = 1;
         continue;
@@ -6346,7 +6407,8 @@ if (env_state != ENV_SUSTAIN || v->note_off_received || v->kill_now || pending_n
 need_compact = 1;
 }
 // In cross-thread render, avoid touching owner's release pool here
-} // end for (LONG k = idx; k < end; ++k)
+}
+if (wgpu_tile_count > 0) wgpu_flush_tile(widx, wgpu_tile_count, frames); // end for (LONG k = idx; k < end; ++k)
 } // end consumer for (;;)
 
 wd->last_key_off_epoch = key_off_epoch;
@@ -6487,8 +6549,8 @@ g_worker_count = desired;
                                                                                                                                                                                                                                                                 g_worker_mix_has_data = (int*)calloc(g_worker_count, sizeof(int));
 
                                                                                                                                                                                                                                                                 int note_map_by_channel = (max_voices <= g_worker_count * STEAL_CHANNEL_MAP_VOICES_PER_WORKER);
-                                                                                                                                                                                                                                                                /* Auto: up to 4096 voices the admitted note-ons fit one event thread (rev. 69). */
-                                                                                                                                                                                                                                                                if (max_voices <= 4096) note_map_by_channel = 2;
+                                                                                                                                                                                                                                                                /* Auto: one event thread at every voice count (rev. 72, HANDOFF sec. 66). */
+note_map_by_channel = 2;
                                                                                                                                                                                                                                                                 {
                                                                                                                                                                                                                                                                 const char *sharding_env = getenv("SS_NOTE_SHARDING");
                                                                                                                                                                                                                                                                 if (sharding_env && sharding_env[0]) {
@@ -7832,6 +7894,19 @@ int voice_get_worker_count(void) {
 float voice_global_mix_gain(void) { return g_global_mix_gain; }
 
 int voice_wgpu_set_enabled(int enabled) {
+    if (enabled && g_wgpu_local_workers != g_worker_count) {
+        if (g_wgpu_local) {
+            for (int w = 0; w < g_wgpu_local_workers; ++w) free(g_wgpu_local[w]);
+            free(g_wgpu_local);
+        }
+        g_wgpu_local = (wgpu_voice_request**)calloc((size_t)(g_worker_count > 0 ? g_worker_count : 1), sizeof(*g_wgpu_local));
+        g_wgpu_local_workers = 0;
+        if (g_wgpu_local) {
+            for (int w = 0; w < g_worker_count; ++w)
+                g_wgpu_local[w] = (wgpu_voice_request*)malloc(sizeof(wgpu_voice_request) * RENDER_TILE_VOICES);
+            g_wgpu_local_workers = g_worker_count;
+        }
+    }
     if (enabled) {
         const int want = max_voices > 0 ? max_voices * 8 : 0;
         if (want > g_wgpu_capacity) {

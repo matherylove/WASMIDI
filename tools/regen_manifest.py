@@ -15,6 +15,7 @@ FILES = [
     ".github/workflows/build-wasm.yml",
     "CMakeLists.txt",
     "HANDOFF.md",
+    "CLAUDE.md",
     "PORTING_STATUS.md",
     "VALIDATION.md",
     "src/keyboard.cpp",

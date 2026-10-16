@@ -13,13 +13,13 @@
 <script src="snappysynth_bridge.js?v=dev"></script>
 </head>
 <body class="wa">
-<div class="wa-stack">
+<div class="wa-desk" id="desk">
 
-  <div class="win wa-main" id="main">
+  <div class="win wa-main" id="w-main" data-win="main">
     <div class="win-title">
       <span class="win-icon"><svg viewBox="0 0 12 12" width="12" height="12" shape-rendering="crispEdges" aria-hidden="true"><path fill="#c4b5fd" d="M4 0h8v2h-8zM4 2h2v6h-2zM10 2h2v7h-2z"/><path fill="#a78bfa" d="M1 7h5v1h-5zM0 8h6v3h-6zM1 11h4v1h-4z"/><path fill="#f0abfc" d="M7 8h5v1h-5zM6 9h6v2h-6zM7 11h4v1h-4z"/></svg></span>
       <span class="win-text">WASMIDI Audio</span>
-      <span class="win-ctl" aria-hidden="true"><span class="cap-btn"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn"><svg viewBox="0 0 9 9" width="9" height="9" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h9v2h-9zM0 2h1v7h-1zM8 2h1v7h-1zM0 8h9v1h-9z"/></svg></span><span class="cap-btn close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
+      <span class="win-ctl" aria-hidden="true"><span class="cap-btn off"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn"><svg viewBox="0 0 9 9" width="9" height="9" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h9v2h-9zM0 2h1v7h-1zM8 2h1v7h-1zM0 8h9v1h-9z"/></svg></span><span class="cap-btn close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
     </div>
     <nav class="win-menu" aria-label="Site">
       <a href="https://dekx.cc/"><u>H</u>ome</a>
@@ -60,7 +60,13 @@
         <span class="spacer"></span>
         <label class="vol"><span>VOL</span><input type="range" id="volume" min="0" max="100" step="1" value="100" aria-label="Volume"></label>
       </div>
-      <p class="drop-hint">Drop a .mid and a .sf2 here. Audio only: no piano roll, keyboard or graphs.</p>
+      <div class="toggles">
+        <button type="button" data-toggle="info" aria-pressed="true" title="Info window">INFO</button>
+        <button type="button" data-toggle="lyrics" aria-pressed="false" title="Lyrics and markers">LYR</button>
+        <button type="button" data-toggle="graphs" aria-pressed="false" title="Graphs">GRAPH</button>
+        <button type="button" data-toggle="vis" aria-pressed="false" title="Spectrum visualizer">VIS</button>
+        <span class="hint">Drop a .mid and a .sf2 here</span>
+      </div>
       <input type="file" id="midi-input" accept=".mid,.midi,.kar,audio/midi" hidden>
       <input type="file" id="sf2-input" accept=".sf2,.sf3,.sfz" hidden>
     </div>
@@ -70,10 +76,11 @@
     </div>
   </div>
 
-  <div class="win win-child">
+  <div class="win win-child" id="w-info" data-win="info">
     <div class="win-title">
       <span class="win-icon"><svg viewBox="0 0 10 11" width="10" height="11" shape-rendering="crispEdges" aria-hidden="true"><path fill="#6f6a98" d="M0 0h7v1h-7zM0 1h1v10h-1zM9 3h1v8h-1zM0 10h10v1h-10zM6 1h2v1h-2zM8 2h1v1h-1z"/><path fill="#dcd8f0" d="M1 1h5v9h-5zM6 2h2v8h-2zM8 3h1v7h-1z"/><path fill="#8a83bd" d="M2 4h4v1h-4zM2 6h6v1h-6zM2 8h5v1h-5z"/></svg></span>
       <span class="win-text">WASMIDI Audio — Info</span>
+      <span class="win-ctl"><span class="cap-btn min-btn" data-min title="Minimize"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn close min-btn" data-min title="Close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
     </div>
     <div class="win-body win-pad">
       <div class="info-grid">
@@ -113,6 +120,43 @@
     </div>
   </div>
 
+
+  <div class="win win-child" id="w-lyrics" data-win="lyrics" hidden>
+    <div class="win-title">
+      <span class="win-icon"><svg viewBox="0 0 12 12" width="12" height="12" shape-rendering="crispEdges" aria-hidden="true"><path fill="#c4b5fd" d="M4 0h8v2h-8zM4 2h2v6h-2zM10 2h2v7h-2z"/><path fill="#a78bfa" d="M1 7h5v1h-5zM0 8h6v3h-6zM1 11h4v1h-4z"/><path fill="#f0abfc" d="M7 8h5v1h-5zM6 9h6v2h-6zM7 11h4v1h-4z"/></svg></span>
+      <span class="win-text">WASMIDI Audio — Lyrics</span>
+      <span class="win-ctl"><span class="cap-btn min-btn" data-min title="Minimize"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn close min-btn" data-min title="Close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
+    </div>
+    <div class="win-body win-pad">
+      <div class="lyr-now" id="lyr-now"><span class="lyr-empty">No lyrics</span></div>
+      <div class="lyr-next" id="lyr-next"></div>
+      <div class="group" style="margin-top:8px"><span class="legend">Markers</span>
+        <div class="lyr-markers" id="lyr-markers"><div class="lyr-empty">No markers</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="win win-child" id="w-graphs" data-win="graphs" hidden>
+    <div class="win-title">
+      <span class="win-icon"><svg viewBox="0 0 12 12" width="12" height="12" shape-rendering="crispEdges" aria-hidden="true"><path fill="#c4b5fd" d="M4 0h8v2h-8zM4 2h2v6h-2zM10 2h2v7h-2z"/><path fill="#a78bfa" d="M1 7h5v1h-5zM0 8h6v3h-6zM1 11h4v1h-4z"/><path fill="#f0abfc" d="M7 8h5v1h-5zM6 9h6v2h-6zM7 11h4v1h-4z"/></svg></span>
+      <span class="win-text">WASMIDI Audio — Graphs</span>
+      <span class="win-ctl"><span class="cap-btn min-btn" data-min title="Minimize"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn close min-btn" data-min title="Close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
+    </div>
+    <div class="win-body win-pad">
+      <div class="graph-box" id="graphs-box"><canvas id="graphs-canvas"></canvas></div>
+    </div>
+  </div>
+
+  <div class="win win-child" id="w-vis" data-win="vis" hidden>
+    <div class="win-title">
+      <span class="win-icon"><svg viewBox="0 0 12 12" width="12" height="12" shape-rendering="crispEdges" aria-hidden="true"><path fill="#c4b5fd" d="M4 0h8v2h-8zM4 2h2v6h-2zM10 2h2v7h-2z"/><path fill="#a78bfa" d="M1 7h5v1h-5zM0 8h6v3h-6zM1 11h4v1h-4z"/><path fill="#f0abfc" d="M7 8h5v1h-5zM6 9h6v2h-6zM7 11h4v1h-4z"/></svg></span>
+      <span class="win-text">WASMIDI Audio — Visualizer</span>
+      <span class="win-ctl"><span class="cap-btn min-btn" data-min title="Minimize"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn close min-btn" data-min title="Close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
+    </div>
+    <div class="win-body win-pad">
+      <div class="graph-box" id="vis-box"><canvas id="vis-canvas"></canvas></div>
+    </div>
+  </div>
 </div>
 <script src="wasmidi-audio.js?v=dev"></script>
 </body>
