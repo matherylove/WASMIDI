@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§72). Este archivo resume el estado al cierre de la rev. 76 y dice
+`HANDOFF.md` (§1-§73). Este archivo resume el estado al cierre de la rev. 77 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -125,7 +125,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 76)
+## Estado actual (rev. 77)
 
 Rendimiento medido por el usuario:
 
@@ -153,6 +153,9 @@ Rendimiento medido por el usuario:
 - Rev. 76 (HANDOFF §72): empezar a mitad de The Nuker 4 congelaba roll y teclado (reset del
   teclado de 45 s por snapshots agotados). Snapshots por pista + snapshots compactos por
   tecla: reset en 548 s de 0,13 s en host y 0,19 s en Chromium.
+- Rev. 77 (HANDOFF §73): los tiles del roll dejaban huecos donde había notas muy cortas
+  (culling por centros de píxel y tiles dibujados corridos). Ahora una columna se tapa solo
+  si las notas de adelante cubren todos sus ticks: 0 píxeles distintos en `cull_tile_sim`.
 
 Mecanismos activos y cómo desactivarlos:
 

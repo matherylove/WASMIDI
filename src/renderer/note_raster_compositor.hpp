@@ -96,6 +96,8 @@ struct CompositorResult {
 struct CompositorScratch {
     std::vector<std::uint64_t> occupancy;
     std::vector<std::uint32_t> uncovered;
+    std::vector<std::uint64_t> partial;
+    std::vector<std::uint32_t> partialRange;
 };
 
 // Culls notes that cannot contribute a pixel. `notes` must be sorted by

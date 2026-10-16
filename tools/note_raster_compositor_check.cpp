@@ -146,10 +146,24 @@ static int RunAll() {
         std::vector<CompositorNote> tiny = { { 101u, 102u, Pack(90, 64, 1) } };
         CullViewport(tiny.data(), tiny.size(), s, g_scratch, r);
         CHECK(r.notes.size() == 1, "sub-pixel note covering a pixel centre was culled");
-        // One that covers no centre emits no fragment (x in [50, 50.5)); culling it is exact.
+        // One that covers no centre on this grid (x in [50, 50.5)) still draws in a
+        // tile shifted by a fraction of a pixel, so it survives.
         std::vector<CompositorNote> none = { { 100u, 101u, Pack(90, 64, 1) } };
         CullViewport(none.data(), none.size(), s, g_scratch, r);
-        CHECK(r.notes.empty(), "a note covering no pixel centre was kept");
+        CHECK(r.notes.size() == 1, "a sub-pixel note was culled");
+        // A later note over half of a column does not hide the one under the other
+        // half (the hole of HANDOFF sec. 73).
+        std::vector<CompositorNote> half = {
+            { 100u, 102u, Pack(90, 64, 1) }, { 101u, 102u, Pack(90, 64, 2) } };
+        CullViewport(half.data(), half.size(), s, g_scratch, r);
+        CHECK(r.notes.size() == 2, "a note half covered inside one column was culled");
+        // Two notes in front that together cover the column do hide it (equal start:
+        // the later index is in front).
+        std::vector<CompositorNote> split = { { 100u, 102u, Pack(90, 64, 1) },
+            { 100u, 101u, Pack(90, 64, 2) }, { 101u, 102u, Pack(90, 64, 3) } };
+        CullViewport(split.data(), split.size(), s, g_scratch, r);
+        CHECK(r.notes.size() == 2 && r.notes[0].endTick == 101u,
+              "notes covering a column between them did not hide the one behind");
 
         // open note (endTick == 0) stretches to the view edge
         std::vector<CompositorNote> open = { { 100u, 0u, Pack(90, 70, 1) } };
