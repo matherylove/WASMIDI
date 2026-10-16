@@ -4608,3 +4608,105 @@ Pruebas de host del CI: todas pasan.
 - Modo GPU estilo Kestrel (etapa 3); WebGPU sigue sin probarse con GPU real.
 - Comparación de calidad a oído: los WAV de `pipeline_bench` (`WAV=prefijo`) sirven
   para escuchar el pico con y sin admisión en el parser (`FEED=0`).
+
+## 71. Revisión 75 — The Nuker 4, etapa 2: roll, teclado y contadores desde un flujo plegado que decodifican los helpers
+
+**Pedido (Dekx, el de §70):** que en WASMIDI el roll horizontal, los gráficos y el teclado
+también vayan en tiempo real con *The Nuker 4 F2.mid*. Durante el trabajo pidió además que
+Claude fusione sus PRs cuando las pruebas pasen, sin esperar su aprobación.
+
+**Causa:** el Worker del parser recorría el MIDI completo dos veces más, con el heap de
+fusión de pistas (`mergePop`, un evento por vez): el barrido del roll y el estado del
+teclado/contadores. En el recorte del pico (§70), en host: barrido **2,6-2,7 s** y estado
+del teclado **4,7-5,0 s** por segundo de canción, en el mismo hilo que además cose el feed
+del synth. Las copias de echo están casi todas en la misma pista (el 83% de los bytes del
+recorte es una sola pista), así que plegarlas por pista reduce ~100 M eventos a ~2,3 M
+palabras en 1,6 s del pico.
+
+**Cambios:**
+
+1. **Flujo visual plegado** (`BpfaMidiStore`, `visualDecodeSpan` / `visualAppend` /
+   `visualTrim`): las palabras de nota y de controlador (sin 0xA0) de todas las pistas en
+   orden (tick, pista), con las copias idénticas de una pista y un tick juntas en una
+   palabra con la cantidad en el byte alto, como el feed del synth. Plegar dentro de una
+   pista y un tick es exacto para el roll y para el teclado: entre dos copias no hay un
+   evento opuesto de la misma tecla. Es el modo por defecto; `?visualstream=0` vuelve al
+   heap de fusión.
+2. **El barrido del roll** (`buildRenderSweepStream` + `renderStep`) consume el flujo con
+   cantidades: el contador de 16 bits de cada tecla y el dueño del color avanzan igual que
+   con una palabra por evento (incluido el desborde a 65536).
+3. **El teclado y los contadores** (`buildLiveSnapshotStream`) leen el mismo flujo, detrás
+   del barrido. Por tecla (pista, canal, nota) basta guardar cuántas notas están abiertas y
+   la más nueva abierta (los note-offs cierran la más vieja, así que la más nueva solo
+   cambia con un note-on o cuando la tecla se vacía); tabla plana si
+   `pistas × 2048 ≤ 1 M` claves, si no un mapa. El desempate entre dueños con el mismo
+   rango (dos canales de una pista) ahora es la clave más alta y no el orden del hash, en
+   los dos stores (el original también), para que el flujo y la fusión den lo mismo.
+4. **Retención:** `visualTrim` no descarta lo que el teclado todavía no leyó, y hasta que
+   el teclado se une al flujo después de reiniciarlo no descarta nada (tope 8 M palabras).
+   Ese era el error que hacía que el teclado cayera siempre a la fusión: el roll va
+   pantallas adelante y recortaba el flujo antes de que el teclado llegara.
+5. **El reset del teclado** (seek) toma las densidades del último segundo y los eventos de
+   su tick desde el flujo cuando lo cubre, sin decodificar con la fusión. La reconstrucción
+   de notas abiertas sigue saliendo de los snapshots por pista (cada 131072 eventos).
+6. **Si el flujo no llega a la posición del teclado:** sin helpers, el teclado lo extiende
+   él mismo (`decodeVisualLocal`; el barrido reutiliza esas palabras); con helpers, lee
+   hasta donde llegó y el teclado se atrasa unos milisegundos en vez de decodificar por su
+   cuenta.
+7. **Helpers** (`web/midi-parser-worker.js`, `midi-parser-helper.js`): los mismos Workers
+   del feed (§70) decodifican tramos del flujo visual (`visual-decode`, exports
+   `wmp_visual_*`); los tramos del feed tienen prioridad. El coordinador los agrega en
+   orden (`appendVisualResult`), y el barrido se detiene cuando le falta el próximo tramo y
+   sigue cuando llega (`sharpRenderStarved`). El pool también arranca con el primer pedido
+   del roll, no solo con el synth.
+8. **Overrides en la URL** (la página le pasa su query al Worker): `?helpers=N` fuerza la
+   cantidad de helpers (Brave puede reportar pocos núcleos), `?rawlimit=MiB` el límite de
+   fuente cruda (`0` fuerza zstd; los helpers solo existen con la fuente comprimida),
+   `?visualstream=0`, `?visualdebug=1` (cada segundo, en la consola: tiempo de barrido,
+   teclado y agregado de tramos del Worker del parser).
+9. **`web/visual-bench.html`** (y `browser_bench.py visual`): carga un MIDI con el Worker
+   del parser y reproduce un tramo a 60 cuadros/s sin dibujar ni sonar, pidiendo el roll y
+   el teclado como la app. Mide por segundo cuántos cuadros tuvieron el roll atrasado, el
+   adelanto mínimo del roll y la latencia del teclado. `browser_bench.py app` maneja la app
+   real (clics en el layout de 1280×900), pero en Chromium sin GPU el hilo principal no
+   llega a pedir cuadros y no sirve para medir.
+10. Herramientas: `tools/host_bench/visual_check.cpp` (fusión contra flujo local contra
+    tramos de helper, IDENTICAL/DIFFER y tiempos por segundo de canción) y un
+    `visualStreamSmoke` en `tools/midi_parser_bootstrap_smoke.cjs` (tres pistas con copias
+    de echo; barrido por fusión, flujo local y tramos de una segunda instancia; estado del
+    teclado del flujo contra la fusión).
+
+**Probado y descartado en esta revisión:** un Worker propio para el teclado (con el estado
+pasado del coordinador al Worker, y repartido por pistas). Con el flujo bien retenido el
+teclado cuesta 0,03-0,05 s por segundo de canción en el hilo del parser, así que se quitó.
+
+**Medición (host, contenedor de 4 hilos, recorte del pico, 60 cuadros/s, roll 2 s adelante):**
+
+| Camino, por segundo de canción en el pico | Fusión (antes) | Flujo local | Flujo con helpers |
+|---|---|---|---|
+| Barrido del roll | 2,5-3,2 s | 0,72-0,90 s | 0,05 s en el coordinador + 0,8-1,0 s en los helpers |
+| Teclado y contadores | 4,8-4,9 s | 0,031-0,045 s | 0,032-0,039 s |
+| Reset del teclado en 2,5 s | 0,21-0,25 s | 0,22-0,27 s | 0,20-0,22 s |
+
+**Medición (Chromium headless, contenedor de 4 hilos, `visual-bench.html` con el recorte del
+pico, 1,5 s + 4 s, roll 2 s adelante, 60 cuadros/s):**
+
+| Query | Roll atrasado | Adelanto mín. | Teclado | Latencia del teclado |
+|---|---|---|---|---|
+| `?helpers=3&rawlimit=0` (flujo + helpers) | 0 de 243 cuadros | 0,07 s | 56/s de media, 60/s pasado el arranque | media 2,8 ms, máx. 225 ms (el primer reset) |
+| `?helpers=0` (fuente cruda, flujo local) | 132 de 244 | se atrasa en el pico | 25/s | — |
+| `?visualstream=0` (fusión, como antes) | 232 de 244 | segundos atrás | 0,5/s | hasta 1,4 s |
+
+WASMIDI Audio con helpers y 1024 voces: 0 underruns (el synth y los
+tramos visuales comparten el pool sin pisarse).
+
+**Verificación:** `visual_check` en el recorte del pico (2,5 s + 1,6 s, y la canción entera
+del recorte): altas, cierres y estados del teclado **IDENTICAL** entre fusión, flujo local y
+tramos de helper. `tools/feeder_check/check.sh`: 24 IDENTICAL, 0 DIFFER (con el desempate
+nuevo en los dos stores). Smoke del parser del CI: OK. Pruebas de host del CI: pasan.
+
+**No verificado:** el archivo completo de 20,9 GB en Chromium; las PCs del usuario (con 16
+y 24 hilos hay 5-8 helpers, acá 3 forzados en 4 hilos); el roll dibujado con GPU real.
+Pendiente aparte: con un MIDI de menos de ~3-6 GB la fuente queda cruda y no hay helpers
+(ni para el synth ni para el roll); compartir la fuente cruda con los helpers es lo
+siguiente si hace falta.

@@ -337,6 +337,159 @@ async function synthFeedSmoke(Module, createParser, denseMidi) {
     Module._wmp_set_raw_source_limit_js(512 * 1024 * 1024);
 }
 
+// Visual stream (HANDOFF sec. 71): three tracks with echo copies and overlapping notes.
+function makeVisualMidi() {
+    const vlq = (out, value) => {
+        const stack = [value & 0x7f];
+        while ((value >>>= 7) > 0) stack.push((value & 0x7f) | 0x80);
+        while (stack.length) out.push(stack.pop());
+    };
+    const tracks = [];
+    for (let t = 0; t < 3; ++t) {
+        const events = [];
+        for (let i = 0; i < 6000; ++i) {
+            const tick = i * 7 + t, key = 36 + ((i * 11 + t * 5) % 48), copies = t === 0 ? 3 : 1;
+            for (let c = 0; c < copies; ++c) {
+                events.push([tick, [0x90 | t, key, 64 + (i & 63)]]);
+                events.push([tick + 20 + (i % 13), [0x80 | t, key, 0]]);
+            }
+            if (i % 97 === 0) events.push([tick, [0xb0 | t, 7, i & 127]]);
+        }
+        events.sort((a, b) => a[0] - b[0]);
+        const body = [];
+        let last = 0;
+        for (const [tick, bytes] of events) { vlq(body, tick - last); last = tick; body.push(...bytes); }
+        body.push(0, 0xff, 0x2f, 0);
+        tracks.push(body);
+    }
+    const out = [0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 1, 0, 3, 0x01, 0xe0];
+    for (const body of tracks) {
+        const n = body.length;
+        out.push(0x4d, 0x54, 0x72, 0x6b, (n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255);
+        for (const b of body) out.push(b);
+    }
+    return Uint8Array.from(out);
+}
+
+function bufferBytes(M) {
+    const ptr = sizeNumber(M._wmp_feed_buffer_ptr_js());
+    return M.HEAPU8.slice(ptr, ptr + sizeNumber(M._wmp_feed_buffer_size_js()));
+}
+
+function putBuffer(M, bytes) {
+    M.HEAPU8.set(bytes, sizeNumber(M._wmp_feed_buffer_js(bytes.length)));
+}
+
+function liveWords(M) {
+    const count = sizeNumber(M._wmp_key_snapshot_word_count_js());
+    return Array.from(new Uint32Array(M.HEAPU8.buffer, sizeNumber(M._wmp_key_snapshot_ptr_js()), count));
+}
+
+async function visualStreamSmoke(Module, createParser, denseMidi) {
+    for (const name of ["_wmp_visual_config_js", "_wmp_visual_head_js", "_wmp_visual_done_js",
+        "_wmp_visual_span_end_js", "_wmp_visual_request_js", "_wmp_visual_decode_js",
+        "_wmp_visual_append_js"]) {
+        if (typeof Module[name] !== "function")
+            throw new Error("Missing generated export " + name);
+    }
+    Module._wmp_set_raw_source_limit_js(0);
+    if (!parsePaged(Module, makeVisualMidi()))
+        throw new Error("Visual smoke could not parse: " + parserErrorText(Module, "?"));
+    const maxTick = new Float64Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_document_info_js()), 6)[0];
+    if (!Module._wmp_feed_image_js())
+        throw new Error("Visual smoke: no helper image");
+    const image = bufferBytes(Module);
+    const slabBytes = sizeNumber(Module._wmp_source_slab_bytes_js());
+    const slabs = [];
+    for (let i = 0; i < sizeNumber(Module._wmp_source_slab_count_js()); ++i) {
+        const ptr = sizeNumber(Module._wmp_source_slab_ptr_js(i));
+        const sab = new SharedArrayBuffer(slabBytes);
+        new Uint8Array(sab).set(Module.HEAPU8.subarray(ptr, ptr + slabBytes));
+        slabs.push(sab);
+    }
+    globalThis.__wasmidiFeedSlabs = slabs;
+    globalThis.__wasmidiFeedSlabBytes = slabBytes;
+    const helper = async () => {
+        const H = await createParser({ noInitialRun: true, noExitRuntime: true, print() {}, printErr() {} });
+        putBuffer(H, image);
+        if (!H._wmp_feed_helper_init_js(image.length))
+            throw new Error("Visual helper init failed: " + parserErrorText(H, "?"));
+        return H;
+    };
+    const Spans = await helper();
+
+    const sweep = (stream, spans) => {
+        Module._wmp_visual_config_js(stream ? 1 : 0, spans ? 0 : 1);
+        Module._wmp_reset_render_cursor_js(0, 0);
+        const appends = [], closes = [];
+        for (let guard = 0; guard < 100000; ++guard) {
+            if (spans && !Module._wmp_visual_done_js()) {
+                const head = Number(Module._wmp_visual_head_js());
+                const end = Number(Module._wmp_visual_span_end_js(head, 3000));
+                if (!Module._wmp_visual_request_js(head, end))
+                    throw new Error("Visual request failed: " + parserErrorText(Module, "?"));
+                putBuffer(Spans, bufferBytes(Module));
+                if (!Spans._wmp_visual_decode_js(sizeNumber(Module._wmp_feed_buffer_size_js())))
+                    throw new Error("Visual decode failed: " + parserErrorText(Spans, "?"));
+                putBuffer(Module, bufferBytes(Spans));
+                if (!Module._wmp_visual_append_js(sizeNumber(Spans._wmp_feed_buffer_size_js())))
+                    throw new Error("Visual append failed: " + parserErrorText(Module, "?"));
+            }
+            if (!Module._wmp_build_render_sweep_js(maxTick, 2048))
+                throw new Error("Visual sweep failed: " + parserErrorText(Module, "?"));
+            const na = sizeNumber(Module._wmp_render_append_count_js());
+            const nc = sizeNumber(Module._wmp_render_close_count_js());
+            if (na) for (const w of new Uint32Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_render_append_ptr_js()), na * 3)) appends.push(w);
+            if (nc) for (const w of new Uint32Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_render_close_ptr_js()), nc * 2)) closes.push(w);
+            if (Module._wmp_render_batch_complete_js()) return { appends, closes };
+        }
+        throw new Error("Visual sweep did not finish");
+    };
+    const same = (a, b) => a.length === b.length && a.every((w, i) => w === b[i]);
+    const merge = sweep(false, false), local = sweep(true, false), spans = sweep(true, true);
+    if (!merge.appends.length)
+        throw new Error("Visual smoke: the sweep produced no notes");
+    for (const [name, r] of [["local", local], ["helper", spans]]) {
+        if (!same(r.appends, merge.appends) || !same(r.closes, merge.closes))
+            throw new Error("Visual stream (" + name + ") differs from the merge sweep: " +
+                r.appends.length / 3 + "/" + merge.appends.length / 3 + " notes");
+    }
+
+    // Live state read from the helper-decoded stream against the merge path.
+    const ticks = [];
+    for (let t = 1000; t < maxTick - 100; t += 333) ticks.push(t);
+    const snapshots = (stream) => {
+        Module._wmp_visual_config_js(stream ? 1 : 0, stream ? 0 : 1);
+        Module._wmp_reset_render_cursor_js(0, 0);
+        return ticks.map((t, i) => {
+            while (stream && !Module._wmp_visual_done_js() && Number(Module._wmp_visual_head_js()) <= t + 500) {
+                const head = Number(Module._wmp_visual_head_js());
+                if (!Module._wmp_visual_request_js(head, Number(Module._wmp_visual_span_end_js(head, 3000))))
+                    throw new Error("Visual request failed: " + parserErrorText(Module, "?"));
+                putBuffer(Spans, bufferBytes(Module));
+                if (!Spans._wmp_visual_decode_js(sizeNumber(Module._wmp_feed_buffer_size_js())))
+                    throw new Error("Visual decode failed: " + parserErrorText(Spans, "?"));
+                putBuffer(Module, bufferBytes(Spans));
+                if (!Module._wmp_visual_append_js(sizeNumber(Spans._wmp_feed_buffer_size_js())))
+                    throw new Error("Visual append failed: " + parserErrorText(Module, "?"));
+            }
+            if (!Module._wmp_build_live_snapshot_js(t, Math.max(0, t - 120), Math.max(0, t - 480), i === 0 ? 1 : 0))
+                throw new Error("Live snapshot failed: " + parserErrorText(Module, "?"));
+            return liveWords(Module);
+        });
+    };
+    const mergeLive = snapshots(false), streamLive = snapshots(true);
+    for (let i = 0; i < ticks.length; ++i) {
+        if (!same(streamLive[i], mergeLive[i]))
+            throw new Error("Live state from the visual stream differs from the merge path at tick " + ticks[i]);
+    }
+    Module._wmp_visual_config_js(1, 1);
+    Module._wmp_set_raw_source_limit_js(512 * 1024 * 1024);
+    // The checks after this one use the dense file.
+    if (!parsePaged(Module, denseMidi))
+        throw new Error("Visual smoke could not restore the dense file: " + parserErrorText(Module, "?"));
+}
+
 async function main() {
     const jsPath = path.resolve(
         process.argv[2] ||
@@ -615,6 +768,7 @@ async function main() {
     }
 
     await synthFeedSmoke(Module, createParser, denseMidi);
+    await visualStreamSmoke(Module, createParser, denseMidi);
 
     Module._wmp_reset_render_cursor_js(0, 1);
     if (!Module._wmp_build_render_sweep_js(1, 65536) ||

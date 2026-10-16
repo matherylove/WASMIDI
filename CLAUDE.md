@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§70). Este archivo resume el estado al cierre de la rev. 74 y dice
+`HANDOFF.md` (§1-§71). Este archivo resume el estado al cierre de la rev. 75 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -33,6 +33,7 @@ Partes:
   estilo Winamp con la estética de dekx.cc que usa el mismo parser y WasmiSynth **sin**
   piano roll, teclado ni gráficos, para aislar problemas de audio.
 - **Benchmark del parser en Chromium**: `web/parser-bench.html`.
+- **Benchmark del roll y el teclado en Chromium**: `web/visual-bench.html` (`browser_bench.py visual`).
 
 ## El usuario y la forma de trabajo
 
@@ -124,7 +125,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 74)
+## Estado actual (rev. 75)
 
 Rendimiento medido por el usuario:
 
@@ -142,7 +143,13 @@ Rendimiento medido por el usuario:
   con admisión por bloques y copias de echo plegadas; decodificación repartida en
   helpers con ≥ 6 núcleos. En Single ahora renderizan todos los workers (antes uno
   solo). Recorte del pico de The Nuker 4 (51,6 M note-ons/s) en Chromium a 1024 voces:
-  0 underruns. Roll/teclado/gráficos todavía decodifican por su cuenta.
+  0 underruns.
+- Rev. 75 (HANDOFF §71): roll, teclado y contadores leen un flujo visual plegado (copias
+  de echo juntas por pista y tick) que decodifican los mismos helpers del feed. En el
+  pico, Chromium de 4 hilos con `?helpers=3&rawlimit=0`: roll nunca atrasado, teclado a
+  60/s con ~3 ms de latencia (antes: roll segundos atrás, teclado 0,5/s). Medir en las
+  PCs con `visual-bench.html`. Con fuente cruda (MIDI de menos de ~3-6 GB según memoria)
+  no hay helpers: el flujo se decodifica en el Worker del parser.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -152,7 +159,9 @@ Mecanismos activos y cómo desactivarlos:
 | Fuente zstd forzada | `store.setRawSourceLimit(0)` (host) |
 | Carga paralela | se salta sola con < 128 MiB, < 4 núcleos o 1 pista |
 | Feed del synth desde el parser (admisión + echo plegado) | `?synthsource=feeder` (feeder JS) o `?synthsource=relay` |
-| Helpers de decodificación del feed | se saltan solos con < 6 núcleos |
+| Helpers de decodificación (feed y flujo visual) | se saltan solos con < 6 núcleos o fuente cruda; `?helpers=N` fuerza N (0 los apaga) |
+| Fuente cruda / zstd en el navegador | `?rawlimit=MiB` (`0` fuerza zstd) |
+| Flujo visual plegado (roll + teclado) | `?visualstream=0`; `?visualdebug=1` mide en consola |
 | Tiles culleados del roll | `?tiles=0` en la URL |
 | Límite de render del synth | `?synthlimit=0` / `ssw_set_render_limit_percent(0)` |
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |
@@ -165,15 +174,17 @@ Mecanismos activos y cómo desactivarlos:
 | Trampolín de `worker_cycle` | `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§70)
+## Pendientes abiertos (ver HANDOFF §67-§71)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
    en WASMIDI y WASMIDI Audio, con MatheryLSD, sin diferencia audible frente a un MIDI
    sin robos ni descartes. Hecho en la rev. 74: (a) admisión en el parser y (b)
-   decodificación repartida para el synth. Falta: etapa 2, roll/teclado/gráficos con la
-   misma decodificación repartida (barrido del renderer ~3,9× tiempo real en el pico);
-   etapa 3, synth por GPU estilo Kestrel; probar el archivo completo en las PCs.
+   decodificación repartida para el synth. Hecho en la rev. 75: etapa 2, roll/teclado/
+   gráficos desde el flujo visual con helpers. Falta: etapa 3, synth por GPU estilo
+   Kestrel; probar el archivo completo de 20,9 GB en las PCs (`visual-bench.html` y la
+   app); helpers con fuente cruda; acelerar el reset del teclado en seeks
+   (`rebuildVisualStateAt`).
 2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
    ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
    (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.

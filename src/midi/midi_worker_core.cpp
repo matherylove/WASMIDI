@@ -1604,6 +1604,139 @@ int wmp_feed_decode_js(double byteCount)
 #endif
 }
 
+// ---- Visual stream (HANDOFF sec. 71): the roll sweep and the live state read helper spans ----
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_visual_config_js(int enabled, int autoDecode)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.setVisualStreamEnabled(enabled != 0);
+    g_mappedStore.setVisualAutoDecode(autoDecode != 0);
+#else
+    (void)enabled; (void)autoDecode;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_visual_head_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.visualStreamHead());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_visual_done_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_mappedStore.visualStreamDone() ? 1 : 0;
+#else
+    return 1;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_visual_span_end_js(double startTick, double sourceEvents)
+{
+#if WASMIDI_PARSER_BPFA
+    if (!jsExactNonNegativeInteger(startTick) || startTick > 4294967295.0 || !(sourceEvents >= 1.0)) return 0.0;
+    return static_cast<double>(g_mappedStore.visualSpanEnd(static_cast<uint32_t>(startTick),
+                                                           static_cast<uint64_t>(std::min(sourceEvents, 1.0e12))));
+#else
+    (void)startTick; (void)sourceEvents;
+    return 0.0;
+#endif
+}
+
+// Coordinator: the request for [startTick, endTick) into the feed buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_visual_request_js(double startTick, double endTick)
+{
+#if WASMIDI_PARSER_BPFA
+    if (!jsExactNonNegativeInteger(startTick) || !jsExactNonNegativeInteger(endTick) || endTick > 4294967296.0) {
+        g_error = "Invalid visual span";
+        return 0;
+    }
+    try {
+        if (!g_mappedStore.buildVisualRequest(static_cast<uint32_t>(startTick),
+                                              static_cast<uint32_t>(std::min(endTick, 4294967295.0)), g_feedBuffer)) {
+            g_error = "Could not plan the visual span";
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Visual span request ran out of memory";
+        return 0;
+    }
+#else
+    (void)startTick; (void)endTick;
+    return 0;
+#endif
+}
+
+// Helper: decodes the visual request in the feed buffer; the result replaces the buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_visual_decode_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid visual request"; return 0; }
+    try {
+        std::vector<uint8_t> request(g_feedBuffer.begin(), g_feedBuffer.begin() + std::ptrdiff_t(size));
+        if (!g_mappedStore.decodeVisualRequest(request.data(), request.size(), g_feedBuffer)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Visual helper ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+// Coordinator: appends the helper result the page copied into the feed buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_visual_append_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid visual result"; return 0; }
+    try {
+        if (!g_mappedStore.appendVisualResult(g_feedBuffer.data(), size)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Visual stream ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif
