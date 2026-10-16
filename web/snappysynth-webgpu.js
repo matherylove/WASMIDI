@@ -4,10 +4,13 @@
 // which voices sound and advances their state; the voices it offloads arrive as
 // 160-byte requests (wgpu_voice_request in Voice/voice.c) and are rendered here.
 // One pass per render segment (filter state is GPU-resident and must advance in
-// segment order), then a fixed-order reduction per output sample.
+// segment order), then a fixed-order reduction per output sample. Voice samples go to
+// a frame-major matrix with one column per voice slot (HANDOFF sec. 74), so a
+// workgroup's stores and the reduction's loads are contiguous.
 
 const WGPU_REQUEST_BYTES = 160;
 const WGPU_REQUEST_WORDS = WGPU_REQUEST_BYTES / 4;
+const WGPU_REDUCE_CHUNK = 256; // REDUCE_CHUNK in the shader
 
 const WGPU_SHADER = /* wgsl */ `
 struct Req {
@@ -22,14 +25,15 @@ struct Req {
   a2: f32, z1l: f32, z2l: f32, z1r: f32,
   z2r: f32, pad3: f32, pad4: f32, pad5: f32,
 }
-struct Params { first: u32, count: u32, block_frames: u32, total: u32, gain: f32, p0: f32, p1: f32, p2: f32 }
+struct Params { first: u32, count: u32, block_frames: u32, total: u32, gain: f32, cols: u32, p1: f32, p2: f32 }
 
 @group(0) @binding(0) var<storage, read> reqs: array<Req>;
 @group(0) @binding(1) var<storage, read> pool: array<u32>;
-@group(0) @binding(2) var<storage, read_write> scratch: array<f32>;
+@group(0) @binding(2) var<storage, read_write> scratch: array<vec2<f32>>;
 @group(0) @binding(3) var<storage, read_write> filters: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> outBuf: array<f32>;
 @group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read_write> partials: array<vec2<f32>>;
 
 fn sample16(index: u32) -> f32 {
   let word = pool[index >> 1u];
@@ -52,16 +56,22 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var f = 0u; f < r.frames; f = f + 1u) {
     var vl = 0.0;
     var vr = 0.0;
+    var pos = 0.0;
     if (alive && f >= r.startup) {
       // Closed-form position, as the CPU advances the voice state (voice.c).
-      var pos = r.position + r.pitch * adv;
+      pos = r.position + r.pitch * adv;
       if (r.loop_active == 1u && pos >= r.loop_end) {
         pos = r.loop_start + (pos - r.loop_start) % (r.loop_end - r.loop_start);
       }
+      // A sample without loop ends the voice when it runs out (the CPU frees it).
+      if (r.loop_active == 0u && pos >= r.playback_end) { alive = false; }
+    }
+    if (alive && f >= r.startup) {
       let i = u32(pos);
       let frac = pos - f32(i);
       var nx = i + 1u;
       if (r.loop_active == 1u && f32(nx) >= r.loop_end) { nx = u32(r.loop_start); }
+      if (r.loop_active == 0u && f32(nx) >= r.playback_end) { nx = i; }
       let base = r.sample_offset;
       let l0 = sample16(base + i * ch);
       let l1 = sample16(base + nx * ch);
@@ -104,27 +114,38 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
       if (alive) { adv = adv + 1.0; }
     }
-    let o = (r.row_start + f) * 2u;
-    scratch[o] = vl;
-    scratch[o + 1u] = vr;
+    scratch[(r.out_offset + f) * params.cols + r.voice_id] = vec2<f32>(vl, vr);
   }
   filters[r.voice_id] = z;
 }
 
+// Two passes without barriers: each thread sums one frame's run of REDUCE_CHUNK voice
+// columns in order, then one thread per frame sums its runs in order. The order is
+// fixed, so the result does not depend on scheduling.
+const REDUCE_CHUNK = 256u;
+
+@compute @workgroup_size(64)
+fn reduceChunks(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let chunks = (params.cols + REDUCE_CHUNK - 1u) / REDUCE_CHUNK;
+  if (gid.x >= params.block_frames * chunks) { return; }
+  let frame = gid.x / chunks;
+  let chunk = gid.x - frame * chunks;
+  let row = frame * params.cols;
+  let end = min(params.cols, (chunk + 1u) * REDUCE_CHUNK);
+  var sum = vec2<f32>(0.0, 0.0);
+  for (var c = chunk * REDUCE_CHUNK; c < end; c = c + 1u) { sum = sum + scratch[row + c]; }
+  partials[gid.x] = sum;
+}
+
 @compute @workgroup_size(64)
 fn reduceMix(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIndex = gid.x;
-  if (outIndex >= params.block_frames * 2u) { return; }
-  let frame = outIndex >> 1u;
-  let channel = outIndex & 1u;
-  var sum = 0.0;
-  for (var k = 0u; k < params.total; k = k + 1u) {
-    let r = reqs[k];
-    if (frame >= r.out_offset && frame < r.out_offset + r.frames) {
-      sum = sum + scratch[(r.row_start + frame - r.out_offset) * 2u + channel];
-    }
-  }
-  outBuf[outIndex] = sum;
+  let frame = gid.x;
+  if (frame >= params.block_frames) { return; }
+  let chunks = (params.cols + REDUCE_CHUNK - 1u) / REDUCE_CHUNK;
+  var sum = vec2<f32>(0.0, 0.0);
+  for (var k = 0u; k < chunks; k = k + 1u) { sum = sum + partials[frame * chunks + k]; }
+  outBuf[frame * 2u] = sum.x;
+  outBuf[frame * 2u + 1u] = sum.y;
 }
 `;
 
@@ -166,21 +187,26 @@ class WasmiSynthGpu {
                 { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true } }
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true } },
+                { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }
             ]
         });
         const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.layout] });
         this.renderPipeline = device.createComputePipeline({
             layout: pipelineLayout, compute: { module, entryPoint: "renderVoices" } });
+        this.chunkPipeline = device.createComputePipeline({
+            layout: pipelineLayout, compute: { module, entryPoint: "reduceChunks" } });
         this.reducePipeline = device.createComputePipeline({
             layout: pipelineLayout, compute: { module, entryPoint: "reduceMix" } });
         const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
         this.requestBuffer = device.createBuffer({ size: this.maxRequests * WGPU_REQUEST_BYTES, usage: storage });
-        // Packed scratch rows hold every offloaded voice-frame of a block.
+        // Frame-major scratch: block frames x voice slots, cleared every block.
         this.scratchFrames = Math.max(this.blockFrames, Math.min(this.maxVoices * this.blockFrames,
             Math.floor(Math.min(device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize) / 8)));
-        this.scratchBuffer = device.createBuffer({ size: this.scratchFrames * 8, usage: GPUBufferUsage.STORAGE });
+        this.scratchBuffer = device.createBuffer({ size: this.scratchFrames * 8, usage: storage });
         this.filterBuffer = device.createBuffer({ size: this.maxVoices * 16, usage: GPUBufferUsage.STORAGE });
+        this.partialBuffer = device.createBuffer({
+            size: this.blockFrames * Math.ceil(this.maxVoices / WGPU_REDUCE_CHUNK) * 8, usage: GPUBufferUsage.STORAGE });
         this.outBuffer = device.createBuffer({
             size: this.blockFrames * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         // Up to 64 segment passes + 1 reduction, 256-byte aligned uniform slots.
@@ -194,7 +220,7 @@ class WasmiSynthGpu {
     }
 
     destroy() {
-        for (const b of [this.requestBuffer, this.scratchBuffer, this.filterBuffer, this.outBuffer,
+        for (const b of [this.requestBuffer, this.scratchBuffer, this.filterBuffer, this.partialBuffer, this.outBuffer,
                          this.paramBuffer, this.poolBuffer])
             if (b) b.destroy();
         for (const r of this.readbacks) r.destroy();
@@ -239,7 +265,8 @@ class WasmiSynthGpu {
                     { binding: 2, resource: { buffer: this.scratchBuffer } },
                     { binding: 3, resource: { buffer: this.filterBuffer } },
                     { binding: 4, resource: { buffer: this.outBuffer } },
-                    { binding: 5, resource: { buffer: this.paramBuffer, size: 32 } }
+                    { binding: 5, resource: { buffer: this.paramBuffer, size: 32 } },
+                    { binding: 6, resource: { buffer: this.partialBuffer } }
                 ]
             });
             return "";
@@ -259,21 +286,20 @@ class WasmiSynthGpu {
             return Promise.resolve(null);
         const ptr = Number(Module._ssw_wgpu_requests_ptr());
         const words = new Uint32Array(Module.HEAPU8.buffer.slice(ptr, ptr + count * WGPU_REQUEST_BYTES));
-        // Packed scratch rows: row_start = sum of the frames of earlier requests.
-        let row = 0;
+        // Columns: one per voice slot up to the highest slot this block uses.
+        let cols = 0;
         const segments = [];
         let segStart = 0;
         for (let i = 0; i < count; ++i) {
             const base = i * WGPU_REQUEST_WORDS;
-            words[base + 13] = row;
-            row += words[base + 5];
+            if (words[base + 7] >= cols) cols = words[base + 7] + 1;
             if (i > 0 && words[base + 10] !== words[base - WGPU_REQUEST_WORDS + 10]) {
                 segments.push([segStart, i - segStart]);
                 segStart = i;
             }
         }
         segments.push([segStart, count - segStart]);
-        if (row > this.scratchFrames || segments.length + 1 > this.paramSlots)
+        if (frames * cols > this.scratchFrames || segments.length + 1 > this.paramSlots)
             return Promise.reject(new Error("GPU block exceeded its scratch capacity"));
         const device = this.device;
         device.queue.writeBuffer(this.requestBuffer, 0, words.buffer, 0, count * WGPU_REQUEST_BYTES);
@@ -287,12 +313,14 @@ class WasmiSynthGpu {
             pv.setUint32(o + 8, frames, true);
             pv.setUint32(o + 12, count, true);
             pv.setFloat32(o + 16, gain, true);
+            pv.setUint32(o + 20, cols, true);
         };
         segments.forEach(([first, n], i) => slot(i, first, n));
         const reduceSlot = segments.length;
         slot(reduceSlot, 0, count);
         device.queue.writeBuffer(this.paramBuffer, 0, params, 0, (reduceSlot + 1) * 256);
         const encoder = device.createCommandEncoder();
+        encoder.clearBuffer(this.scratchBuffer, 0, frames * cols * 8);
         segments.forEach(([, n], i) => {
             const pass = encoder.beginComputePass();
             pass.setPipeline(this.renderPipeline);
@@ -302,9 +330,16 @@ class WasmiSynthGpu {
         });
         {
             const pass = encoder.beginComputePass();
+            pass.setPipeline(this.chunkPipeline);
+            pass.setBindGroup(0, this.bindGroup, [reduceSlot * 256]);
+            pass.dispatchWorkgroups(Math.ceil(frames * Math.ceil(cols / WGPU_REDUCE_CHUNK) / 64));
+            pass.end();
+        }
+        {
+            const pass = encoder.beginComputePass();
             pass.setPipeline(this.reducePipeline);
             pass.setBindGroup(0, this.bindGroup, [reduceSlot * 256]);
-            pass.dispatchWorkgroups(Math.ceil(frames * 2 / 64));
+            pass.dispatchWorkgroups(Math.ceil(frames / 64));
             pass.end();
         }
         const readback = this.readbacks.pop() || device.createBuffer({

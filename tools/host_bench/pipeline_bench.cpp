@@ -3,7 +3,8 @@
 // reports feed and render cost per second of song. Optional WAV per point.
 //   ./pipeline_bench SF2 MID WORKERS DUR START [START...]
 // Env: VOICES (1024), FEED=0 (send every event; the synth admits), ADMIT, STEALCAP, DET=1,
-//      WAV=prefix (writes prefix_<start>.wav)
+//      WAV=prefix (writes prefix_<start>.wav), GPUSIDE=1 (voices go to the WebGPU request list and
+//      are not rendered: the CPU side of the GPU mode)
 #include "bpfa_midi_store.hpp"
 #include <algorithm>
 #include <chrono>
@@ -53,6 +54,9 @@ static void writeWav(const char* path, const std::vector<int16_t>& pcm, int sr) 
     fwrite(pcm.data(), 2, pcm.size(), f); fclose(f);
 }
 
+extern "C" { int ssw_wgpu_set_enabled(int); void ssw_wgpu_begin_block(void); void ssw_wgpu_set_frame_base(int);
+int ssw_wgpu_request_count(void); int ssw_wgpu_collect_samples(uintptr_t, int, uintptr_t); }
+static long g_reqs = 0;
 int main(int argc, char** argv) {
     if (argc < 6) { fprintf(stderr, "usage: pipeline_bench SF2 MID WORKERS DUR START [START...]\n"); return 2; }
     const int workers = atoi(argv[3]);
@@ -75,6 +79,9 @@ int main(int argc, char** argv) {
     if (getenv("STEALCAP")) ssw_set_steal_cap_percent(atoi(getenv("STEALCAP")));
     if (getenv("DET")) ssw_set_deterministic(1);
     if (getenv("PATHS")) ssw_set_debug_metrics(1);
+    const bool gpuside = getenv("GPUSIDE") != nullptr;
+    if (gpuside) { static uint32_t table[4 * 65536]; uint32_t total = 0;
+        ssw_wgpu_collect_samples((uintptr_t)table, 65536, (uintptr_t)&total); printf("gpu side enabled=%d\n", ssw_wgpu_set_enabled(1)); }
 
     BpfaMidiStore::SynthFeedConfig cfg;
     cfg.maxVoices = uint32_t(voices);
@@ -109,7 +116,9 @@ int main(int argc, char** argv) {
                 events += long(msgs.size()); secEvents += long(msgs.size());
             }
             auto r0 = Clock::now();
+            if (gpuside) { ssw_wgpu_begin_block(); ssw_wgpu_set_frame_base(0); }
             ssw_render_queued_into(uintptr_t(buf.data()), BLOCK);
+            if (gpuside) g_reqs += ssw_wgpu_request_count();
             const double r = ms(r0); renderMs += r; secRender += r; maxBlock = std::max(maxBlock, r); secMax = std::max(secMax, r);
             ++secBlocks;
             secAlloc += ssw_alloc_us(); secBusy += ssw_worker_busy_us(); secPart += ssw_workers_participating();
@@ -139,5 +148,6 @@ int main(int argc, char** argv) {
             writeWav(path.c_str(), pcm, SR);
         }
     }
+    if (getenv("GPUSIDE")) printf("gpu requests %ld\n", g_reqs);
     return 0;
 }

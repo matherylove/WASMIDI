@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§74). Este archivo resume el estado al cierre de la rev. 78 y dice
+`HANDOFF.md` (§1-§75). Este archivo resume el estado al cierre de la rev. 79 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -96,6 +96,14 @@ Bancos de prueba (necesitan los archivos de prueba del usuario, ver abajo):
   (0 auto, 1 canal, 2 hash, 3 single), `DET=1` (determinístico), `LIMIT`, `ADMIT`,
   `STEALCAP`, `DBG=1` (desglose ALLOC/BUSY por segundo), `GPUEMU=1` (emula en C el
   shader WebGPU). Compilar con `tools/host_bench/build.sh` o como en HANDOFF §61-§63.
+- `tools/host_bench/pipeline_bench.cpp` — feed del parser (admisión, echo plegado) + WasmiSynth,
+  como en el navegador. `./pipeline_bench SF2 MID WORKERS DUR START...`. Variables: `VOICES`,
+  `DET=1`, `PATHS=1` (fase de eventos y busy por bloque), `WAV=prefijo`, `GPUSIDE=1` (costo
+  del lado CPU del modo GPU). Desde `tools/host_bench`, después de `feeder_check/check.sh` (deja
+  un `zstd.h` en `/tmp/wasmidi_zstd_inc`): `g++ -O2 -std=c++17 -I/tmp/wasmidi_zstd_inc -I../../src
+  -I../../src/midi -I$E -DSNAPPYSYNTH_WASM=1 -pthread -o pipeline_bench pipeline_bench.cpp
+  ../../src/midi/{bpfa_midi_store,midi_mapped_store,midi_parser,midi_document_codec}.cpp` + los
+  `.o` del synth compilados con `gcc -O3` como en `build.sh`, `-l:libzstd.so.1 -lm`.
 - `tools/host_bench/large_midi_bench.cpp` — carga e índice de MIDIs gigantes.
 - `tools/feeder_check/*_compare.cpp` aceptan `BPFA_ZSTD=1` y `BPFA_PARALLEL=N`.
 
@@ -125,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 78)
+## Estado actual (rev. 79)
 
 Rendimiento medido por el usuario:
 
@@ -162,6 +170,11 @@ Rendimiento medido por el usuario:
   El usuario: 6144 voces estables en el 5900X; la meta de 24576 necesita el synth por GPU.
   `visual-bench.html` se pausa con la pestaña oculta; WASMIDI Audio suena oculta con todo
   lo visual congelado (`browser_bench.py audio ... --hide=S`).
+- Rev. 79 (HANDOFF §75): modo GPU hacia 24576 voces. Note-offs apilados en una pasada (WAV
+  idéntico), todas las voces van a la GPU (también las VOR con note-off pendiente y las que
+  llegan al final de una muestra sin loop) y la suma en la GPU es por cuadro. Host, pico, 24576
+  voces, `DET=1`: lado CPU del modo GPU 3,0× → 0,90× tiempo real (`pipeline_bench GPUSIDE=1`);
+  modo CPU 4,4× → 3,1×. Lo que queda es la fase de eventos (serial). Sin GPU real medida.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -187,7 +200,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§74)
+## Pendientes abiertos (ver HANDOFF §67-§75)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -197,7 +210,8 @@ Mecanismos activos y cómo desactivarlos:
    gráficos desde el flujo visual con helpers. Rev. 78: render de 4 voces por vectores.
    Medido por el usuario con la canción entera: 6144 voces estables en el 5900X (meta 24576
    = 1024 × 24 workers) y el roll se atrasa en 830-858 s con 8 helpers (faltan las líneas
-   `[WASMIDI visual]` de ese tramo). Falta: etapa 3, synth por GPU estilo Kestrel; helpers
+   `[WASMIDI visual]` de ese tramo). Rev. 79: modo GPU con todas las voces y suma por cuadro.
+   Falta: medir el modo GPU en GPU real; bajar la fase de eventos (serial); helpers
    con fuente cruda; saltos justo después del pico (las densidades del reset decodifican
    ese segundo en el Worker del parser).
 2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
