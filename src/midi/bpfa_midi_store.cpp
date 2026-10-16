@@ -1947,7 +1947,7 @@ bool BpfaMidiStore::decodeVisualLocal(uint32_t endTick)
 }
 
 namespace {
-// The live snapshot reads the stream a roll lookahead behind the sweep: ~13 M words/s at
+// The live snapshot reads the stream a roll lookahead behind the sweep: ~4 M words/s at
 // 830 s of The Nuker 4, so 8 M words dropped its words every few seconds (HANDOFF sec. 78).
 constexpr std::size_t VisualPlanWords = std::size_t(32) << 20;
 constexpr std::size_t VisualRetainWords = std::size_t(48) << 20;
