@@ -4904,3 +4904,84 @@ del sitio) OK.
 - El roll atrasado en 830-858 s de la canción entera en la PC del usuario (pierde ~0,28 s por
   segundo con 8 helpers; en host los helpers decodifican ese tramo a 1,18 s por segundo de
   canción entre todos). Hacen falta las líneas `[WASMIDI visual]` de la consola en ese tramo.
+
+## 75. Revisión 79 — Modo GPU hacia 24576 voces: todas las voces a la GPU, suma por cuadro y note-offs apilados en una pasada
+
+**Pedido (Dekx, el de §74):** 24576 voces (1024 × 24 workers) y el synth por GPU estilo Kestrel.
+
+**Medición de partida (host, contenedor de 4 hilos, recorte del pico de §70, 24576 voces,
+4 workers, `DET=1`):** con `pipeline_bench GPUSIDE=1` (nuevo: las voces van a la lista de
+peticiones de WebGPU y no se renderizan, o sea el costo del lado CPU del modo GPU) el modo GPU
+costaba **3,0×** tiempo real y el modo CPU 4,4×. Callgrind del lado CPU del modo GPU:
+
+- `keyqueue_apply_noteoff_cutoff`: 22,7 M llamadas en 1 s de canción. Un evento de note-off
+  plegado (copias de echo, `stack_count`) hacía una llamada por copia y cada una recorría la
+  lista abierta de la tecla. Todo en la fase de eventos, que es serial (reparto Single).
+- 27% de los bloques de voz no iban a la GPU: `wgpu_try_offload` rechazaba las voces apiladas
+  por VOR con un note-off pendiente (`vor_stack_count > 1`), que son casi todas en The Nuker 4,
+  y se renderizaban en la CPU por el camino escalar.
+- `wgpu_try_offload` también rechazaba las voces de muestras sin loop que llegaban al final
+  dentro del bloque.
+
+**Cambios:**
+
+1. **Note-offs apilados en una pasada** (`keyqueue_apply_noteoff_batch`, `Voice/voice.c`): los
+   n note-offs de un evento plegado se aplican con una sola compactación de la lista abierta y
+   un puntero que avanza. Si la lista está ordenada por `key_order_id` (lo normal: se agrega en
+   orden de note-on) es O(lista + n); si no, cae a buscar por cada cutoff como antes. Resultado
+   igual al de n llamadas del camino FIFO: WAV **idéntico** en modo determinístico.
+2. **Voces VOR con note-off pendiente a la GPU:** el avance en forma cerrada aplica
+   `vor_apply_pending_note_offs` en el cuadro del note-off como `advance_voice_sample_state`;
+   si la voz conserva copias sigue sonando y la petición va con `pending_off = -1` para que el
+   kernel no la suelte.
+3. **Muestras sin loop que se acaban:** se descargan igual. El kernel deja de sonar la voz
+   cuando la posición llega a `playback_end` y no interpola más allá del final; la CPU la da
+   por terminada (`ENV_OFF`) cuando su posición pasa el final. En la CPU esa voz seguía en un
+   release mudo ocupando un lugar del pool.
+4. **Suma de voces en la GPU** (`web/snappysynth-webgpu.js`): antes cada voz escribía su fila
+   en un scratch empaquetado y `reduceMix` recorría, por cada muestra de salida, todas las
+   peticiones del bloque (structs de 160 bytes). Ahora el scratch es una matriz por cuadro con
+   una columna por voz (`(cuadro × columnas + voz)`, se limpia con `clearBuffer`), así las
+   escrituras de un workgroup y las lecturas de la suma son contiguas, y la suma son dos pasadas
+   sin barreras: tramos de 256 columnas por cuadro y después los tramos de cada cuadro, siempre
+   en el mismo orden. Una voz tiene a lo sumo una petición por segmento y los segmentos no se
+   pisan en cuadros, así que la columna por voz no choca (el estado del filtro por voz ya lo
+   suponía).
+5. `tools/host_bench/pipeline_bench.cpp`: `GPUSIDE=1`. `midibench.c` (`GPUEMU`): el emulador
+   del kernel sigue los cambios 3.
+
+**Medición (host, 24576 voces, 4 workers, `DET=1`, pico, 2 s):**
+
+| | Antes | Note-offs en una pasada | + todas las voces a la GPU |
+|---|---|---|---|
+| Modo CPU, render | 4,39× | 3,08× | — |
+| Modo GPU, lado CPU (`GPUSIDE=1`) | 3,02× | 1,73× | **0,90×** |
+| Fase de eventos (`alloc`, suma de los 4 workers), 2.º segundo | 155 ms/bloque | 45 ms/bloque | 39 ms/bloque |
+| Bloques de voz que van a la GPU | 73% | 73% | 100% |
+
+Sin `DET` (con el límite de render, como en el navegador) el lado CPU del modo GPU ya estaba en
+~0,95× porque el límite descarta notas. A 6144 voces en modo CPU determinístico: 0,91× → 0,76×.
+
+**GPU emulada (SwiftShader, Chromium headless del contenedor):** la suma nueva da **2×** más
+cuadros por segundo con 1024 y con 6144 voces. Una página de prueba con los dos kernels sobre
+las mismas peticiones sintéticas (1 o 2 segmentos, filtros, loops, note-offs): diferencia
+máxima relativa 5·10⁻⁶ (orden de la suma) y 24576 voces en 668 contra 1319 ms por bloque.
+SwiftShader no representa una GPU real.
+
+**Audio del modo GPU** (`midibench GPUEMU=1`, 1024 voces, recorte del pico, 3 s): igual que en
+la rev. 73, la forma de onda no se puede comparar muestra a muestra con el modo CPU (la posición
+en forma cerrada corre la fase y en un MIDI tan denso las señales se descorrelacionan), pero el
+nivel por segundo queda dentro de 2-3% y el espectro a 0,55 dB de media del modo CPU, igual que
+antes de esta revisión (0,56 dB).
+
+**Verificación:** arneses del CI del synth y build local completo (pruebas de host del CI +
+wasm + validación del sitio) OK; WASMIDI Audio en Chromium con GPU (SwiftShader): estado "active", sin errores de
+validación.
+
+**Pendiente / no verificado:**
+
+- Una GPU real (la RX 9070XT y la RTX 2050 del usuario): cuánto tarda el kernel con 24576 voces
+  y si el pipeline de hasta 8 bloques alcanza.
+- Lo que queda en el lado CPU del modo GPU es la fase de eventos y reserva de voces (serial con
+  el reparto Single): robos (`steal_voice_fast`), un ordenamiento por edad de voces, la
+  preparación de las peticiones. Siguiente paso de la etapa 3.

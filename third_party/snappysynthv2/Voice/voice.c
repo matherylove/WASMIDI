@@ -2641,6 +2641,49 @@ if (g_voice_gen) {
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
+#if SSW_NOTEOFF_OPEN_LIST && SSW_NOTEOFF_FIFO
+/* The n note-offs of one stacked event (cutoffs first_cutoff .. first_cutoff+n-1) in one
+ * pass over the open list, with the result of n calls of the FIFO path above (HANDOFF
+ * sec. 75): each one releases the first entry in list order that is still open, has no
+ * pending note-off and is not newer than its cutoff. */
+static inline void keyqueue_apply_noteoff_batch(int ch, int key, unsigned int first_cutoff, int n,
+                                                int release_delay) {
+    open_key_list *ol = open_list_for(ch, key);
+    int w = 0, sorted = 1;
+    unsigned int last_order = 0;
+    for (int r = 0; r < ol->count; ++r) {
+        const open_entry oe = ol->e[r];
+        if (!open_entry_live(ch, key, &oe)) continue;
+        const unsigned int order = voices[oe.vid].key_order_id;
+        if (w > 0 && order < last_order) sorted = 0;
+        last_order = order;
+        ol->e[w++] = oe;
+    }
+    ol->count = w;
+    int p = 0;
+    for (int s = 0; s < n; ++s) {
+        const unsigned int cutoff = first_cutoff + (unsigned int)s;
+        while (p < w && voices[ol->e[p].vid].pending_note_off_samples >= 0) ++p;
+        if (p >= w) return;
+        int q = p;
+        if (voices[ol->e[q].vid].key_order_id > cutoff) {
+            if (sorted) continue;
+            for (++q; q < w; ++q) {
+                const voice *u = &voices[ol->e[q].vid];
+                if (u->pending_note_off_samples < 0 && u->key_order_id <= cutoff) break;
+            }
+            if (q >= w) continue;
+        }
+        voice *v = &voices[ol->e[q].vid];
+#ifdef VOR
+        if (v->vor_stack_count > 1 && v->vor_pending_note_offs < INT_MAX) ++v->vor_pending_note_offs;
+#endif
+        v->pending_note_off_samples = keyqueue_noteoff_delay_for_voice(v, release_delay);
+        if (q == p) ++p;
+    }
+}
+#endif
+
 static inline void process_note_off_event(worker_data *wd, const ch_event *e, int release_delay) {
                                                                                                                                                                                                                                                                 if (!wd || !e) return;
                                                                                                                                                                                                                                                                 if (e->ch < 0 || e->ch >= MIDI_CHANNEL_COUNT) return;
@@ -2659,6 +2702,15 @@ static inline void process_note_off_event(worker_data *wd, const ch_event *e, in
                                                                                                                                                                                                                                                                  // stack_count is 1-based (normalized in enqueue_event).
                                                                                                                                                                                                                                                                 // Consume up to stack_count note-offs, clamped to on_order.
                                                                                                                                                                                                                                                                 int consume = (e->stack_count >= 1) ? e->stack_count : 1;
+#if SSW_NOTEOFF_OPEN_LIST && SSW_NOTEOFF_FIFO
+if (g_voice_gen && g_use_fast_note_off_tail) {
+    const unsigned int open_slots = on_order - off_order;
+    const int n = (unsigned int)consume < open_slots ? consume : (int)open_slots;
+    g_key_off_counter[e->ch][e->key] = off_order + (unsigned int)n;
+    keyqueue_apply_noteoff_batch(e->ch, e->key, off_order + 1u, n, release_delay);
+    return;
+}
+#endif
                                                                                                                                                                                                                                                                 for (int s = 0; s < consume; ++s) {
                                                                                                                                                                                                                                                                 if (off_order >= on_order) break;
 ++off_order;
@@ -4092,7 +4144,6 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     if (fabsf(v->portamento_offset) > 0.0001f && fabsf(v->portamento_step) > 0.0f) return 0;
 #ifdef VOR
     if (fabsf(v->vor_gain_scale - v->vor_gain_target) > 0.00001f) return 0;
-    if (v->pending_note_off_samples >= 0 && v->vor_stack_count > 1) return 0;
 #endif
     const int sample_start = (v->sample_start >= 0 && v->sample_start < s_num) ? v->sample_start : 0;
     const int sample_end = (v->sample_end > sample_start && v->sample_end <= s_num) ? v->sample_end : s_num;
@@ -4101,7 +4152,6 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     const int loop_active = (v->loop_mode == 1 || v->loop_mode == 2) && loop_end > loop_start;
     const float pitch = v->pitch_multiplier * ch_render->bend_pitch_mul;
     float pos = v->position < (float)sample_start ? (float)sample_start : v->position;
-    if (!loop_active && pos + pitch * (float)frames >= (float)(sample_end - 1)) return 0;
     /* Block-start note-off handling, as the CPU loop does it. */
     const int sustain_down = g_channel_sustain_snapshot[ch];
     int env_state = v->env_state;
@@ -4185,8 +4235,17 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
             pending = -1;
             if (env_state != ENV_OFF) {
                 if (!v->note_off_received && env_state != ENV_RELEASE) {
-                    v->note_off_received = 1;
-                    if (!sustain_down) env_state = ENV_RELEASE;
+#ifdef VOR
+                    /* A stacked voice that still holds copies keeps sounding, as in
+                     * advance_voice_sample_state; the kernel then must not release it. */
+                    if (vor_apply_pending_note_offs(v)) {
+                        r->pending_off = -1;
+                    } else
+#endif
+                    {
+                        v->note_off_received = 1;
+                        if (!sustain_down) env_state = ENV_RELEASE;
+                    }
                 }
             }
         }
@@ -4200,6 +4259,8 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
             pos = (float)loop_start + fmodf(pos - (float)loop_start, len);
         }
     }
+    /* Without a loop the GPU stops the voice where the sample runs out (HANDOFF sec. 75). */
+    if (!loop_active && pos >= (float)sample_end) env_state = ENV_OFF;
     v->pending_note_off_samples = pending;
     v->startup_samples = 0;
     v->position = pos;

@@ -51,9 +51,11 @@ static void emu_gpu_render(float *out, int frames) {
         for (uint32_t f = q->startup; f < q->frames; ++f) {
             pos = q->position + q->pitch * adv;
             if (q->loop_active && pos >= q->loop_end) pos = q->loop_start + fmodf(pos - q->loop_start, q->loop_end - q->loop_start);
+            if (!q->loop_active && pos >= q->playback_end) break;
             const int i = (int)pos; const float frac = pos - (float)i;
             int nx = i + 1;
             if (q->loop_active && (float)nx >= q->loop_end) nx = (int)q->loop_start;
+            if (!q->loop_active && (float)nx >= q->playback_end) nx = i;
             const int16_t *b = g_pool + q->sample_offset;
             const float l0 = b[i * ch], l1 = b[nx * ch];
             const float r0 = b[i * ch + ch - 1], r1 = b[nx * ch + ch - 1];
