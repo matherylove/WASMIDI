@@ -15,6 +15,8 @@
 Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
          --query=helpers=3 (appended to the page URL)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
+         --hide=S (audio: from second S on, the page reports itself hidden, like a tab in
+                   the background; the clock on the page must stop while the audio goes on)
 Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
 Chromium normally has no real GPU: WebGPU results there are not representative."""
 import asyncio
@@ -72,13 +74,20 @@ async def main():
             await page.set_input_files("#midi-input", args[1])
             await page.wait_for_function("() => !document.getElementById('play').disabled", timeout=3600000)
             await page.click("#play")
+            hide = next((float(f.split("=", 1)[1]) for f in flags if f.startswith("--hide=")), None)
             for second in range(int(seconds)):
+                if hide is not None and second == int(hide):
+                    await page.evaluate("""() => {
+                        Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+                        Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+                        document.dispatchEvent(new Event("visibilitychange")); }""")
                 await page.wait_for_timeout(1000)
                 st = await page.evaluate("""() => { const s = WasmidiSnappyBridge.state; return {
                     t: WasmidiSnappyBridge.getAudioClock(), voices: s.activeVoices, load: s.renderLoadPercent,
-                    buffer: s.ringFillPercent, underruns: s.underruns, dropped: s.droppedNotes, gpu: s.gpuStatus }; }""")
-                print("%3d s  clock %7.2f  voices %6s  load %5s%%  buffer %5s%%  underruns %s  dropped %s  gpu %s" % (
-                    second + 1, st["t"] or 0, st["voices"], round(st["load"] or 0), round(st["buffer"] or 0),
+                    buffer: s.ringFillPercent, underruns: s.underruns, dropped: s.droppedNotes, gpu: s.gpuStatus,
+                    shown: document.getElementById("clock").textContent }; }""")
+                print("%3d s  clock %7.2f  shown %s  voices %6s  load %5s%%  buffer %5s%%  underruns %s  dropped %s  gpu %s" % (
+                    second + 1, st["t"] or 0, st["shown"], st["voices"], round(st["load"] or 0), round(st["buffer"] or 0),
                     st["underruns"], st["dropped"], st["gpu"]))
             print(await page.text_content("#log"))
         elif mode == "visual":

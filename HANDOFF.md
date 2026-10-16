@@ -4812,3 +4812,95 @@ validación del sitio) OK.
 **No verificado:** en las PCs con The Nuker 4 (si queda algún hueco con `?tiles=0` también,
 es otra cosa: sin tiles cada nota de menos de un píxel que no cubre un centro no se dibuja,
 igual que antes).
+
+## 74. Revisión 78 — WasmiSynth renderiza cuatro voces a la vez; benchmarks y WASMIDI Audio en segundo plano
+
+**Pedido (Dekx):** "aun se acaba rapido el buffer en algunas partes del midi, recuerda nuestra
+meta"; "el player solo sigue sin trabarse con 6144 voces en el ryzen 9, la meta eran 24576, y
+aun falta el gpu synth con kestrel". Y: "No hay forma de que al menos en benchmarks se pause el
+test cuando cambio de ventana o pestaña? y en wasmidi audio que suene asi esté minimizado o en
+otra pestaña pero que todo lo visual quede congelado mientras?"
+
+**Causa (synth):** con callgrind sobre `pipeline_bench` (recorte del pico de §70, 24576
+voces, 4 workers) casi todo el costo está en el bucle genérico por muestra de `worker_cycle`
+(biquad, interpolación, envolvente): ~7-9 ns por voz y muestra, escalar. Los eventos, la
+reserva de voces y los robos son marginales ("alloc" suma esperas de todos los workers, no CPU).
+
+**Cambio (synth, `Voice/voice.c`):**
+
+1. Las voces estéreo que llegan al bucle genérico por muestra (`vor_fast_ok`, salida a 1 o 2
+   canales, sin medio rate) se **estacionan** (`voice_park`, hasta `RENDER_TILE_VOICES` por
+   tile, en almacenamiento `__thread`) con todo el estado que ese bucle lee, y al final del
+   tile `voice_park_flush` las renderiza **de a cuatro** con vectores de 4 carriles
+   (`vq_f4`/`vq_i4`, extensiones vectoriales de GCC/clang: SSE en host, SIMD128 en wasm).
+2. Cada carril hace la misma aritmética por muestra que el bucle escalar. La envolvente se
+   escribe uniforme como `env*m + a` (ataque, decay, sustain y release con su `m` y `a`).
+3. **Tramo apretado sin máscaras:** mientras ningún carril tiene que salir, el bucle no
+   selecciona por carril; los carriles vacíos tienen una muestra muda, ganancia 0 y
+   envolvente constante. El tramo se acota por los cuadros de inicio y fin, por el margen al
+   final de la muestra (`2 + frames*endpos/2^23`) y se corta cuando la envolvente cruza sus
+   límites (`en >= hi` o `en <= lo`). La constante "sin límite" es `FLT_MAX` y no `INFINITY`
+   (el wasm compila con `-ffast-math`).
+4. Un carril sale al camino escalar (`voice_run_scalar`, el mismo bucle con
+   `advance_voice_sample_state`) desde el cuadro en que necesita algo que los vectores no
+   cubren: zona de diezmado (< 0,01), fin de una muestra sin loop, o un note-off pendiente en
+   ese bloque. `voice_park_finish` hace la cola de siempre (`voice_done_ws`, compactación).
+5. La suma de los cuatro carriles es un árbol fijo `(l0+l1)+(l2+l3)`, así que el resultado es
+   determinístico y no depende de cuántos workers haya.
+6. Rollback: `-DSSW_VOICE_QUAD=0`.
+
+**Cambio (páginas):**
+
+- `web/visual-bench.html`: con la pestaña oculta (`visibilitychange`) el test se pausa
+  ("En pausa (pestaña oculta)"), el tiempo oculto no cuenta, las muestras de latencia del
+  teclado que cruzan una pausa se descartan, y el informe final dice cuántos segundos estuvo en
+  pausa. En la corrida de la canción entera que mandó el usuario (cuadros raros en 889-1033 s)
+  la pestaña había quedado oculta.
+- `web/wasmidi-audio.js`: el feed del parser al synth y el render ya viven en Workers (§70) y
+  el audio sale por el AudioWorklet, así que la página suena en segundo plano. Lo que dependía
+  del hilo principal era el transporte del camino de respaldo (`scheduleAhead` con
+  `?synthsource=relay/feeder`) y el fin de la canción, que solo corrían en
+  `requestAnimationFrame` (no corre con la pestaña oculta). Ahora `transportTick` hace eso y,
+  con la página oculta, lo llama el timer de 250 ms sin tocar el DOM: reloj, ventanas, letras,
+  gráficos y visualizador quedan congelados y vuelven al mostrarse. Chrome no frena los timers
+  de una pestaña que suena.
+- `tools/browser_bench.py audio ... --hide=S`: desde el segundo S la página se reporta oculta;
+  imprime el reloj que muestra la página (`shown`) junto al del audio.
+
+**Medición (synth):**
+
+| | Antes | Después |
+|---|---|---|
+| Host, núcleo del render por voz y muestra (tramo apretado) | 1× | ~1,5× más rápido |
+| Host, `pipeline_bench` pico, 24576 voces, 4 workers: render (veces tiempo real) | 2,97-3,28× | 2,16-3,14× (worker busy 106-120 → 74-110 ms/bloque; el contenedor es ruidoso) |
+| Chromium headless, WASMIDI Audio, recorte del pico, 6144 voces, 3 workers: carga máx. | 162% | 128% |
+| idem, underruns | 368 | 128 |
+
+Diferencia de salida contra el render anterior (`DET=1`, recorte del pico, 3 s): máximo 1 LSB,
+SNR 105,4 dB. Con distintas cantidades de workers en modo determinístico: IDÉNTICO.
+
+**Medición (páginas, Chromium headless):** `visual-bench` con la pestaña "oculta" 3 s de 5 s:
+305 cuadros, informe "en pausa 3.0 s con la pestaña oculta". WASMIDI Audio, recorte del pico,
+1024 voces, 3 workers, oculta desde el segundo 2: el reloj de la página quedó en 00:01, el audio
+siguió hasta el final con 0 underruns y el fin de la canción se detectó estando oculta.
+
+**Verificación:** `gcc -fsyntax-only` de `voice.c` con y sin `SSW_VOICE_QUAD`, arneses del CI
+del synth (`ssw_schedule_harness`, `worker_freelist_borrow_check`, `worker_cycle_smoke`),
+`node --check` de `web/*.js`, build local completo (pruebas de host del CI + wasm + validación
+del sitio) OK.
+
+**No verificado / pendiente:**
+
+- Las PCs del usuario. SIMD por CPU da ~1,3-1,5×: no alcanza para 24576 voces (hoy 6144 en el
+  5900X). Lo que falta es la etapa 3, el synth por GPU estilo Kestrel (pasos por bloque en la
+  GPU: robo/alta/render/reducción/compactación, pool SoA, fase 32.32, suma en árbol fijo,
+  note-offs por tabla canal×tecla). El híbrido de las rev. 70-73 sigue sin probarse en una GPU
+  real.
+- Una pestaña realmente oculta (en headless se simula `document.hidden`; el freno de timers de
+  Chrome no se emula).
+- En Chromium, el contador de notas descartadas del recorte del pico salió más alto con el
+  render nuevo (98.597 contra 22.621 en corridas distintas); el modo determinístico en host da
+  la misma salida, así que parece depender del tiempo del navegador. Revisar si se repite.
+- El roll atrasado en 830-858 s de la canción entera en la PC del usuario (pierde ~0,28 s por
+  segundo con 8 helpers; en host los helpers decodifican ese tramo a 1,18 s por segundo de
+  canción entre todos). Hacen falta las líneas `[WASMIDI visual]` de la consola en ese tramo.

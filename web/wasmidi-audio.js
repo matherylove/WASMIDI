@@ -889,18 +889,21 @@ void main() {
         if (!rafId && !document.hidden) rafId = requestAnimationFrame(frame);
     }
 
+    function transportTick() {
+        const b = bridge();
+        if (!S.playing || !b) return;
+        const clock = b.getAudioClock();
+        if (Number.isFinite(clock) && clock >= 0) S.time = Math.min(S.duration, clock);
+        scheduleAhead();
+        if (S.duration > 0 && S.time >= S.duration - 1e-3 && clock >= S.duration + 0.3) {
+            stop();
+            log("End of song");
+        }
+    }
+
     function frame(now) {
         rafId = 0;
-        const b = bridge();
-        if (S.playing && b) {
-            const clock = b.getAudioClock();
-            if (Number.isFinite(clock) && clock >= 0) S.time = Math.min(S.duration, clock);
-            scheduleAhead();
-            if (S.duration > 0 && S.time >= S.duration - 1e-3 && clock >= S.duration + 0.3) {
-                stop();
-                log("End of song");
-            }
-        }
+        transportTick();
         $("clock").textContent = fmtTime(S.time);
         if (!S.seeking) $("seek").value = String(S.time);
         if (now - lastReadouts > 100) { lastReadouts = now; updateReadouts(); }
@@ -928,7 +931,10 @@ void main() {
         $("synth-status").textContent = String(st.status || "").replace(/SnappySynthV2/g, "WasmiSynth");
     }
 
+    // A hidden page keeps playing (the feed and the render live in Workers) but draws
+    // nothing; this timer only keeps the transport going.
     function idleTick() {
+        if (document.hidden) { transportTick(); return; }
         if (!rafId) {
             updateReadouts();
             if (Windows.isOpen("lyrics")) Lyrics.update(S.time);
