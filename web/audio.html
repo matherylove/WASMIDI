@@ -28,8 +28,9 @@
     </nav>
     <div class="win-body win-pad">
       <div class="lcd">
-        <div>
-          <div class="clock" id="clock">00:00<small id="total">00:00</small></div>
+        <div class="left">
+          <div class="clock" id="clock">00:00</div>
+          <div class="total">/ <span id="total">00:00</span></div>
           <div class="state stop" id="state"><i></i><span>IDLE</span></div>
         </div>
         <div class="right">
@@ -49,10 +50,10 @@
       </div>
 
       <div class="transport">
-        <button type="button" id="restart" aria-label="Restart" title="Restart" disabled><svg viewBox="0 0 9 8" width="9" height="8" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h2v8h-2zM8 0h1v8h-1zM7 1h1v6h-1zM6 2h1v4h-1zM5 3h1v2h-1z"/></svg></button>
-        <button type="button" id="play" aria-label="Play" title="Play (Space)" disabled><svg viewBox="0 0 6 8" width="6" height="8" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h1v8h-1zM1 1h1v6h-1zM2 2h1v4h-1zM3 3h1v2h-1z"/></svg></button>
-        <button type="button" id="pause" aria-label="Pause" title="Pause (Space)" disabled><svg viewBox="0 0 7 8" width="7" height="8" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h2v8h-2zM5 0h2v8h-2z"/></svg></button>
-        <button type="button" id="stop" aria-label="Stop" title="Stop" disabled><svg viewBox="0 0 7 7" width="7" height="7" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h7v7h-7z"/></svg></button>
+        <button type="button" id="restart" aria-label="Restart" title="Restart" disabled><svg viewBox="0 0 9 8" width="18" height="16" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h2v8h-2zM8 0h1v8h-1zM7 1h1v6h-1zM6 2h1v4h-1zM5 3h1v2h-1z"/></svg></button>
+        <button type="button" id="play" aria-label="Play" title="Play (Space)" disabled><svg viewBox="0 0 6 8" width="12" height="16" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h1v8h-1zM1 1h1v6h-1zM2 2h1v4h-1zM3 3h1v2h-1z"/></svg></button>
+        <button type="button" id="pause" aria-label="Pause" title="Pause (Space)" disabled><svg viewBox="0 0 7 8" width="14" height="16" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h2v8h-2zM5 0h2v8h-2z"/></svg></button>
+        <button type="button" id="stop" aria-label="Stop" title="Stop" disabled><svg viewBox="0 0 7 7" width="14" height="14" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h7v7h-7z"/></svg></button>
         <button type="button" id="open-midi" title="Open MIDI">MIDI…</button>
         <button type="button" id="open-sf2" title="Open SoundFont">SF2…</button>
         <button type="button" id="gpu" title="WasmiSynth engine: CPU or WebGPU" aria-pressed="false">CPU</button>
@@ -65,7 +66,7 @@
     </div>
     <div class="win-status">
       <span class="status-cell grow" id="status">Idle</span>
-      <span class="status-cell term" id="synth-status">WasmiSynth</span>
+      <span class="status-cell term" id="synth-status">WasmiSynth idle</span>
     </div>
   </div>
 

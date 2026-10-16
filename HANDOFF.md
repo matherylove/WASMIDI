@@ -388,6 +388,9 @@ stealer sin una medición que lo exija.
 15. **Decidir con benchmarks de host algo dominado por el navegador** (rev. 58). La
     lectura bajo demanda ganaba 35% con `pread` en host y en el navegador cargó más
     lento: el costo real eran los cruces EM_JS y `FileReaderSync` por página.
+16. **Afirmar que una herramienta no existe sin buscarla en todo el sistema** (rev. 71.1).
+    Chromium estaba en `/opt/pw-browsers` y en la caché de puppeteer; `which` no lo
+    encontraba.
 
 ---
 
@@ -4175,4 +4178,31 @@ queda dedicado al synth. No usa el límite dinámico de velocity de la app (piso
 **No verificable acá:** todo corre en el navegador (aislamiento cross-origin, AudioWorklet,
 workers). Archivos JS con `node --check`; exports C++ compilados con stub.
 
-Última revisión entregada: `wasmidi-main-rev71-wasmidi-audio.zip`.
+Revisión anterior entregada: `wasmidi-main-rev71-wasmidi-audio.zip`.
+
+---
+
+## 65. Revisión 71.1 — WASMIDI Audio: arreglos visuales y Chromium en el entorno
+
+**Reporte del usuario (captura):** visualmente bugeado: el reloj del LCD ("00:00" a
+46 px más el total en la misma línea) no entraba en su columna de 132 px y el total se
+cortaba contra la marquesina; la barra de estado decía "SnappySynthV2 idle"; el aviso de
+aislamiento cross-origin quedaba en el registro aunque la página ya se recargara.
+
+**Cambios:** columna del reloj de ancho automático, total en su propia línea ("/ 00:00"),
+estado abajo; lecturas con valor grande en VT323 y etiqueta chica; la marquesina solo se
+desplaza si el texto no entra (medido); "SnappySynthV2" se muestra como "WasmiSynth"; el
+aviso de aislamiento solo aparece si a los 3 s la página sigue sin aislamiento, como error
+y pidiendo recargar; iconos de transporte al doble de tamaño.
+
+**Corrección importante (error nº 16):** el entorno de trabajo **sí tiene Chromium**:
+`/opt/pw-browsers/chromium-1194` y `chromium_headless_shell-1194` (Playwright, con
+`PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers`) y `~/.cache/puppeteer/chrome/linux-131…`.
+Antes se le dijo al usuario que no había (§55, §57): solo se había buscado con `which`.
+Con esto se verificó esta página renderizándola (servidor local + captura). Lo que sigue
+faltando es emsdk y red, así que no se puede compilar el wasm acá; con el sitio ya
+compilado por el CI (artefacto `site/`) subido, se puede correr `parser-bench.html`,
+WASMIDI Audio y la app en Chromium headless para medir (servidor con COOP/COEP).
+WebGPU sin GPU real probablemente no esté disponible en headless.
+
+Última revisión entregada: `wasmidi-main-rev71.1-audio-visual-fix.zip`.

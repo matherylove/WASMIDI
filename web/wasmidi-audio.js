@@ -71,7 +71,9 @@
     function setTitle(text) {
         const box = $("marquee");
         box.firstElementChild.textContent = text;
-        box.classList.toggle("still", text.length < 36);
+        box.classList.add("still");
+        // Scroll only when the text does not fit.
+        requestAnimationFrame(() => box.classList.toggle("still", box.firstElementChild.scrollWidth <= box.clientWidth - 12));
     }
 
     function setState(kind, label) {
@@ -390,7 +392,7 @@
                 log("End of song");
             }
         }
-        $("clock").firstChild.textContent = fmtTime(S.time);
+        $("clock").textContent = fmtTime(S.time);
         if (!S.seeking) $("seek").value = String(S.time);
         if (b) {
             const st = b.state;
@@ -404,7 +406,7 @@
             $("r-engine").textContent = settings.gpu ? "GPU" : "CPU";
             $("meter-load").style.width = S.loading ? $("meter-load").style.width
                 : Math.max(0, Math.min(100, Number(st.renderLoadPercent) || 0)) + "%";
-            $("synth-status").textContent = st.status || "";
+            $("synth-status").textContent = String(st.status || "").replace(/SnappySynthV2/g, "WasmiSynth");
         }
         requestAnimationFrame(tick);
     }
@@ -438,7 +440,7 @@
         $("stop").addEventListener("click", stop);
         $("restart").addEventListener("click", () => { seek(0); if (!S.playing) S.time = 0; });
         const seekBar = $("seek");
-        seekBar.addEventListener("input", () => { S.seeking = true; $("clock").firstChild.textContent = fmtTime(Number(seekBar.value)); });
+        seekBar.addEventListener("input", () => { S.seeking = true; $("clock").textContent = fmtTime(Number(seekBar.value)); });
         seekBar.addEventListener("change", () => { S.seeking = false; seek(Number(seekBar.value)); });
         $("volume").addEventListener("input", () => {
             settings.volume = Number($("volume").value) | 0;
@@ -481,9 +483,14 @@
             if (e.target && /input|select|textarea/i.test(e.target.tagName)) return;
             if (e.key === " ") { e.preventDefault(); if (S.playing) pause(); else void play(); }
         });
-        if (!globalThis.crossOriginIsolated)
-            log("Waiting for cross-origin isolation (the page reloads once on first visit)…");
-        setTitle("WASMIDI Audio — open a MIDI and a SoundFont");
+        if (!globalThis.crossOriginIsolated) {
+            // coi-serviceworker reloads the page once on the first visit.
+            setTimeout(() => {
+                if (!globalThis.crossOriginIsolated)
+                    log("This page is not cross-origin isolated, so WasmiSynth cannot start its threads. Reload the page.", "err");
+            }, 3000);
+        }
+        setTitle("Open a MIDI and a SoundFont");
         setState("stop", "IDLE");
         updateButtons();
         requestAnimationFrame(tick);
