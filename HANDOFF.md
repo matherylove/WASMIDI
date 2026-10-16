@@ -4710,3 +4710,58 @@ y 24 hilos hay 5-8 helpers, acá 3 forzados en 4 hilos); el roll dibujado con GP
 Pendiente aparte: con un MIDI de menos de ~3-6 GB la fuente queda cruda y no hay helpers
 (ni para el synth ni para el roll); compartir la fuente cruda con los helpers es lo
 siguiente si hace falta.
+
+## 72. Revisión 76 — El teclado y el roll se congelaban al empezar a mitad de The Nuker 4
+
+**Pedido (Dekx):** en `visual-bench.html` con *The Nuker 4 F2.mid* completo (Chrome 155,
+24 hilos, 8 helpers) desde 0 todo iba en tiempo real, pero desde 548 s el roll se quedaba
+quieto y el teclado no respondía nunca en 15 s.
+
+**Causa:** el primer pedido del teclado después de un salto reconstruye qué notas están
+abiertas (`rebuildVisualStateAt`) desde el último snapshot de cada pista. El presupuesto de
+notas de los snapshots (16 M) era global: en The Nuker 4 cada copia de echo es una nota
+abierta, así que cada snapshot tiene miles de notas y la pista densa agotaba el presupuesto
+en los primeros minutos. En 548 s había que decodificar desde muy atrás: **45 s** en host
+(un hilo), y en Chromium más, con el Worker del parser bloqueado (ni roll ni teclado).
+
+**Cambios** (`BpfaMidiStore`):
+
+1. **Presupuesto de snapshots por pista**, proporcional a sus bytes (mínimo 4096 notas).
+   Cuando una pista lo agota se queda con uno de cada dos snapshots y duplica el intervalo,
+   así que siguen cubriendo toda la canción. Mismo total de memoria.
+2. **Snapshots compactos para el teclado** (`liveSnapshots`): por (canal, tecla) con notas
+   abiertas solo la cantidad y el inicio de la más nueva (12 bytes por tecla, como mucho
+   2048 por pista, en vez de una entrada por copia). Presupuesto propio de 4 M teclas
+   (~48 MB) con el mismo reparto y raleo. Viajan en el blob de la carga paralela.
+3. **`liveRebuildAt`:** el reset del teclado en modo flujo siembra las teclas desde el
+   snapshot más cercano (compacto o de notas) y decodifica el resto plegado
+   (`decodeTrackUntil`) directo a la tabla plana de teclas, sin el mapa de listas de notas.
+4. **Densidades del reset sin la fusión:** cuando el flujo visual no cubre el último
+   segundo, cada pista se decodifica plegada desde su checkpoint y los puntos se ordenan por
+   tick; los eventos del tick actual también salen de ahí.
+
+La reconstrucción de notas del roll (`rebuildVisualStateAt`, páginas y fusión) no cambió;
+solo usa snapshots repartidos de otra manera.
+
+**Medición:**
+
+| Reset del teclado en 548 s, The Nuker 4 completo | Antes | Después |
+|---|---|---|
+| Host, un hilo (`reset_probe`, carga simple o paralela simulada) | 45,3 s | 0,13 s |
+| Chromium, contenedor de 4 hilos, `?helpers=3` | > 15 s (nunca respondió) | 0,19 s |
+
+En ese Chromium, desde 548 s: el teclado responde 61 veces por segundo desde el primer
+segundo; el roll va en tiempo real hasta 552 s y se atrasa entre 553 y 558 s (el pico),
+porque 3 helpers en 4 hilos no alcanzan a decodificar el pico completo; se recupera solo en
+559 s. En las PCs del usuario hay 8 helpers.
+
+En el recorte del pico, un salto justo después del pico (4,2 s, densidades sobre el segundo
+más denso) pasa de 2,0 s (fusión) a 0,6 s en host.
+
+**Verificación:** `visual_check` en el recorte del pico desde 0,3 s, 2,5 s, 3,3 s y 4,2 s:
+altas, cierres y estados del teclado IDENTICAL entre fusión, flujo y helpers.
+`tools/feeder_check/check.sh`: 24 IDENTICAL (incluida la carga paralela simulada con zstd).
+Smoke del parser del CI: OK (en el build local).
+
+**No verificado:** las PCs del usuario; saltos justo después del pico en el navegador (las
+densidades todavía decodifican ese segundo en el Worker del parser: ~0,6 s en host).
