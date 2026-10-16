@@ -7,7 +7,8 @@
         telemetry every second (voices, render load, buffer fill, underruns).
   python3 tools/browser_bench.py shot PAGE OUT.png      screenshot (e.g. audio.html)
 
-Options: --url http://127.0.0.1:8080  --headed
+Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
+         --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
 Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
 Chromium normally has no real GPU: WebGPU results there are not representative."""
 import asyncio
@@ -20,6 +21,7 @@ args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = [a for a in sys.argv[1:] if a.startswith("--")]
 url = next((f.split("=", 1)[1] for f in flags if f.startswith("--url=")), "http://127.0.0.1:8080")
 headed = "--headed" in flags
+log_all = "--log" in flags
 chromium = os.environ.get("WASMIDI_CHROMIUM") or (
     "/opt/pw-browsers/chromium" if os.path.exists("/opt/pw-browsers/chromium") else None)
 
@@ -33,7 +35,7 @@ async def main():
             headless=not headed, executable_path=chromium,
             args=["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--autoplay-policy=no-user-gesture-required"])
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
-        page.on("console", lambda m: print("[console]", m.type, m.text) if m.type in ("error", "warning") else None)
+        page.on("console", lambda m: print("[console]", m.type, m.text) if log_all or m.type in ("error", "warning") else None)
         page.on("pageerror", lambda e: print("[pageerror]", e))
         if mode == "parser":
             await page.goto(url + "/parser-bench.html")
@@ -50,6 +52,11 @@ async def main():
             await page.set_input_files("#sf2-input", args[2])
             await page.wait_for_function("() => globalThis.WasmidiSnappyBridge && WasmidiSnappyBridge.state.soundfontLoaded",
                                          timeout=600000)
+            settings = {k: f.split("=", 1)[1] for f in flags for k in ("voices", "workers") if f.startswith("--" + k + "=")}
+            if settings:
+                await page.evaluate("""s => { for (const k in s) document.getElementById("c-" + k).value = s[k];
+                    document.getElementById("apply").click(); }""", settings)
+                await page.wait_for_timeout(1500)
             if "--gpu" in flags:
                 await page.click("#gpu")
             await page.set_input_files("#midi-input", args[1])

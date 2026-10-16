@@ -4515,3 +4515,96 @@ correr (sin red).
 
 **No verificado:** benchmarks con `Hypernova.mid` y `MatheryLSD.sf2` (no están en
 `tools/data/`); WebGPU (Chromium headless sin GPU real).
+
+---
+
+## 70. Revisión 74 — The Nuker 4: el parser alimenta al synth, copias de echo y workers que sí renderizan
+
+**Pedido (Dekx):** que *The Nuker 4 F2.mid* (20,9 GB) suene en tiempo real sin problemas
+en WASMIDI y en WASMIDI Audio con MatheryLSD; WasmiSynth a 1024 voces por worker en el
+Ryzen 9 5900X + RX 9070XT y en el Ryzen 7 7435HS + RTX 2050; roll, gráficos y teclado en
+tiempo real; modo GPU lo mejor posible (referencia: Kestrel); la calidad no puede
+empeorar de forma audible frente a un MIDI sin robos ni descartes. Dato del usuario: en
+este tipo de MIDI casi todas las notas vienen de *echo channels*, copias que empiezan y
+terminan en el mismo punto, apiladas como un sándwich.
+
+**El archivo (índice en host, `tools/host_bench/nuker_bench.cpp`):** 30 pistas, 960 PPQ,
+1223 s, **2.743 millones de notas**; índice 208-232 s en host con fuente zstd (455 MB de
+fuente comprimida, 1,3 GB de store). Pico **51,6 M note-ons/s en 553 s**; por décimos de
+la canción, el máximo pasa de 15 M/s en 6 de 10 tramos. Para medir se usa un recorte de
+550-556 s (`tools/host_bench/midi_slice.c`, 491 MB, 64 M notas, pico en 3 s del recorte).
+
+**Causa:** el synth no es el cuello. A 51 M note-ons/s, el camino anterior
+(`buildEventBatch` → JS → worker del synth → admisión en el synth) tenía que decodificar
+y mover ~103-163 M eventos/s por un solo hilo, aunque después el synth descarte el 96%.
+
+**Cambios:**
+
+1. **El parser alimenta al synth directamente** (`BpfaMidiStore::buildSynthFeed`,
+   exports `wmp_feed_*`, `web/midi-parser-worker.js`). El bridge crea un `MessageChannel`
+   y le da un extremo al Worker del parser (`feeder-port`) y el otro al worker del synth;
+   el synth pide `{fill, target}` y el parser responde lotes `{batch, messages, times,
+   sysex…, safeUntil}`. Sin pasar por el hilo principal. `?synthsource=feeder` vuelve al
+   feeder JS de §26-27 y `?synthsource=relay` al relevo por la página.
+2. **Admisión en el parser** (la propuesta (a) de §67): la canción se corta en bloques
+   de admisión de 512 frames a 48 kHz y en cada bloque entra como mucho el 25% de las
+   voces (umbral por velocidad con histograma, igual que la admisión del synth de §61).
+   Los note-offs se emparejan FIFO por (pista, tecla); el de un note-on descartado se
+   descarta también. No quedan notas colgadas ni note-offs huérfanos (verificado: las
+   cuentas coinciden con las del propio archivo).
+3. **Copias de echo plegadas:** en cada pista, los eventos idénticos (mismo tick, mismo
+   mensaje) se juntan en una unidad con la cantidad en el byte alto (hasta 256), para
+   note-ons y note-offs. VOR ya renderiza una pila como una sola voz, así que la
+   admisión cuenta **unidades**: con el mismo presupuesto de voces entran ~37× más
+   notas distintas. El synth acepta note-offs con cantidad
+   (`ssw_note_fifo_push/pop` con `count`) y su FIFO de admisión cuenta las copias.
+4. **Decodificación repartida** (propuesta (b) de §67): Workers auxiliares
+   (`web/midi-parser-helper.js`, `feed-init` / `feed-decode`) con su propia instancia
+   del parser leen los slabs comprimidos de 16 MiB por `SharedArrayBuffer`
+   (`wmp_copy_feed_slab`). Cada pedido es un tramo de `chunks × 4` bloques con puntos de
+   reanudación por pista (24 B por pista); el coordinador cose los resultados en orden
+   (`stitchFeedResult`) resolviendo los note-offs que cruzan tramos. Memory64 + pthreads
+   no sirve: la API JS limita la memoria i64 compartida a 65536 páginas (4 GB). Se
+   activan con ≥ 6 núcleos (`floor(cores/3)`, máx. 8); con menos, decodificación en un
+   hilo.
+5. **WasmiSynth: en Single solo renderizaba un worker.** Los workers sin voces propias
+   (todos menos el 0 en Single, el modo de Auto desde la rev. 72) salían del ciclo antes
+   de tomar tiles de render. La rev. 69 decía que compartían los tiles, pero el host de
+   1 núcleo no podía verlo (1 contra 4 workers daba WAV idénticos porque renderizaba
+   uno solo). Ahora todos toman tiles, y la compactación de la lista de voces de cada
+   worker (`compact_worker_voices`) pasa al inicio del ciclo siguiente, cuando ningún
+   otro worker sigue renderizando esas voces.
+6. `wmp_feed_reset_js` limpia `complete` y `safeSeconds` (al volver al principio después
+   del final de la canción, el feed decía "completo" sin mandar nada).
+7. `tools/browser_bench.py`: `--log` (toda la consola) y `--voices=N --workers=N`.
+
+**Medición (contenedor de Claude Code: Xeon 2,8 GHz, 4 hilos, más lento que ambas PCs):**
+
+| Prueba | Antes | Después |
+|---|---|---|
+| Host, feed de 1 s del pico | 1,17 s (1 helper, tramos de 16 bloques) | 0,81 s (1 helper, tramos 4×8); **0,24 s con 4 helpers** (2×4) |
+| Host, render 1024 voces, recorte del pico, 1/2/4 workers | 0,78× / 0,80× / 0,77× | **0,80× / 0,50× / 0,36×** |
+| Chromium, WASMIDI Audio, recorte del pico, 1024 voces, workers auto | underruns 16 → 142 en 6 s, carga 108% | **0 underruns**, carga 62-107% |
+| Igual con 3 workers | 204 underruns, carga hasta 160% | **0 underruns**, carga 44-56% |
+| Chromium, 256 voces | — | 0 underruns, carga ≤ 47% |
+
+En el pico el parser descarta el 96% de los note-ons (contando copias) a 1024 voces; el
+synth descarta además ~1300 en 3 s por su propia admisión.
+
+**Verificación:** salida de los helpers idéntica a la del feed secuencial
+(`tools/host_bench/feed_parallel.cpp`, recorte del pico y MIDI sintético; y en el CI,
+`synthFeedSmoke` en `tools/midi_parser_bootstrap_smoke.cjs` con una segunda instancia del
+módulo como helper). `feed_check.cpp` compara el feed sin admisión contra el stream de
+eventos (multiconjunto por tick, expandiendo las pilas). Modo determinístico: 1 contra 4
+workers da **WAV idénticos** ahora que los 4 renderizan (`pipeline_bench`, `DET=1`).
+Pruebas de host del CI: todas pasan.
+
+**No verificado / pendiente:**
+- El archivo completo de 20,9 GB en Chromium (solo el recorte del pico) y en las PCs del
+  usuario; los helpers del feed no se activan en este contenedor (4 hilos).
+- **El roll, el teclado y los gráficos siguen con su propia decodificación** (etapa 2):
+  en host el barrido del renderer cuesta ~3,9× tiempo real en el pico. Falta repartirlo
+  entre helpers igual que el feed.
+- Modo GPU estilo Kestrel (etapa 3); WebGPU sigue sin probarse con GPU real.
+- Comparación de calidad a oído: los WAV de `pipeline_bench` (`WAV=prefijo`) sirven
+  para escuchar el pico con y sin admisión en el parser (`FEED=0`).

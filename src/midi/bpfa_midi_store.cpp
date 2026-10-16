@@ -269,6 +269,12 @@ void BpfaMidiStore::clear()
     std::vector<uint8_t>().swap(fileBytes_);
     sourceSlabs_.clear();
     std::vector<SourceChunk>().swap(sourceChunks_);
+    externalFetch_ = nullptr;
+    externalFetchUser_ = nullptr;
+    feedValid_ = false;
+    feedCursor_ = MergeCursor{};
+    feedCarried_.reset(0);
+    feedLocal_.reset(0);
     storedSourceBytes_ = 0;
     sourceSize_ = 0;
     sourceCache_.clear();
@@ -910,6 +916,718 @@ bool BpfaMidiStore::buildEventBatch(uint32_t endTick, std::size_t maxEvents, std
         e.length = static_cast<uint32_t>(sx.data.size());
         sysExBytes.insert(sysExBytes.end(), sx.data.begin(), sx.data.end());
         sysExEvents.push_back(e);
+    }
+    return true;
+}
+
+// Copies of a note at the same tick (echo stacks) fold into one word whose high byte counts
+// them; a note-off of the key closes the note-on unit and the other way round, so no copy
+// moves across its opposite event (HANDOFF sec. 70).
+inline void BpfaMidiStore::foldEvent(std::vector<FeedWord>& out, std::size_t& used, uint32_t tick, uint32_t message)
+{
+    if (tick != unitTick_) {
+        unitTick_ = tick;
+        if (++unitGen_ == 0) { unitTag_.fill(0); unitGen_ = 1; }
+    }
+    const uint32_t type = message & 0xf0u;
+    if (type == 0x90u || type == 0x80u) {
+        const uint32_t slot = (type == 0x90u ? 2048u : 0u) | ((message & 15u) << 7) | ((message >> 8) & 127u);
+        if (unitTag_[slot] == unitGen_) {
+            FeedWord& unit = out[unitAt_[slot]];
+            if ((unit.packed & 0x00ffffffu) == message && (unit.packed >> 24) < 0xffu) {
+                unit.packed += 1u << 24;
+                return;
+            }
+        }
+        unitTag_[slot ^ 2048u] = 0;
+        unitTag_[slot] = unitGen_;
+        unitAt_[slot] = uint32_t(used);
+    }
+    out[used++] = FeedWord(tick, message);
+}
+
+void BpfaMidiStore::decodeTrackUntil(Cursor& c, uint32_t endTick, std::vector<FeedWord>& out)
+{
+    if (c.finished || c.eventTick >= endTick) return;
+    unitTick_ = ~0u;
+    {
+        std::size_t used = out.size();
+        out.resize(used + 1);
+        foldEvent(out, used, c.eventTick, c.eventMessage);
+        out.resize(used);
+    }
+    Decoder d{fileBytes_.empty() ? nullptr : fileBytes_.data(), c.position, c.end, c.tick, c.runningStatus,
+              c.finished};
+    d.store = this;
+    if (compressedSource()) {
+        if (!c.own) c.own.reset(new uint8_t[sourceBlockSize_]);
+        d.own = c.own.get();
+    }
+    if (c.block && sourceSlotValid(c.blockSlot, c.blockBegin)) {
+        d.block = c.block;
+        d.blockBegin = c.blockBegin;
+        d.blockEnd = c.blockEnd;
+        d.blockSlot = c.blockSlot;
+    }
+    uint8_t status = 0, d1 = 0, d2 = 0;
+    uint32_t tempo = 0, dataLength = 0;
+    uint64_t dataOffset = 0;
+    bool stop = false;
+    while (!stop) {
+        // Fast path: channel events with at least 16 bytes left in the block, no per-byte
+        // bounds checks. Anything else (metas, SysEx, block edges, errors) takes readEvent.
+        if (d.block && d.position >= d.blockBegin && d.position < d.blockEnd && d.blockEnd - d.position > 16 &&
+            !d.finished) {
+            const uint8_t* const base = d.block - d.blockBegin;
+            const uint8_t* p = base + d.position;
+            const uint8_t* const limit = base + d.blockEnd - 16;
+            uint32_t tick = d.tick;
+            uint8_t rs = d.runningStatus;
+            uint64_t nextIndex = c.nextIndex;
+            std::size_t used = out.size();
+            // Room for every event the remaining block bytes could hold (>= 2 bytes each).
+            out.resize(used + std::size_t(limit - p) / 2u + 1u);
+            while (p < limit) {
+                const uint8_t* const start = p;
+                uint32_t delta = *p & 0x7fu;
+                if (*p++ & 0x80u) {
+                    delta = (delta << 7) | (*p & 0x7fu);
+                    if (*p++ & 0x80u) {
+                        delta = (delta << 7) | (*p & 0x7fu);
+                        if (*p++ & 0x80u) {
+                            delta = (delta << 7) | (*p & 0x7fu);
+                            if (*p++ & 0x80u) { p = start; break; }
+                        }
+                    }
+                }
+                uint8_t s = *p;
+                if (s < 0x80u) {
+                    if (rs < 0x80u || rs >= 0xf0u) { p = start; break; }
+                    s = rs;
+                } else if (s < 0xf0u) {
+                    ++p;
+                } else {
+                    p = start;
+                    break;
+                }
+                const uint8_t type = s & 0xf0u;
+                const uint8_t a = p[0];
+                const bool two = type != 0xc0u && type != 0xd0u;
+                const uint8_t b = two ? p[1] : 0;
+                if ((a | b) & 0x80u || delta > 0xffffffffu - tick) { p = start; break; }
+                p += two ? 2 : 1;
+                rs = s;
+                tick += delta;
+                const uint64_t index = nextIndex++;
+                uint8_t st = s, v2 = b;
+                if (type == 0x90u && b == 0) { st = uint8_t(0x80u | (s & 0x0fu)); v2 = 64; }
+                const uint32_t message = st | (uint32_t(a) << 8) | (uint32_t(v2) << 16);
+                if (tick >= endTick) {
+                    c.eventIndex = index;
+                    c.eventTick = tick;
+                    c.eventMessage = message;
+                    stop = true;
+                    break;
+                }
+                foldEvent(out, used, tick, message);
+            }
+            out.resize(used);
+            c.nextIndex = nextIndex;
+            d.position = uint64_t(p - base);
+            d.tick = tick;
+            d.runningStatus = rs;
+            if (stop) break;
+        }
+        const Kind kind = readEvent(d, status, d1, d2, tempo, dataOffset, dataLength);
+        if (kind == Kind::End) { c.finished = true; break; }
+        if (kind != Kind::Channel) continue;
+        const uint64_t index = c.nextIndex++;
+        const uint8_t type = status & 0xf0;
+        uint8_t st = status, v2 = d2;
+        if (type == 0x90 && d2 == 0) { st = uint8_t(0x80 | (status & 0x0f)); v2 = 64; }
+        const uint32_t message = st | (uint32_t(d1) << 8) | (uint32_t(v2) << 16);
+        if (d.tick >= endTick) {
+            c.eventIndex = index;
+            c.eventTick = d.tick;
+            c.eventMessage = message;
+            break;
+        }
+        std::size_t used = out.size();
+        out.resize(used + 1);
+        foldEvent(out, used, d.tick, message);
+        out.resize(used);
+    }
+    c.position = d.position;
+    c.tick = d.tick;
+    c.runningStatus = d.runningStatus;
+    c.block = d.block;
+    c.blockBegin = d.blockBegin;
+    c.blockEnd = d.blockEnd;
+    c.blockSlot = d.blockSlot;
+}
+
+void BpfaMidiStore::resetSynthFeed(uint32_t startTick)
+{
+    feedValid_ = false;
+    feedStats_ = SynthFeedStats{};
+    if (!valid_) return;
+    startTick = std::min(startTick, metadata_.maxTick);
+    mergeReset(feedCursor_, startTick, false);
+    feedSysExCursor_ = static_cast<std::size_t>(std::lower_bound(sysex_.begin(), sysex_.end(), startTick,
+        [](const SysExRef& e, uint32_t tick) { return e.tick < tick; }) - sysex_.begin());
+    feedStartTick_ = startTick;
+    feedTick_ = startTick;
+    feedCursorTick_ = startTick;
+    feedBlock_ = static_cast<uint64_t>(std::floor(metadata_.tickToSeconds(startTick) / synthFeedBlockSeconds()));
+    feedCarried_.reset(tracks_.size());
+    feedValid_ = true;
+}
+
+double BpfaMidiStore::synthFeedBlockSeconds() const
+{
+    return double(std::max<uint32_t>(1, feedConfig_.blockFrames)) / double(std::max<uint32_t>(1, feedConfig_.sampleRate));
+}
+
+uint32_t BpfaMidiStore::feedAdmit() const
+{
+    return feedConfig_.admissionPercent
+        ? std::max<uint32_t>(1, uint32_t(uint64_t(feedConfig_.maxVoices) * feedConfig_.admissionPercent / 100u)) : 0;
+}
+
+// Block b of a chunk holds ticks in [edge[b], edge[b + 1]); edges depend only on the block
+// index and the seek tick, so every chunk of a feed can be planned ahead.
+void BpfaMidiStore::feedEdges(uint64_t firstBlock, uint32_t blocks, uint32_t* edge) const
+{
+    const double blockSeconds = synthFeedBlockSeconds();
+    for (uint32_t b = 0; b <= blocks; ++b) {
+        const double t = std::ceil(metadata_.secondsToTick(double(firstBlock + b) * blockSeconds));
+        const uint32_t tick = t >= double(metadata_.maxTick) + 1.0 ? metadata_.maxTick + 1u : uint32_t(std::max(0.0, t));
+        edge[b] = std::max(feedStartTick_, tick);
+    }
+}
+
+void BpfaMidiStore::FeedPairs::reset(std::size_t tracks)
+{
+    heads.clear();
+    heads.resize(tracks);
+    runs.clear();
+    freeRun = ~0u;
+    touched.clear();
+}
+
+BpfaMidiStore::FeedQueue& BpfaMidiStore::FeedPairs::queue(uint32_t track, uint32_t key)
+{
+    auto& keys = heads[track][key >> 7];
+    if (!keys) keys.reset(new FeedQueue[128]);
+    return keys[key & 127u];
+}
+
+void BpfaMidiStore::FeedPairs::push(FeedQueue& q, bool kept, uint32_t count, uint32_t trackKey)
+{
+    if (q.tail != ~0u) {
+        FeedRun& r = runs[q.tail];
+        if (r.kept == uint8_t(kept) && r.count <= 0x7fffffffu - count) { r.count += count; return; }
+    } else {
+        touched.push_back(trackKey);
+    }
+    uint32_t node = freeRun;
+    if (node != ~0u) freeRun = runs[node].next;
+    else { node = uint32_t(runs.size()); runs.push_back(FeedRun{}); }
+    runs[node] = FeedRun{count, ~0u, uint8_t(kept)};
+    if (q.tail == ~0u) q.head = node;
+    else runs[q.tail].next = node;
+    q.tail = node;
+}
+
+uint32_t BpfaMidiStore::FeedPairs::pop(FeedQueue& q, uint32_t count, uint32_t& kept)
+{
+    kept = 0;
+    while (count && q.head != ~0u) {
+        const uint32_t node = q.head;
+        FeedRun& r = runs[node];
+        const uint32_t take = std::min(r.count, count);
+        if (r.kept) kept += take;
+        count -= take;
+        r.count -= take;
+        if (r.count == 0) {
+            q.head = r.next;
+            if (q.head == ~0u) q.tail = ~0u;
+            r.next = freeRun;
+            freeRun = node;
+        }
+    }
+    return count;
+}
+
+namespace {
+// Stacked note words: the high byte holds the copies - 1 (note-ons and note-offs).
+inline uint32_t stackOf(uint32_t m) { return (m >> 24) + 1u; }
+template <typename Emit> void emitStacked(uint32_t message, uint32_t count, Emit&& emit)
+{
+    while (count) {
+        const uint32_t n = std::min<uint32_t>(count, 256u);
+        emit((message & 0x00ffffffu) | ((n - 1u) << 24));
+        count -= n;
+    }
+}
+} // namespace
+
+// One chunk: decode every track (copies folded into units, which the synth's VOR renders
+// as one voice each); admission thresholds per block over units (the synth's own rule); then per track keep
+// or drop each unit and pair note-offs FIFO per (track, key) inside the chunk. Note-offs
+// that find their key empty are deferred to the stitch, which pairs them with the queues
+// carried from earlier chunks. Removing a matched pair never leaves a note hanging.
+void BpfaMidiStore::feedDecodeChunk(std::vector<Cursor>& cursors, const uint32_t* edge, uint32_t blocks,
+                                    uint32_t admit, uint8_t floorVelocity, FeedChunk& out)
+{
+    out.events.clear();
+    out.deferred.clear();
+    out.pending.clear();
+    out.stats = SynthFeedStats{};
+    out.blocks = blocks;
+    out.endTick = edge[blocks];
+    const std::size_t trackCount = cursors.size();
+    const uint32_t endTick = edge[blocks];
+
+    feedRaw_.clear();
+    feedTrackEnd_.resize(trackCount);
+    bool anyLeft = false;
+    for (std::size_t t = 0; t < trackCount; ++t) {
+        Cursor& c = cursors[t];
+        const uint64_t before = c.nextIndex;
+        decodeTrackUntil(c, endTick, feedRaw_);
+        out.stats.decoded += c.nextIndex - before;
+        feedTrackEnd_[t] = uint32_t(feedRaw_.size());
+        anyLeft = anyLeft || !c.finished;
+    }
+    out.anyLeft = anyLeft;
+
+    std::array<int, 64> threshold{}, quota{};
+    threshold.fill(-1);
+    if (admit) {
+        std::array<std::array<uint32_t, 128>, 64> histogram{};
+        std::array<long, 64> counts{};
+        uint32_t begin = 0;
+        for (std::size_t t = 0; t < trackCount; ++t) {
+            const uint32_t end = feedTrackEnd_[t];
+            uint32_t b = 0;
+            for (uint32_t i = begin; i < end; ++i) {
+                const FeedWord& e = feedRaw_[i];
+                const uint32_t m = e.packed;
+                const uint8_t v = (m >> 16) & 0x7f;
+                if ((m & 0xf0u) != 0x90u || v < floorVelocity) continue;
+                while (b + 1 < blocks && e.tick >= edge[b + 1]) ++b;
+                ++histogram[b][v];
+                ++counts[b];
+            }
+            begin = end;
+        }
+        for (uint32_t b = 0; b < blocks; ++b) {
+            if (counts[b] <= long(admit)) continue;
+            long above = 0;
+            for (int v = 127; v >= 0; --v) {
+                if (above + long(histogram[b][v]) > long(admit)) { threshold[b] = v; quota[b] = int(long(admit) - above); break; }
+                above += histogram[b][v];
+            }
+        }
+    }
+
+    feedKept_.clear();
+    feedKeptTrack_.clear();
+    if (feedLocal_.heads.size() != trackCount) feedLocal_.reset(trackCount);
+    uint32_t begin = 0;
+    for (std::size_t t = 0; t < trackCount; ++t) {
+        const uint32_t end = feedTrackEnd_[t];
+        uint32_t b = 0;
+        for (uint32_t i = begin; i < end; ++i) {
+            const FeedWord& e = feedRaw_[i];
+            const uint32_t m = e.packed;
+            const uint32_t type = m & 0xf0u;
+            if (type == 0x90u) {
+                const int v = int((m >> 16) & 0x7f);
+                const uint32_t copies = stackOf(m);
+                bool kept = v >= floorVelocity;
+                if (kept && admit) {
+                    while (b + 1 < blocks && e.tick >= edge[b + 1]) ++b;
+                    if (threshold[b] >= 0) {
+                        if (v < threshold[b]) kept = false;
+                        else if (v == threshold[b]) kept = quota[b]-- > 0;
+                    }
+                }
+                out.stats.noteOns += copies;
+                const uint32_t key = ((m & 15u) << 7) | ((m >> 8) & 127u);
+                feedLocal_.push(feedLocal_.queue(uint32_t(t), key), kept, copies, (uint32_t(t) << 11) | key);
+                if (!kept) { out.stats.droppedNoteOns += copies; continue; }
+            } else if (type == 0x80u) {
+                const uint32_t copies = stackOf(m);
+                uint32_t keptOffs = 0;
+                const uint32_t unpaired = feedLocal_.pop(
+                    feedLocal_.queue(uint32_t(t), ((m & 15u) << 7) | ((m >> 8) & 127u)), copies, keptOffs);
+                out.stats.droppedNoteOffs += copies - unpaired - keptOffs;
+                if (keptOffs) {
+                    feedKept_.push_back(EventWord{e.tick, (m & 0x00ffffffu) | ((keptOffs - 1u) << 24)});
+                    feedKeptTrack_.push_back(uint32_t(t));
+                }
+                if (unpaired) {
+                    feedKept_.push_back(EventWord{e.tick, (m & 0x00ffffffu) | ((unpaired - 1u) << 24)});
+                    feedKeptTrack_.push_back(uint32_t(t) | 0x80000000u);
+                }
+                continue;
+            }
+            feedKept_.push_back(EventWord{e.tick, m});
+            feedKeptTrack_.push_back(uint32_t(t));
+        }
+        begin = end;
+    }
+
+    // What is still open at the end of the chunk, per key in first-touch order.
+    for (const uint32_t trackKey : feedLocal_.touched) {
+        FeedQueue& q = feedLocal_.queue(trackKey >> 11, trackKey & 2047u);
+        if (q.head == ~0u) continue;
+        out.pending.push_back(trackKey);
+        const std::size_t countAt = out.pending.size();
+        out.pending.push_back(0);
+        for (uint32_t node = q.head; node != ~0u;) {
+            FeedRun& r = feedLocal_.runs[node];
+            out.pending.push_back((r.count << 1) | r.kept);
+            ++out.pending[countAt];
+            const uint32_t next = r.next;
+            r.next = feedLocal_.freeRun;
+            feedLocal_.freeRun = node;
+            node = next;
+        }
+        q.head = q.tail = ~0u;
+    }
+    feedLocal_.touched.clear();
+
+    // (tick, track) order: the kept events are few, a stable sort by tick is enough.
+    feedOrder_.resize(feedKept_.size());
+    for (uint32_t i = 0; i < feedOrder_.size(); ++i) feedOrder_[i] = i;
+    std::stable_sort(feedOrder_.begin(), feedOrder_.end(),
+        [this](uint32_t a, uint32_t b) { return feedKept_[a].tick < feedKept_[b].tick; });
+    out.events.reserve(feedOrder_.size());
+    for (uint32_t index : feedOrder_) {
+        const EventWord& e = feedKept_[index];
+        if (feedKeptTrack_[index] & 0x80000000u) {
+            out.deferred.push_back(uint32_t(out.events.size()));
+            out.deferred.push_back(feedKeptTrack_[index] & 0xffffu);
+        }
+        out.events.push_back(e);
+    }
+}
+
+void BpfaMidiStore::feedStitch(const FeedChunk& chunk, std::vector<EventWord>& output, std::vector<double>& times,
+                               std::vector<SysExBatchEvent>& sysExEvents, std::vector<uint8_t>& sysExBytes,
+                               double& safeSeconds, bool& complete)
+{
+    feedStats_.decoded += chunk.stats.decoded;
+    feedStats_.noteOns += chunk.stats.noteOns;
+    feedStats_.droppedNoteOns += chunk.stats.droppedNoteOns;
+    feedStats_.droppedNoteOffs += chunk.stats.droppedNoteOffs;
+    std::size_t deferred = 0;
+    uint32_t lastTick = ~0u;
+    double lastSeconds = 0.0;
+    auto emit = [&](uint32_t tick, uint32_t m) {
+        const uint32_t type = m & 0xf0u;
+        if ((type == 0x90u || type == 0x80u) && !output.empty()) {
+            EventWord& previous = output.back();
+            const uint32_t have = stackOf(previous.packed), add = stackOf(m);
+            if (previous.tick == tick && (previous.packed & 0x00ffffffu) == (m & 0x00ffffffu) && have + add <= 256u) {
+                previous.packed = (m & 0x00ffffffu) | ((have + add - 1u) << 24);
+                return;
+            }
+        }
+        if (tick != lastTick) { lastTick = tick; lastSeconds = metadata_.tickToSeconds(tick); }
+        output.push_back(EventWord{tick, m});
+        times.push_back(lastSeconds);
+    };
+    for (std::size_t i = 0; i < chunk.events.size(); ++i) {
+        const EventWord& e = chunk.events[i];
+        uint32_t m = e.packed;
+        if (deferred + 1 < chunk.deferred.size() && chunk.deferred[deferred] == i) {
+            const uint32_t track = chunk.deferred[deferred + 1];
+            deferred += 2;
+            const uint32_t copies = stackOf(m);
+            uint32_t kept = 0, unpaired = copies;
+            if (track < feedCarried_.heads.size())
+                unpaired = feedCarried_.pop(feedCarried_.queue(track, ((m & 15u) << 7) | ((m >> 8) & 127u)), copies, kept);
+            feedStats_.droppedNoteOffs += copies - unpaired - kept;
+            if (kept + unpaired == 0) continue;
+            m = (m & 0x00ffffffu) | ((kept + unpaired - 1u) << 24);
+        }
+        emit(e.tick, m);
+    }
+    for (std::size_t i = 0; i + 1 < chunk.pending.size();) {
+        const uint32_t trackKey = chunk.pending[i], runCount = chunk.pending[i + 1];
+        i += 2;
+        const uint32_t track = trackKey >> 11;
+        for (uint32_t r = 0; r < runCount && i < chunk.pending.size(); ++r, ++i) {
+            if (track >= feedCarried_.heads.size()) continue;
+            feedCarried_.push(feedCarried_.queue(track, trackKey & 2047u), chunk.pending[i] & 1u,
+                              chunk.pending[i] >> 1, trackKey);
+        }
+    }
+    feedCarried_.touched.clear();
+
+    const uint32_t endTick = chunk.endTick;
+    while (feedSysExCursor_ < sysex_.size() && sysex_[feedSysExCursor_].tick < endTick) {
+        const SysExRef& sx = sysex_[feedSysExCursor_++];
+        if (sx.data.empty()) continue;
+        SysExBatchEvent ev;
+        ev.tick = sx.tick;
+        ev.offset = static_cast<uint32_t>(sysExBytes.size());
+        ev.length = static_cast<uint32_t>(sx.data.size());
+        sysExBytes.insert(sysExBytes.end(), sx.data.begin(), sx.data.end());
+        sysExEvents.push_back(ev);
+    }
+    feedTick_ = endTick;
+    feedBlock_ = chunk.firstBlock + chunk.blocks;
+    const double windowEnd = double(feedBlock_) * synthFeedBlockSeconds();
+    safeSeconds = windowEnd;
+    if (!chunk.anyLeft || endTick > metadata_.maxTick) {
+        complete = true;
+        safeSeconds = std::max(windowEnd, double(metadata_.durationSeconds) + 1.0);
+    }
+}
+
+bool BpfaMidiStore::buildSynthFeed(double endSeconds, std::size_t maxEvents, std::vector<EventWord>& output,
+                                   std::vector<double>& times, std::vector<SysExBatchEvent>& sysExEvents,
+                                   std::vector<uint8_t>& sysExBytes, double& safeSeconds, bool& complete)
+{
+    output.clear();
+    times.clear();
+    sysExEvents.clear();
+    sysExBytes.clear();
+    complete = false;
+    safeSeconds = 0.0;
+    if (!valid_ || !feedValid_) return false;
+    const uint32_t blocks = std::clamp<uint32_t>(feedConfig_.windowBlocks, 1u, 64u);
+    const uint32_t admit = feedAdmit();
+    const uint8_t floorVelocity = uint8_t(std::min<uint32_t>(feedConfig_.velocityFloor, 127u));
+    maxEvents = std::max<std::size_t>(1, maxEvents);
+    // After stitched helper results the sequential cursors are behind: move them.
+    if (feedCursorTick_ != feedTick_) {
+        mergeReset(feedCursor_, feedTick_, false);
+        feedCursorTick_ = feedTick_;
+    }
+    bool first = true;
+    while (output.size() < maxEvents) {
+        if (!first && double(feedBlock_) * synthFeedBlockSeconds() >= endSeconds) break;
+        first = false;
+        std::array<uint32_t, 65> edge{};
+        feedEdges(feedBlock_, blocks, edge.data());
+        feedDecodeChunk(feedCursor_.cursors, edge.data(), blocks, admit, floorVelocity, feedChunk_);
+        feedChunk_.firstBlock = feedBlock_;
+        feedStitch(feedChunk_, output, times, sysExEvents, sysExBytes, safeSeconds, complete);
+        feedCursorTick_ = feedTick_;
+        if (complete) break;
+    }
+    return true;
+}
+
+// ---- Decode helpers (HANDOFF sec. 70) ----
+
+namespace {
+constexpr uint32_t FeedImageMagic = 0x31494657u;    // "WFI1"
+constexpr uint32_t FeedRequestMagic = 0x31524657u;  // "WFR1"
+constexpr uint32_t FeedResultMagic = 0x31534657u;   // "WFS1"
+
+template <typename T> void putPod(std::vector<uint8_t>& out, const T& value)
+{
+    const std::size_t at = out.size();
+    out.resize(at + sizeof(T));
+    std::memcpy(out.data() + at, &value, sizeof(T));
+}
+template <typename T> void putArray(std::vector<uint8_t>& out, const T* data, std::size_t count)
+{
+    const std::size_t at = out.size();
+    out.resize(at + count * sizeof(T));
+    if (count) std::memcpy(out.data() + at, data, count * sizeof(T));
+    while (out.size() & 7u) out.push_back(0);
+}
+struct PodReader {
+    const uint8_t* data;
+    std::size_t size;
+    std::size_t at = 0;
+    bool ok = true;
+    template <typename T> T get()
+    {
+        T value{};
+        if (!ok || size - at < sizeof(T)) { ok = false; return value; }
+        std::memcpy(&value, data + at, sizeof(T));
+        at += sizeof(T);
+        return value;
+    }
+    template <typename T> void array(std::vector<T>& out, std::size_t count)
+    {
+        if (!ok || count > (size - at) / sizeof(T)) { ok = false; return; }
+        out.resize(count);
+        if (count) std::memcpy(out.data(), data + at, count * sizeof(T));
+        at += count * sizeof(T);
+        at = std::min(size, (at + 7u) & ~std::size_t(7));
+    }
+};
+} // namespace
+
+std::size_t BpfaMidiStore::sourceSlabBytes() { return SourceSlabSize; }
+
+bool BpfaMidiStore::exportFeedImage(std::vector<uint8_t>& blob) const
+{
+    blob.clear();
+    if (!valid_ || !compressedSource() || chunkBase_ != 0) return false;
+    putPod(blob, FeedImageMagic);
+    putPod(blob, uint32_t(tracks_.size()));
+    putPod(blob, uint64_t(sourceSize_));
+    putPod(blob, uint64_t(sourceBlockSize_));
+    putPod(blob, uint64_t(sourceChunks_.size()));
+    putPod(blob, uint32_t(metadata_.maxTick));
+    putPod(blob, uint32_t(0));
+    for (const TrackStorage& t : tracks_) {
+        putPod(blob, t.byteBegin);
+        putPod(blob, t.byteEnd);
+    }
+    putArray(blob, sourceChunks_.data(), sourceChunks_.size());
+    return true;
+}
+
+bool BpfaMidiStore::importFeedImage(const uint8_t* data, std::size_t size, FeedSourceFetch fetch, void* fetchUser)
+{
+    clear();
+    PodReader in{data, size};
+    if (in.get<uint32_t>() != FeedImageMagic || !fetch) { error_ = "Invalid feed image"; return false; }
+    const uint32_t trackCount = in.get<uint32_t>();
+    sourceSize_ = in.get<uint64_t>();
+    sourceBlockSize_ = std::size_t(in.get<uint64_t>());
+    const uint64_t chunkCount = in.get<uint64_t>();
+    metadata_.maxTick = in.get<uint32_t>();
+    in.get<uint32_t>();
+    if (!in.ok || trackCount == 0 || trackCount > 65535u || sourceBlockSize_ == 0 || chunkCount == 0) {
+        error_ = "Invalid feed image";
+        return false;
+    }
+    tracks_.assign(trackCount, TrackStorage{});
+    for (TrackStorage& t : tracks_) {
+        t.byteBegin = in.get<uint64_t>();
+        t.byteEnd = in.get<uint64_t>();
+    }
+    in.array(sourceChunks_, std::size_t(chunkCount));
+    if (!in.ok) { error_ = "Truncated feed image"; return false; }
+    externalFetch_ = fetch;
+    externalFetchUser_ = fetchUser;
+    metadata_.trackCount = trackCount;
+    valid_ = true;
+    return true;
+}
+
+bool BpfaMidiStore::buildFeedRequest(uint64_t firstBlock, uint32_t blocks, uint32_t chunks,
+                                     std::vector<uint8_t>& request) const
+{
+    request.clear();
+    if (!valid_ || !feedValid_ || blocks == 0 || blocks > 64 || chunks == 0 || chunks > 4096) return false;
+    std::vector<uint32_t> edge(std::size_t(blocks) * chunks + 1u);
+    feedEdges(firstBlock, uint32_t(edge.size() - 1u), edge.data());
+    putPod(request, FeedRequestMagic);
+    putPod(request, uint32_t(tracks_.size()));
+    putPod(request, firstBlock);
+    putPod(request, blocks);
+    putPod(request, chunks);
+    putPod(request, feedAdmit());
+    putPod(request, uint32_t(std::min<uint32_t>(feedConfig_.velocityFloor, 127u)));
+    putArray(request, edge.data(), edge.size());
+    for (const TrackStorage& storage : tracks_) {
+        const auto& cps = storage.checkpoints;
+        auto it = std::lower_bound(cps.begin(), cps.end(), edge[0],
+            [](const TrackCheckpoint& cp, uint32_t tick) { return cp.tick < tick; });
+        const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+        putPod(request, cp.byteOffset);
+        putPod(request, cp.eventIndex);
+        putPod(request, cp.tick);
+        putPod(request, uint32_t(cp.runningStatus));
+    }
+    return true;
+}
+
+bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std::vector<uint8_t>& result)
+{
+    result.clear();
+    PodReader in{data, size};
+    if (!valid_ || in.get<uint32_t>() != FeedRequestMagic || in.get<uint32_t>() != tracks_.size()) {
+        error_ = "Invalid feed request";
+        return false;
+    }
+    const uint64_t firstBlock = in.get<uint64_t>();
+    const uint32_t blocks = in.get<uint32_t>();
+    const uint32_t chunks = in.get<uint32_t>();
+    const uint32_t admit = in.get<uint32_t>();
+    const uint8_t floorVelocity = uint8_t(std::min<uint32_t>(in.get<uint32_t>(), 127u));
+    if (!in.ok || blocks == 0 || blocks > 64 || chunks == 0 || chunks > 4096) { error_ = "Invalid feed request"; return false; }
+    std::vector<uint32_t> edge;
+    in.array(edge, std::size_t(blocks) * chunks + 1u);
+    std::vector<Cursor>& cursors = feedCursor_.cursors;
+    cursors.resize(tracks_.size());
+    for (std::size_t t = 0; t < tracks_.size() && in.ok; ++t) {
+        Cursor& c = cursors[t];
+        c.position = in.get<uint64_t>();
+        c.nextIndex = in.get<uint64_t>();
+        c.tick = in.get<uint32_t>();
+        c.runningStatus = uint8_t(in.get<uint32_t>());
+        c.end = tracks_[t].byteEnd;
+        c.finished = false;
+        c.block = nullptr;
+        bool ok = in.ok && c.position >= tracks_[t].byteBegin && c.position <= c.end && decodeNext(c, false);
+        while (ok && c.eventTick < edge[0]) ok = decodeNext(c, false);
+        if (!ok) c.finished = true;
+    }
+    if (!in.ok) { error_ = "Truncated feed request"; return false; }
+    putPod(result, FeedResultMagic);
+    putPod(result, chunks);
+    for (uint32_t k = 0; k < chunks; ++k) {
+        feedDecodeChunk(cursors, edge.data() + std::size_t(k) * blocks, blocks, admit, floorVelocity, feedChunk_);
+        const FeedChunk& out = feedChunk_;
+        putPod(result, out.blocks);
+        putPod(result, uint32_t(out.anyLeft ? 1 : 0));
+        putPod(result, firstBlock + uint64_t(k) * blocks);
+        putPod(result, out.endTick);
+        putPod(result, uint32_t(0));
+        putPod(result, out.stats);
+        putPod(result, uint64_t(out.events.size()));
+        putPod(result, uint64_t(out.deferred.size()));
+        putPod(result, uint64_t(out.pending.size()));
+        putArray(result, out.events.data(), out.events.size());
+        putArray(result, out.deferred.data(), out.deferred.size());
+        putArray(result, out.pending.data(), out.pending.size());
+    }
+    return true;
+}
+
+bool BpfaMidiStore::stitchFeedResult(const uint8_t* data, std::size_t size, std::vector<EventWord>& output,
+                                     std::vector<double>& times, std::vector<SysExBatchEvent>& sysExEvents,
+                                     std::vector<uint8_t>& sysExBytes, double& safeSeconds, bool& complete)
+{
+    output.clear();
+    times.clear();
+    sysExEvents.clear();
+    sysExBytes.clear();
+    complete = false;
+    safeSeconds = 0.0;
+    PodReader in{data, size};
+    if (!valid_ || !feedValid_ || in.get<uint32_t>() != FeedResultMagic) { error_ = "Invalid feed result"; return false; }
+    const uint32_t chunks = in.get<uint32_t>();
+    for (uint32_t k = 0; k < chunks && !complete; ++k) {
+        FeedChunk& chunk = feedChunk_;
+        chunk.blocks = in.get<uint32_t>();
+        chunk.anyLeft = in.get<uint32_t>() != 0;
+        chunk.firstBlock = in.get<uint64_t>();
+        chunk.endTick = in.get<uint32_t>();
+        in.get<uint32_t>();
+        chunk.stats = in.get<SynthFeedStats>();
+        const uint64_t events = in.get<uint64_t>(), deferred = in.get<uint64_t>(), pending = in.get<uint64_t>();
+        in.array(chunk.events, std::size_t(events));
+        in.array(chunk.deferred, std::size_t(deferred));
+        in.array(chunk.pending, std::size_t(pending));
+        if (!in.ok) { error_ = "Truncated feed result"; return false; }
+        if (chunk.firstBlock != feedBlock_) { error_ = "Feed result out of order"; return false; }
+        feedStitch(chunk, output, times, sysExEvents, sysExBytes, safeSeconds, complete);
     }
     return true;
 }
@@ -1723,14 +2441,33 @@ bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uin
     const uint64_t chunkIndex = globalChunk - chunkBase_;
     if (chunkIndex >= sourceChunks_.size()) return false;
     const SourceChunk& chunk = sourceChunks_[chunkIndex];
-    const uint8_t* stored = sourceSlabs_[chunk.physicalOffset / SourceSlabSize].get() +
-        chunk.physicalOffset % SourceSlabSize;
     begin = globalChunk * sourceBlockSize_;
     end = begin + chunk.size;
-    if (!(chunk.stored & SourceBlockCompressed)) {
-        data = stored;
-        slotHint = 0xffffu;
-        return true;
+    const uint8_t* stored = nullptr;
+    if (externalFetch_) {
+        // Decode helper: the compressed slabs live outside this instance (HANDOFF sec. 70).
+        const std::size_t length = (chunk.stored & SourceBlockCompressed) ? (chunk.stored & SourceBlockStoredSize) : chunk.size;
+        if (!(chunk.stored & SourceBlockCompressed) && own) {
+            if (!externalFetch_(externalFetchUser_, chunk.physicalOffset, own, length)) return false;
+            data = own;
+            slotHint = 0xfffeu;
+            return true;
+        }
+        if (externalScratch_.size() < std::max<std::size_t>(length, sourceBlockSize_)) externalScratch_.resize(std::max<std::size_t>(length, sourceBlockSize_));
+        if (!externalFetch_(externalFetchUser_, chunk.physicalOffset, externalScratch_.data(), length)) return false;
+        stored = externalScratch_.data();
+        if (!(chunk.stored & SourceBlockCompressed)) {
+            data = stored;
+            slotHint = 0xfffdu;
+            return true;
+        }
+    } else {
+        stored = sourceSlabs_[chunk.physicalOffset / SourceSlabSize].get() + chunk.physicalOffset % SourceSlabSize;
+        if (!(chunk.stored & SourceBlockCompressed)) {
+            data = stored;
+            slotHint = 0xffffu;
+            return true;
+        }
     }
     if (!decompressContext_) decompressContext_ = ZSTD_createDCtx();
     ZSTD_DCtx* dctx = static_cast<ZSTD_DCtx*>(decompressContext_);

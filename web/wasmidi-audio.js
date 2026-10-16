@@ -85,6 +85,9 @@
     // ---- Parser worker ----------------------------------------------------
     function startParser() {
         if (S.parser) S.parser.terminate();
+        const b = bridge();
+        if (b && b.clearLocalMidiSource) b.clearLocalMidiSource();
+        S.feedDirect = false;
         S.parser = new Worker("midi-parser-worker.js?v=" + encodeURIComponent(VERSION));
         S.parserReady = new Promise(resolve => { S.parserReadyResolve = resolve; });
         S.parser.onmessage = event => onParserMessage(event.data || {});
@@ -138,6 +141,13 @@
             updateButtons();
             S.parser.postMessage({ type: "text-events" });
             S.parser.postMessage({ type: "density" });
+            {
+                // The parser answers the synth directly (HANDOFF sec. 70); the pump
+                // below stays for ?synthsource=relay.
+                const b = bridge();
+                if (b && b.setLocalMidiSource) b.setLocalMidiSource(null, S.parser);
+                S.feedDirect = !!(b && b.state && b.state.localSynthReady);
+            }
             return;
         case "text-events":
             Lyrics.setEvents(m.events || []);
@@ -297,6 +307,7 @@
 
     // ---- Transport (same protocol as mainwindow.cpp) -----------------------
     function resetSynth(seconds) {
+        if (S.feedDirect) return;
         S.generation = ((S.generation + 1) >>> 0) || 1;
         S.resetPending = true;
         S.pumpPending = false;
@@ -321,7 +332,7 @@
 
     function scheduleAhead() {
         const b = bridge();
-        if (!S.playing || !b || !S.parser) return;
+        if (!S.playing || !b || !S.parser || S.feedDirect) return;
         const rate = b.state.sampleRate > 0 ? b.state.sampleRate : 44100;
         const blockSeconds = Math.max(1, b.state.blockFrames || settings.blockFrames) / rate;
         const transportSeconds = blockSeconds * Math.max(1, b.state.numBuffers || settings.numBuffers);

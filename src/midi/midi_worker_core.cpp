@@ -241,6 +241,34 @@ bool browserReadAt(void*,
 #endif
 }
 
+#if defined(__EMSCRIPTEN__) && WASMIDI_PARSER_BPFA
+// Synth feed helper (HANDOFF sec. 70): compressed source slabs shared by the parser
+// Worker as SharedArrayBuffers of sourceSlabBytes() each.
+EM_JS(int, wmp_copy_feed_slab, (double physicalOffset, double byteCount, double destinationAddress), {
+    const root = typeof globalThis !== "undefined" ? globalThis : self;
+    const slabs = root.__wasmidiFeedSlabs;
+    const slabBytes = root.__wasmidiFeedSlabBytes;
+    const offset = Number(physicalOffset), count = Number(byteCount), destination = Number(destinationAddress);
+    if (!slabs || !slabBytes) return 0;
+    const index = Math.floor(offset / slabBytes), at = offset - index * slabBytes;
+    const slab = slabs[index];
+    if (!slab || at + count > slab.byteLength || destination + count > HEAPU8.length) return 0;
+    HEAPU8.set(new Uint8Array(slab, at, count), destination);
+    return 1;
+});
+#endif
+
+bool feedSlabFetch(void*, uint64_t physicalOffset, uint8_t* destination, std::size_t byteCount)
+{
+#if defined(__EMSCRIPTEN__) && WASMIDI_PARSER_BPFA
+    return wmp_copy_feed_slab(static_cast<double>(physicalOffset), static_cast<double>(byteCount),
+                              static_cast<double>(reinterpret_cast<std::uintptr_t>(destination))) != 0;
+#else
+    (void)physicalOffset; (void)destination; (void)byteCount;
+    return false;
+#endif
+}
+
 } // namespace
 
 namespace {
@@ -1246,6 +1274,334 @@ int wmp_memory_growth_probe_js(double megabytes)
     const int ok = block[bytes - 1] == 1;
     delete[] block;
     return ok;
+}
+
+
+// ---- Synth feed (HANDOFF sec. 70) ----
+// Coordinator side (the parser Worker): config, reset, sequential build, helper requests
+// and in-order stitch. The output reuses the event-batch buffers (g_eventBatch, times,
+// SysEx). Helper side: a second instance of this module imports the feed image and
+// decodes requests, reading compressed source slabs that the page shares with it.
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_feed_config_js(double maxVoices, double admissionPercent, double sampleRate, double blockFrames,
+                        double velocityFloor, double windowBlocks)
+{
+#if WASMIDI_PARSER_BPFA
+    auto clampU32 = [](double v, double lo, double hi) {
+        return static_cast<uint32_t>(std::clamp(std::isfinite(v) ? v : lo, lo, hi));
+    };
+    wasmidi::BpfaMidiStore::SynthFeedConfig cfg;
+    cfg.maxVoices = clampU32(maxVoices, 1.0, 1048576.0);
+    cfg.admissionPercent = clampU32(admissionPercent, 0.0, 100.0);
+    cfg.sampleRate = clampU32(sampleRate, 8000.0, 384000.0);
+    cfg.blockFrames = clampU32(blockFrames, 16.0, 16384.0);
+    cfg.velocityFloor = clampU32(velocityFloor, 0.0, 127.0);
+    cfg.windowBlocks = clampU32(windowBlocks, 1.0, 64.0);
+    g_mappedStore.setSynthFeedConfig(cfg);
+#else
+    (void)maxVoices; (void)admissionPercent; (void)sampleRate; (void)blockFrames; (void)velocityFloor; (void)windowBlocks;
+#endif
+}
+
+#if WASMIDI_PARSER_BPFA
+double g_feedSafeSeconds = 0.0;
+bool g_feedComplete = false;
+std::vector<uint8_t> g_feedBuffer;
+#endif
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_feed_reset_js(double startTick)
+{
+#if WASMIDI_PARSER_BPFA
+    const uint32_t tick = jsExactNonNegativeInteger(startTick)
+        ? static_cast<uint32_t>(std::min<double>(startTick, double(std::numeric_limits<uint32_t>::max()))) : 0u;
+    g_mappedStore.resetSynthFeed(tick);
+    g_feedSafeSeconds = 0.0;
+    g_feedComplete = false;
+#else
+    (void)startTick;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_build_js(double endSeconds, double maxEvents)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        const std::size_t limit = static_cast<std::size_t>(std::clamp(std::isfinite(maxEvents) ? maxEvents : 1.0, 1.0, 1048576.0));
+        if (!g_mappedStore.buildSynthFeed(std::isfinite(endSeconds) ? endSeconds : 0.0, limit, g_eventBatch,
+                                          g_eventBatchTimes, g_sysExBatchEvents, g_sysExBatchBytes,
+                                          g_feedSafeSeconds, g_feedComplete)) {
+            g_error = g_mappedStore.error();
+            if (g_error.empty()) g_error = "Could not build the synth feed";
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Synth feed could not obtain more memory from the browser/OS";
+        return 0;
+    }
+#else
+    (void)endSeconds; (void)maxEvents;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_safe_seconds_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_feedSafeSeconds;
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_complete_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_feedComplete ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_block_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.synthFeedBlock());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_block_seconds_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_mappedStore.synthFeedBlockSeconds();
+#else
+    return 0.0;
+#endif
+}
+
+// Shared scratch for images, requests and results crossing to/from JavaScript.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_buffer_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        std::size_t size = 0;
+        if (!jsSizeToNative(byteCount, size)) return 0.0;
+        g_feedBuffer.resize(std::max<std::size_t>(size, 1u));
+        return pointerToJsAddress(g_feedBuffer.data());
+    } catch (...) {
+        g_error = "Synth feed could not obtain more memory from the browser/OS";
+        return 0.0;
+    }
+#else
+    (void)byteCount;
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_buffer_size_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_feedBuffer.size());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_buffer_ptr_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_feedBuffer.empty() ? 0.0 : pointerToJsAddress(g_feedBuffer.data());
+#else
+    return 0.0;
+#endif
+}
+
+// Coordinator: the helper image into the feed buffer (0 when the source is not the
+// compressed slabs, e.g. a raw in-memory source).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_image_js()
+{
+#if WASMIDI_PARSER_BPFA
+    try { return g_mappedStore.exportFeedImage(g_feedBuffer) ? 1 : 0; }
+    catch (...) { g_error = "Synth feed image ran out of memory"; return 0; }
+#else
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_source_slab_count_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.sourceSlabCount());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_source_slab_ptr_js(double index)
+{
+#if WASMIDI_PARSER_BPFA
+    if (!jsExactNonNegativeInteger(index) || index >= double(g_mappedStore.sourceSlabCount())) return 0.0;
+    return pointerToJsAddress(g_mappedStore.sourceSlab(static_cast<std::size_t>(index)));
+#else
+    (void)index;
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_source_slab_bytes_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(wasmidi::BpfaMidiStore::sourceSlabBytes());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_request_js(double firstBlock, double blocks, double chunks)
+{
+#if WASMIDI_PARSER_BPFA
+    if (!jsExactNonNegativeInteger(firstBlock) || !jsExactNonNegativeInteger(blocks) || !jsExactNonNegativeInteger(chunks)) {
+        g_error = "Invalid synth feed request";
+        return 0;
+    }
+    try {
+        if (!g_mappedStore.buildFeedRequest(static_cast<uint64_t>(firstBlock), static_cast<uint32_t>(std::min(blocks, 64.0)),
+                                            static_cast<uint32_t>(std::min(chunks, 4096.0)), g_feedBuffer)) {
+            g_error = "Could not plan the synth feed request";
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Synth feed request ran out of memory";
+        return 0;
+    }
+#else
+    (void)firstBlock; (void)blocks; (void)chunks;
+    return 0;
+#endif
+}
+
+// Coordinator: stitches the result the page copied into the feed buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_stitch_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid synth feed result"; return 0; }
+    try {
+        if (!g_mappedStore.stitchFeedResult(g_feedBuffer.data(), size, g_eventBatch, g_eventBatchTimes,
+                                            g_sysExBatchEvents, g_sysExBatchBytes, g_feedSafeSeconds, g_feedComplete)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Synth feed stitch ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_helper_init_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid synth feed image"; return 0; }
+    try {
+        if (!g_mappedStore.importFeedImage(g_feedBuffer.data(), size, feedSlabFetch, nullptr)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Synth feed helper ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+// Helper: decodes the request in the feed buffer; the result replaces the buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_feed_decode_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid synth feed request"; return 0; }
+    try {
+        std::vector<uint8_t> request(g_feedBuffer.begin(), g_feedBuffer.begin() + std::ptrdiff_t(size));
+        if (!g_mappedStore.decodeFeedRequest(request.data(), request.size(), g_feedBuffer)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Synth feed helper ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
 }
 
 #ifdef __EMSCRIPTEN__

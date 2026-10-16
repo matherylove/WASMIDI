@@ -3,7 +3,8 @@
 "use strict";
 
 // Parallel MIDI load helper (HANDOFF sec. 60): indexes a contiguous range of tracks
-// with the same Memory64 parser core and returns the partial index as one buffer.
+// with the same Memory64 parser core and returns the partial index as one buffer. The
+// same script runs the synth feed helpers (HANDOFF sec. 70).
 
 let corePromise = null;
 
@@ -35,8 +36,49 @@ function errorText(Module, fallback) {
     return fallback;
 }
 
+// Synth feed helper (HANDOFF sec. 70): decodes spans of admission blocks for the parser
+// Worker from the compressed source slabs it shares (SharedArrayBuffers).
+async function feedMessage(m) {
+    try {
+        const Module = await loadCore(m.baseUrl || feedBase.baseUrl, m.version || feedBase.version);
+        if (m.type === "feed-init") {
+            feedBase.baseUrl = m.baseUrl;
+            feedBase.version = m.version;
+            self.__wasmidiFeedSlabs = m.slabs;
+            self.__wasmidiFeedSlabBytes = m.slabBytes;
+            const image = new Uint8Array(m.image);
+            const ptr = Number(Module._wmp_feed_buffer_js(image.length));
+            if (!ptr)
+                throw new Error(errorText(Module, "No memory for the synth feed image"));
+            Module.HEAPU8.set(image, ptr);
+            if (!Module._wmp_feed_helper_init_js(image.length))
+                throw new Error(errorText(Module, "Invalid synth feed image"));
+            postMessage({ type: "feed-ready" });
+            return;
+        }
+        const request = new Uint8Array(m.request);
+        const ptr = Number(Module._wmp_feed_buffer_js(request.length));
+        if (!ptr)
+            throw new Error(errorText(Module, "No memory for the synth feed request"));
+        Module.HEAPU8.set(request, ptr);
+        if (!Module._wmp_feed_decode_js(request.length))
+            throw new Error(errorText(Module, "Synth feed decode failed"));
+        const out = Number(Module._wmp_feed_buffer_ptr_js());
+        const size = Number(Module._wmp_feed_buffer_size_js());
+        const result = Module.HEAPU8.slice(out, out + size);
+        postMessage({ type: "feed-result", id: m.id, result: result.buffer }, [result.buffer]);
+    } catch (error) {
+        postMessage({ type: "feed-error", message: error && error.message ? error.message : String(error) });
+    }
+}
+const feedBase = { baseUrl: "", version: "" };
+
 self.onmessage = async event => {
     const m = event.data || {};
+    if (m.type === "feed-init" || m.type === "feed-decode") {
+        await feedMessage(m);
+        return;
+    }
     if (m.type !== "partial")
         return;
     try {

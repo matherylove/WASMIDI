@@ -227,11 +227,11 @@ static void ssw_note_fifo_clear_all(void) {
     for (int i = 0; i < 16 * 128; ++i) { g_note_fifo[i].head = 0; g_note_fifo[i].size = 0; }
 }
 
-static void ssw_note_fifo_push(int key, int kept) {
+static void ssw_note_fifo_push(int key, int kept, uint32_t count) {
     ssw_note_fifo* f = &g_note_fifo[key];
     if (f->size) {
         ssw_note_run* last = &f->runs[(f->head + f->size - 1) % f->cap];
-        if (last->kept == (uint8_t)kept && last->count < 0xffffffffu) { ++last->count; return; }
+        if (last->kept == (uint8_t)kept && last->count <= 0xffffffffu - count) { last->count += count; return; }
     }
     if (f->size == f->cap) {
         const uint32_t cap = f->cap ? f->cap * 2 : 4;
@@ -243,17 +243,24 @@ static void ssw_note_fifo_push(int key, int kept) {
         f->cap = cap;
         f->head = 0;
     }
-    f->runs[(f->head + f->size) % f->cap] = (ssw_note_run){1u, (uint8_t)kept};
+    f->runs[(f->head + f->size) % f->cap] = (ssw_note_run){count, (uint8_t)kept};
     ++f->size;
 }
 
-static int ssw_note_fifo_pop(int key) {
+/* Pops `count` note-ons (a stacked note-off, HANDOFF sec. 70); returns how many of
+ * them were kept. Note-offs with nothing to pair are kept. */
+static uint32_t ssw_note_fifo_pop(int key, uint32_t count) {
     ssw_note_fifo* f = &g_note_fifo[key];
-    if (!f->size) return 1;
-    ssw_note_run* first = &f->runs[f->head];
-    const int kept = first->kept;
-    if (--first->count == 0) { f->head = (f->head + 1) % f->cap; --f->size; }
-    return kept;
+    uint32_t kept = 0;
+    while (count && f->size) {
+        ssw_note_run* first = &f->runs[f->head];
+        const uint32_t take = first->count < count ? first->count : count;
+        if (first->kept) kept += take;
+        count -= take;
+        first->count -= take;
+        if (first->count == 0) { f->head = (f->head + 1) % f->cap; --f->size; }
+    }
+    return kept + count;
 }
 
 void ssw_set_admission_percent(int percent) { g_admission_percent = percent < 0 ? 0 : percent; }
@@ -614,7 +621,7 @@ static void dispatch_midi_part_event_at_qpc(int part, int cmd, int b1, int b2,
             if (b2 > 0) voice_send_note_event_at(part, b1, b2, 1, stack_count, timestamp_qpc);
             else voice_send_note_event_at(part, b1, 0, 0, 1, timestamp_qpc);
             break;
-        case 0x80: voice_send_note_event_at(part, b1, 0, 0, 1, timestamp_qpc); break;
+        case 0x80: voice_send_note_event_at(part, b1, 0, 0, stack_count, timestamp_qpc); break;
         case 0xB0: voice_control_change_at(part, b1, b2, timestamp_qpc); break;
         case 0xC0: voice_program_change_at(part, b1, timestamp_qpc); break;
         case 0xE0: voice_pitch_bend_at(part, b1, b2, timestamp_qpc); break;
@@ -878,7 +885,7 @@ static void dispatch_short_at_qpc(uint32_t msg, int64_t timestamp_qpc) {
             if (b2 > 0) voice_send_note_event_at(ch, b1, b2, 1, stack_count, timestamp_qpc);
             else voice_send_note_event_at(ch, b1, 0, 0, 1, timestamp_qpc);
             break;
-        case 0x80: voice_send_note_event_at(ch, b1, 0, 0, 1, timestamp_qpc); break;
+        case 0x80: voice_send_note_event_at(ch, b1, 0, 0, stack_count, timestamp_qpc); break;
         case 0xB0: voice_control_change_at(ch, b1, b2, timestamp_qpc); break;
         case 0xC0: voice_program_change_at(ch, b1, timestamp_qpc); break;
         case 0xE0: voice_pitch_bend_at(ch, b1, b2, timestamp_qpc); break;
@@ -1571,11 +1578,18 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                             if (velocity < admit_threshold) kept = 0;
                             else if (velocity == admit_threshold) kept = admit_quota-- > 0;
                         }
-                        ssw_note_fifo_push(key, kept);
+                        ssw_note_fifo_push(key, kept, ((event->message >> 24) & 0xffu) + 1u);
                         if (!kept) { ++g_admission_dropped; ++block->index; continue; }
-                    } else if (!ssw_note_fifo_pop(key)) {
-                        ++block->index;
-                        continue;
+                    } else {
+                        const uint32_t stack = command == 0x80u ? ((event->message >> 24) & 0xffu) + 1u : 1u;
+                        const uint32_t kept = ssw_note_fifo_pop(key, stack);
+                        if (!kept) {
+                            ++block->index;
+                            continue;
+                        }
+                        if (kept != stack)
+                            block->events[block->index].message =
+                                (event->message & 0x00ffffffu) | ((kept - 1u) << 24);
                     }
                 }
                 {

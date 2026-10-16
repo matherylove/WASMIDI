@@ -169,14 +169,18 @@
             : "soundfont.sf2";
     }
 
-    // Dedicated synth MIDI feeder (HANDOFF §26-27): opt-in with ?synthsource=feeder.
+    // Synth MIDI source over a MessagePort. Default: the parser Worker answers the synth
+    // directly with admitted events (HANDOFF sec. 70). ?synthsource=feeder: the old JS
+    // feeder (HANDOFF §26-27). ?synthsource=relay: batches relayed by the page.
     let feeder = null;
     let feederPortForWorker = null;
     let localVelocityFloor = -1;
-    const localSourceAllowed = (() => {
-        try { return new URL(globalThis.location.href).searchParams.get("synthsource") === "feeder"; }
-        catch (_) { return false; }
+    const synthSource = (() => {
+        try { return new URL(globalThis.location.href).searchParams.get("synthsource") || ""; }
+        catch (_) { return ""; }
     })();
+    const localSourceAllowed = synthSource === "feeder";
+    const parserSourceAllowed = synthSource !== "feeder" && synthSource !== "relay";
 
     function deliverFeederPort() {
         if (worker && feederPortForWorker) {
@@ -195,8 +199,17 @@
         if (worker) worker.postMessage({ type: "feederPort", port: null });
     }
 
-    function setLocalMidiSource(file) {
+    function setLocalMidiSource(file, parserWorker) {
         clearLocalMidiSource();
+        if (parserSourceAllowed && parserWorker && typeof MessageChannel === "function") {
+            const channel = new MessageChannel();
+            parserWorker.postMessage({ type: "feeder-port", port: channel.port1 }, [channel.port1]);
+            feederPortForWorker = channel.port2;
+            state.localSynthReady = true;
+            state.localSynthLoadMs = 0;
+            deliverFeederPort();
+            return;
+        }
         if (!localSourceAllowed || !file || typeof Worker !== "function") return;
         feeder = new Worker("./synth-feeder-worker.js?v=13.12.0");
         const channel = new MessageChannel();

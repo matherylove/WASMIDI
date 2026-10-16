@@ -1136,8 +1136,365 @@ async function pumpSynthWindow(message) {
     }
 }
 
+// Synth feed (HANDOFF sec. 70): this Worker answers WasmiSynth's feeder port directly
+// (reset/fill/batch, the same protocol as synth-feeder-worker.js), so the main thread is
+// out of the audio path. The C++ store applies the synth's block admission before the
+// events leave the parser. With a compressed source, helper Workers decode spans of
+// admission blocks in parallel from shared copies of the compressed slabs and this
+// Worker stitches their results in order.
+const FEED_SPAN_BLOCKS = 4;
+const FEED_PREFETCH_SECONDS = 1.0;
+const FEED_FILL_BUDGET_MS = 12;
+const FEED_MAX_EVENTS = 262144;
+const FEED_HELPERS_MAX = 8;
+let feedPort = null;
+let feedGeneration = 0;
+let feedReady = false;
+let feedConfig = { voices: 1024, admission: 25, sampleRate: 48000, blockFrames: 512, velocityFloor: 0 };
+let feedHistory = null;
+let feedFill = null;
+let feedComplete = false;
+let feedPool = null;
+let feedPlanned = 0;
+let feedQueue = [];
+let feedSequence = 0;
+let feedSpanChunks = 2;
+
+function feedApplyConfig(Module, d) {
+    if (d) {
+        if (Number(d.voices) > 0) feedConfig.voices = Number(d.voices) | 0;
+        if (Number(d.sampleRate) > 0) feedConfig.sampleRate = Number(d.sampleRate);
+        if (Number(d.blockFrames) > 0) feedConfig.blockFrames = Number(d.blockFrames) | 0;
+        if (d.velocityFloor != null) feedConfig.velocityFloor = Math.max(0, Math.min(127, d.velocityFloor | 0));
+    }
+    Module._wmp_feed_config_js(feedConfig.voices, feedConfig.admission, feedConfig.sampleRate,
+        feedConfig.blockFrames, feedConfig.velocityFloor, FEED_SPAN_BLOCKS);
+}
+
+function feedTakeBatch(Module, out) {
+    const count = sizeToNumber(Module._wmp_event_batch_count_js(), "feed batch count");
+    if (count) {
+        const ptr = pointerToNumber(Module._wmp_event_batch_ptr_js(), "feed batch pointer");
+        const timePtr = pointerToNumber(Module._wmp_event_batch_time_ptr_js(), "feed time pointer");
+        const words = new Uint32Array(Module.HEAPU8.buffer, ptr, count * 2);
+        const messages = new Uint32Array(count);
+        for (let i = 0; i < count; ++i) messages[i] = words[i * 2 + 1];
+        out.messages.push(messages);
+        out.times.push(new Float64Array(Module.HEAPU8.buffer, timePtr, count).slice());
+    }
+    const sxCount = sizeToNumber(Module._wmp_sysex_batch_event_count_js(), "feed SysEx count");
+    const sxBytes = sizeToNumber(Module._wmp_sysex_batch_data_size_js(), "feed SysEx bytes");
+    if (sxCount && sxBytes) {
+        const meta = new Uint32Array(copyWasmBytes(Module, Module._wmp_sysex_batch_event_ptr_js(), sxCount * 12).buffer);
+        const data = copyWasmBytes(Module, Module._wmp_sysex_batch_data_ptr_js(), sxBytes);
+        out.sysex.push({ meta, data });
+    }
+    out.safe = Math.max(out.safe, Number(Module._wmp_feed_safe_seconds_js()) || 0);
+    if (Module._wmp_feed_complete_js()) out.complete = true;
+}
+
+function feedPostBatch(Module, generation, out) {
+    let total = 0;
+    for (const m of out.messages) total += m.length;
+    const prefix = feedHistory;
+    feedHistory = null;
+    const selector = prefix ? prefix.selector : null;
+    const selectorCount = selector ? selector.length : 0;
+    const messages = new Uint32Array(selectorCount + total);
+    const times = new Float64Array(selectorCount + total);
+    if (selectorCount) {
+        messages.set(selector, 0);
+        times.fill(prefix.time, 0, selectorCount);
+    }
+    let at = selectorCount;
+    for (let k = 0; k < out.messages.length; ++k) {
+        messages.set(out.messages[k], at);
+        times.set(out.times[k], at);
+        at += out.messages[k].length;
+    }
+    const parts = [];
+    if (prefix && prefix.sysexMeta && prefix.sysexData)
+        parts.push({ meta: prefix.sysexMeta, data: prefix.sysexData, time: prefix.time });
+    for (const p of out.sysex) parts.push(p);
+    let sxCount = 0, sxBytes = 0;
+    for (const p of parts) { sxCount += Math.floor(p.meta.length / 3); sxBytes += p.data.length; }
+    const sysexMeta = new Uint32Array(sxCount * 3);
+    const sysexData = new Uint8Array(sxBytes);
+    const sysexTimes = new Float64Array(sxCount);
+    let mi = 0, di = 0;
+    let lastTick = 0xffffffff, lastTime = 0;
+    for (const p of parts) {
+        const n = Math.floor(p.meta.length / 3);
+        sysexData.set(p.data, di);
+        for (let i = 0; i < n; ++i, ++mi) {
+            const tick = p.meta[i * 3] >>> 0;
+            sysexMeta[mi * 3] = tick;
+            sysexMeta[mi * 3 + 1] = (p.meta[i * 3 + 1] + di) >>> 0;
+            sysexMeta[mi * 3 + 2] = p.meta[i * 3 + 2] >>> 0;
+            if (p.time != null) {
+                sysexTimes[mi] = p.time;
+            } else {
+                if (tick !== lastTick) {
+                    lastTick = tick;
+                    lastTime = Math.max(0, Number(Module._wmp_tick_to_seconds_js(tick)) || 0);
+                }
+                sysexTimes[mi] = lastTime;
+            }
+        }
+        di += p.data.length;
+    }
+    feedPort.postMessage({
+        type: "batch",
+        generation,
+        messages, times, sysexMeta, sysexData, sysexTimes,
+        safeUntil: out.complete ? Math.max(out.safe, 1e9) : out.safe
+    }, [messages.buffer, times.buffer, sysexMeta.buffer, sysexData.buffer, sysexTimes.buffer]);
+}
+
+async function feedReset(d) {
+    const Module = await getModule();
+    if (!mappedFileReady) return;
+    feedGeneration = d.generation >>> 0;
+    feedFill = null;
+    feedComplete = false;
+    feedQueue = [];
+    if (feedPool) feedPool.pending = [];
+    ++feedSequence;
+    const time = Math.max(0, Number(d.time) || 0);
+    const tick = Math.max(0, Math.floor(Number(Module._wmp_seconds_to_tick_js(time)) || 0));
+    feedApplyConfig(Module, d);
+    Module._wmp_feed_reset_js(tick);
+    feedPlanned = Number(Module._wmp_feed_block_js()) || 0;
+
+    // Seek state, as resetSynthCursor() restores it for the relayed path.
+    const history = { time: Math.max(0, Number(Module._wmp_tick_to_seconds_js(tick)) || 0) };
+    if (!Module._wmp_build_historical_sysex_js(tick))
+        throw new Error(parserErrorText(Module, "Could not restore mapped SysEx state"));
+    const hCount = sizeToNumber(Module._wmp_sysex_batch_event_count_js(), "historical SysEx count");
+    const hBytes = sizeToNumber(Module._wmp_sysex_batch_data_size_js(), "historical SysEx bytes");
+    if (hCount && hBytes) {
+        history.sysexMeta = new Uint32Array(copyWasmBytes(Module, Module._wmp_sysex_batch_event_ptr_js(), hCount * 12).buffer);
+        history.sysexData = copyWasmBytes(Module, Module._wmp_sysex_batch_data_ptr_js(), hBytes);
+    }
+    if (!Module._wmp_build_historical_selector_state_js(tick))
+        throw new Error(parserErrorText(Module, "Could not restore mapped bank/program state"));
+    const sCount = sizeToNumber(Module._wmp_historical_selector_state_count_js(), "selector count");
+    if (sCount) {
+        const ptr = pointerToNumber(Module._wmp_historical_selector_state_ptr_js(), "selector pointer");
+        const words = new Uint32Array(Module.HEAPU8.buffer, ptr, sCount * 2);
+        history.selector = new Uint32Array(sCount);
+        for (let i = 0; i < sCount; ++i) history.selector[i] = words[i * 2 + 1];
+    }
+    feedHistory = history;
+}
+
+async function feedOnFill(d) {
+    const Module = await getModule();
+    if (!mappedFileReady || (d.generation >>> 0) !== feedGeneration) return;
+    if ((d.velocityFloor != null && (d.velocityFloor | 0) !== feedConfig.velocityFloor) ||
+        (Number(d.voices) > 0 && (Number(d.voices) | 0) !== feedConfig.voices))
+        feedApplyConfig(Module, d);
+    feedFill = { generation: feedGeneration, target: Math.max(0, Number(d.target) || 0) };
+    if (feedPool && feedPool.ready) feedPump(Module);
+    else feedFillSequential(Module);
+}
+
+function feedFillSequential(Module) {
+    const fill = feedFill;
+    if (!fill) return;
+    feedFill = null;
+    const out = { messages: [], times: [], sysex: [], safe: 0, complete: false };
+    const started = performance.now();
+    let events = 0;
+    do {
+        if (!Module._wmp_feed_build_js(fill.target, FEED_MAX_EVENTS))
+            throw new Error(parserErrorText(Module, "Could not build the synth feed"));
+        feedTakeBatch(Module, out);
+        events += sizeToNumber(Module._wmp_event_batch_count_js(), "feed batch count");
+    } while (!out.complete && out.safe < fill.target && events < FEED_MAX_EVENTS &&
+             performance.now() - started < FEED_FILL_BUDGET_MS);
+    feedPostBatch(Module, fill.generation, out);
+}
+
+// ---- Helper pool ----
+
+function feedHelperCount() {
+    const cores = Number(self.navigator && self.navigator.hardwareConcurrency) || 1;
+    return Math.min(FEED_HELPERS_MAX, Math.max(0, Math.floor(cores / 3)));
+}
+
+async function feedStartPool() {
+    const Module = await getModule();
+    const helpers = feedHelperCount();
+    if (feedPool || helpers < 2 || typeof SharedArrayBuffer !== "function" || !self.crossOriginIsolated)
+        return;
+    if (!Module._wmp_feed_image_js()) return;
+    const image = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(), sizeToNumber(Module._wmp_feed_buffer_size_js(), "feed image size"));
+    // Longer spans with many tracks: each span resumes every track from a checkpoint.
+    const trackCount = new Uint32Array(image.buffer, 0, 2)[1];
+    feedSpanChunks = trackCount < 256 ? 2 : trackCount < 2048 ? 4 : 8;
+    const slabBytes = sizeToNumber(Module._wmp_source_slab_bytes_js(), "slab size");
+    const slabCount = sizeToNumber(Module._wmp_source_slab_count_js(), "slab count");
+    const slabs = [];
+    try {
+        for (let i = 0; i < slabCount; ++i) {
+            const ptr = pointerToNumber(Module._wmp_source_slab_ptr_js(i), "slab pointer");
+            const sab = new SharedArrayBuffer(slabBytes);
+            new Uint8Array(sab).set(Module.HEAPU8.subarray(ptr, ptr + slabBytes));
+            slabs.push(sab);
+        }
+    } catch (error) {
+        console.warn("[WASMIDI synth feed] no memory for shared source slabs; decoding on one thread", error);
+        return;
+    }
+    const url = new URL("midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
+        WASMIDI_MIDI_PARSER_BASE_URL).href;
+    const pool = { ready: false, failed: false, helpers: [], pending: [] };
+    feedPool = pool;
+    const inits = [];
+    for (let h = 0; h < helpers; ++h) {
+        const worker = new Worker(url);
+        const helper = { worker, busy: null };
+        pool.helpers.push(helper);
+        inits.push(new Promise((resolve, reject) => {
+            worker.onmessage = event => {
+                const m = event.data || {};
+                if (m.type === "feed-ready") resolve();
+                else if (m.type === "feed-result") feedOnResult(helper, m);
+                else if (m.type === "feed-error") {
+                    reject(new Error(m.message || "Synth feed helper failed"));
+                    feedPoolFailed(m.message);
+                }
+            };
+            worker.onerror = event => {
+                const text = (event && event.message) || "Synth feed helper crashed";
+                reject(new Error(text));
+                feedPoolFailed(text);
+            };
+        }));
+        const copy = image.slice();
+        worker.postMessage({
+            type: "feed-init", baseUrl: WASMIDI_MIDI_PARSER_BASE_URL, version: WASMIDI_MIDI_PARSER_BOOTSTRAP,
+            image: copy.buffer, slabs, slabBytes
+        }, [copy.buffer]);
+    }
+    try {
+        await Promise.all(inits);
+        if (feedPool !== pool || pool.failed) return;
+        pool.ready = true;
+        console.info("[WASMIDI synth feed] " + helpers + " decode helpers, " +
+            (slabCount * slabBytes / 1048576).toFixed(0) + " MiB shared source");
+        if (feedFill) feedPump(Module);
+    } catch (_) {}
+}
+
+function feedPoolFailed(message) {
+    const pool = feedPool;
+    if (!pool || pool.failed) return;
+    pool.failed = true;
+    pool.ready = false;
+    console.warn("[WASMIDI synth feed] helpers stopped; decoding on one thread:", message);
+    for (const h of pool.helpers) { try { h.worker.terminate(); } catch (_) {} }
+    feedQueue = [];
+    ++feedSequence;
+    // Restart the sequential feed exactly where the stitch stopped.
+    getModule().then(Module => { if (feedFill) feedFillSequential(Module); });
+}
+
+function feedDispatch() {
+    const pool = feedPool;
+    if (!pool || !pool.ready) return;
+    for (const helper of pool.helpers) {
+        if (helper.busy) continue;
+        const entry = pool.pending.shift();
+        if (!entry) return;
+        helper.busy = entry;
+        helper.worker.postMessage({ type: "feed-decode", id: entry.id, request: entry.request.buffer },
+            [entry.request.buffer]);
+        entry.request = null;
+    }
+}
+
+function feedOnResult(helper, m) {
+    const entry = helper.busy;
+    helper.busy = null;
+    if (entry && entry.id === m.id && entry.sequence === feedSequence) {
+        entry.result = new Uint8Array(m.result);
+        getModule().then(Module => feedPump(Module));
+    }
+    feedDispatch();
+}
+
+function feedPump(Module) {
+    const pool = feedPool;
+    if (!pool || !pool.ready) return;
+    const blockSeconds = Number(Module._wmp_feed_block_seconds_js()) || (512 / 48000);
+    const fill = feedFill;
+    // Plan spans ahead of what the synth asked for.
+    const horizon = (fill ? fill.target : 0) + FEED_PREFETCH_SECONDS;
+    const spanBlocks = FEED_SPAN_BLOCKS * feedSpanChunks;
+    // The sequential path may have moved the feed while the pool was starting.
+    if (!feedQueue.length) feedPlanned = Number(Module._wmp_feed_block_js()) || 0;
+    while (!feedComplete && feedQueue.length < pool.helpers.length * 2 && feedPlanned * blockSeconds < horizon) {
+        if (!Module._wmp_feed_request_js(feedPlanned, FEED_SPAN_BLOCKS, feedSpanChunks))
+            throw new Error(parserErrorText(Module, "Could not plan the synth feed"));
+        const request = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(),
+            sizeToNumber(Module._wmp_feed_buffer_size_js(), "feed request size"));
+        pool.lastId = (pool.lastId || 0) + 1;
+        const entry = { id: pool.lastId, sequence: feedSequence, request, result: null };
+        feedQueue.push(entry);
+        pool.pending.push(entry);
+        feedPlanned += spanBlocks;
+    }
+    feedDispatch();
+    if (!fill) return;
+    // Stitch finished spans in order until the fill is covered.
+    const out = { messages: [], times: [], sysex: [], safe: 0, complete: false };
+    let stitched = false;
+    while (feedQueue.length && feedQueue[0].result && !out.complete) {
+        const entry = feedQueue.shift();
+        const ptr = pointerToNumber(Module._wmp_feed_buffer_js(entry.result.length), "feed buffer");
+        if (!ptr) throw new Error(parserErrorText(Module, "Could not allocate the feed buffer"));
+        Module.HEAPU8.set(entry.result, ptr);
+        if (!Module._wmp_feed_stitch_js(entry.result.length))
+            throw new Error(parserErrorText(Module, "Could not stitch the synth feed"));
+        feedTakeBatch(Module, out);
+        stitched = true;
+        if (out.safe >= fill.target) break;
+    }
+    if (out.complete) feedComplete = true;
+    if (!stitched) return;
+    feedFill = null;
+    feedPostBatch(Module, fill.generation, out);
+    if (feedQueue.length < pool.helpers.length * 2) feedPump(Module);
+}
+
+function feedAttachPort(port) {
+    if (feedPort) { try { feedPort.close(); } catch (_) {} }
+    feedPort = port || null;
+    if (!feedPort) return;
+    feedPort.onmessage = event => {
+        const d = event.data || {};
+        const run = async () => {
+            if (d.type === "reset") await feedReset(d);
+            else if (d.type === "fill") await feedOnFill(d);
+        };
+        run().catch(error => {
+            console.error("[WASMIDI synth feed]", error);
+            postMessage({ type: "runtime-error", requestType: "synth-feed",
+                message: error && error.message ? error.message : String(error) });
+        });
+    };
+    feedPort.start();
+    feedStartPool().catch(error => console.warn("[WASMIDI synth feed] helper pool unavailable", error));
+}
+
 self.onmessage = async event => {
     const message = event.data || {};
+    if (message.type === "feeder-port") {
+        feedAttachPort(message.port);
+        return;
+    }
     try {
         if (message.type === "sharp-render") {
             await requestSharpRenderer(message);

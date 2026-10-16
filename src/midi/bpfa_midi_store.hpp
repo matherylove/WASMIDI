@@ -69,6 +69,64 @@ public:
                               std::vector<uint8_t>& sysExBytes);
     bool buildHistoricalSelectorState(uint32_t startTick, std::vector<EventWord>& output);
 
+    // Synth feed (HANDOFF sec. 70): the event stream already thinned by the synth's block
+    // admission, decoded track by track per window instead of through the merge heap.
+    struct SynthFeedConfig {
+        uint32_t maxVoices = 1024;
+        uint32_t admissionPercent = 25;   // 0 = keep every note-on
+        uint32_t sampleRate = 48000;
+        uint32_t blockFrames = 512;
+        uint32_t velocityFloor = 0;
+        uint32_t windowBlocks = 4;
+    };
+    struct SynthFeedStats {
+        uint64_t decoded = 0;
+        uint64_t noteOns = 0;
+        uint64_t droppedNoteOns = 0;
+        uint64_t droppedNoteOffs = 0;
+    };
+    void setSynthFeedConfig(const SynthFeedConfig& config) { feedConfig_ = config; }
+    void resetSynthFeed(uint32_t startTick);
+    // Emits every admitted event of whole admission windows until the window that
+    // reaches endSeconds or until maxEvents is passed. safeSeconds: everything before
+    // it has been emitted. complete: the song has no events left.
+    bool buildSynthFeed(double endSeconds, std::size_t maxEvents, std::vector<EventWord>& output,
+                        std::vector<double>& times, std::vector<SysExBatchEvent>& sysExEvents,
+                        std::vector<uint8_t>& sysExBytes, double& safeSeconds, bool& complete);
+    const SynthFeedStats& synthFeedStats() const { return feedStats_; }
+
+    // Parallel synth feed (HANDOFF sec. 70). The feed is cut into chunks of whole admission
+    // blocks; a chunk is decoded with local note-off pairing (feedDecodeChunk) and then
+    // stitched in order against the carried pairing queues (feedStitch). buildSynthFeed does
+    // both on this store; decode helpers do the first half on their own instance with only
+    // the source and track ranges (exportFeedImage / importFeedImage).
+    struct FeedChunk {
+        uint64_t firstBlock = 0;
+        uint32_t blocks = 0;
+        uint32_t endTick = 0;
+        bool anyLeft = false;
+        SynthFeedStats stats;
+        std::vector<EventWord> events;          // (tick, track) order, stacked notes (high byte)
+        std::vector<uint32_t> deferred;         // (event index, track) of each deferred note-off
+        std::vector<uint32_t> pending;          // per key: track << 11 | key, runs, (count << 1 | kept)...
+    };
+    using FeedSourceFetch = bool (*)(void* user, uint64_t physicalOffset, uint8_t* destination, std::size_t length);
+    bool exportFeedImage(std::vector<uint8_t>& blob) const;
+    bool importFeedImage(const uint8_t* blob, std::size_t size, FeedSourceFetch fetch, void* fetchUser);
+    std::size_t sourceSlabCount() const { return sourceSlabs_.size(); }
+    const uint8_t* sourceSlab(std::size_t index) const { return sourceSlabs_[index].get(); }
+    static std::size_t sourceSlabBytes();
+    // Coordinator: the request of `chunks` consecutive chunks of `blocks` blocks from firstBlock.
+    bool buildFeedRequest(uint64_t firstBlock, uint32_t blocks, uint32_t chunks, std::vector<uint8_t>& request) const;
+    // Helper: decodes one request into serialized FeedChunks (cursors carried across them).
+    bool decodeFeedRequest(const uint8_t* request, std::size_t size, std::vector<uint8_t>& result);
+    // Coordinator: stitches the chunks of a result (results must arrive in block order).
+    bool stitchFeedResult(const uint8_t* result, std::size_t size, std::vector<EventWord>& output,
+                          std::vector<double>& times, std::vector<SysExBatchEvent>& sysExEvents,
+                          std::vector<uint8_t>& sysExBytes, double& safeSeconds, bool& complete);
+    uint64_t synthFeedBlock() const { return feedBlock_; }
+    double synthFeedBlockSeconds() const;
+
     void resetRenderCursor(uint32_t startTick, bool perTrackColors);
     bool buildRenderSweep(uint32_t endTick, std::size_t maxSourceEvents, std::vector<VisualNote>& appends,
                           std::vector<RenderClose>& closes, uint32_t& appendBase, bool& complete,
@@ -320,6 +378,54 @@ private:
 
     MergeCursor eventCursor_;
     std::size_t eventSysExCursor_ = 0;
+
+    struct FeedRun { uint32_t count = 0; uint32_t next = ~0u; uint8_t kept = 0; };
+    struct FeedQueue { uint32_t head = ~0u; uint32_t tail = ~0u; };
+    // Note-off pairing queues per (track, channel, key): runs of kept/dropped note-ons
+    // in a shared pool (a linked list per key; nearly always one run long).
+    struct FeedPairs {
+        std::vector<std::array<std::unique_ptr<FeedQueue[]>, 16>> heads;
+        std::vector<FeedRun> runs;
+        uint32_t freeRun = ~0u;
+        std::vector<uint32_t> touched;          // track << 11 | key that became non-empty
+        void reset(std::size_t tracks);
+        FeedQueue& queue(uint32_t track, uint32_t key);
+        void push(FeedQueue& queue, bool kept, uint32_t count, uint32_t trackKey);
+        // Pops up to count note-ons; kept: how many were kept; returns the count left unpaired.
+        uint32_t pop(FeedQueue& queue, uint32_t count, uint32_t& kept);
+    };
+    // Decoded feed event; the empty constructor keeps vector growth from zero-filling the
+    // room reserved ahead of the decode loop.
+    struct FeedWord { uint32_t tick; uint32_t packed; FeedWord() {} FeedWord(uint32_t t, uint32_t m) : tick(t), packed(m) {} };
+    void decodeTrackUntil(Cursor& cursor, uint32_t endTick, std::vector<FeedWord>& out);
+    void foldEvent(std::vector<FeedWord>& out, std::size_t& used, uint32_t tick, uint32_t message);
+    std::array<uint32_t, 4096> unitTag_{}, unitAt_{};
+    uint32_t unitGen_ = 0, unitTick_ = ~0u;
+    void feedEdges(uint64_t firstBlock, uint32_t blocks, uint32_t* edge) const;
+    void feedDecodeChunk(std::vector<Cursor>& cursors, const uint32_t* edge, uint32_t blocks, uint32_t admit,
+                         uint8_t velocityFloor, FeedChunk& out);
+    void feedStitch(const FeedChunk& chunk, std::vector<EventWord>& output, std::vector<double>& times,
+                    std::vector<SysExBatchEvent>& sysExEvents, std::vector<uint8_t>& sysExBytes,
+                    double& safeSeconds, bool& complete);
+    uint32_t feedAdmit() const;
+    SynthFeedConfig feedConfig_;
+    SynthFeedStats feedStats_;
+    MergeCursor feedCursor_;
+    std::size_t feedSysExCursor_ = 0;
+    uint64_t feedBlock_ = 0;       // next admission block (absolute, from song time 0)
+    uint32_t feedStartTick_ = 0;   // seek tick of the current feed
+    uint32_t feedTick_ = 0;        // events before this tick were consumed
+    uint32_t feedCursorTick_ = 0;  // where feedCursor_ stands (sequential path)
+    bool feedValid_ = false;
+    std::vector<FeedWord> feedRaw_;
+    std::vector<EventWord> feedKept_;
+    std::vector<uint32_t> feedKeptTrack_;     // bit 31: deferred note-off
+    std::vector<uint32_t> feedTrackEnd_, feedOrder_;
+    FeedPairs feedCarried_, feedLocal_;
+    FeedChunk feedChunk_;
+    FeedSourceFetch externalFetch_ = nullptr;
+    void* externalFetchUser_ = nullptr;
+    mutable std::vector<uint8_t> externalScratch_;
 
     MergeCursor renderCursor_;
     bool renderPerTrackColors_ = false;
