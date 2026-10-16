@@ -1650,6 +1650,7 @@ double wmp_visual_span_end_js(double startTick, double sourceEvents)
 {
 #if WASMIDI_PARSER_BPFA
     if (!jsExactNonNegativeInteger(startTick) || startTick > 4294967295.0 || !(sourceEvents >= 1.0)) return 0.0;
+    if (!g_mappedStore.visualRoomAhead()) return startTick;
     return static_cast<double>(g_mappedStore.visualSpanEnd(static_cast<uint32_t>(startTick),
                                                            static_cast<uint64_t>(std::min(sourceEvents, 1.0e12))));
 #else

@@ -136,6 +136,8 @@ public:
     void setVisualAutoDecode(bool enabled) { visualAutoDecode_ = enabled; }
     uint32_t visualStreamHead() const { return visHead_; }
     bool visualStreamDone() const { return visDone_; }
+    // False while the stream holds VisualPlanWords past the live snapshot: no new span.
+    bool visualRoomAhead() const;
     // End tick of a span from startTick that holds about sourceEvents events (from the density).
     uint32_t visualSpanEnd(uint32_t startTick, uint64_t sourceEvents) const;
     bool decodeVisualLocal(uint32_t endTick);
@@ -238,10 +240,13 @@ private:
         uint64_t byteBegin = 0;
         uint64_t byteEnd = 0;
         uint32_t maxTick = 0;
+        uint64_t channelEnd = 0;  // just past the last channel event (rev. 82)
         std::vector<TrackCheckpoint> checkpoints;
         std::vector<VisualSnapshot> snapshots;
         std::vector<LiveSnapshotPoint> liveSnapshots;
     };
+    // Cursors stop after the last channel event: a tempo-only tail is never re-read.
+    static uint64_t cursorEnd(const TrackStorage& t) { return t.channelEnd ? t.channelEnd : t.byteEnd; }
     struct SysExRef {
         uint32_t tick = 0;
         uint16_t track = 0;

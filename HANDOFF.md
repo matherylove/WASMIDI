@@ -5111,3 +5111,56 @@ lo mismo que el modo GPU sin pilas (§75).
 - El roll sin cuadros: faltan las líneas `[WASMIDI visual]` (`?visualdebug=1`) y saber si era
   modo CPU o GPU (en GPU, el kernel del synth y el WebGL del roll comparten la GPU).
 - Abaratar el robo en modo 0.
+
+## 78. Revisión 82 — El roll ya no se atrasa en 829-858 s de The Nuker 4 y el teclado no se congela ahí
+
+**Pedido:** el log de `visual-bench.html` de la canción entera (24 núcleos, 8 helpers, modo GPU,
+24 workers) muestra el roll atrasado solo en 829-858 s (hasta 8,9 s detrás). El audio iba bien.
+
+**Causa del roll:** los helpers tardaban el doble en decodificar cada tramo del flujo visual con
+el archivo entero que con un recorte de la misma zona (host: 1,30 contra 0,62 s por segundo de
+canción). Cada tramo reposiciona las 30 pistas desde su checkpoint, y los checkpoints se ponen
+cada 256 eventos de canal. La pista 0 de The Nuker 4 es la de tempo: 1,9 MB sin un solo evento
+de canal, así que su único checkpoint es el inicio y `decodeNext` la leía entera (con ~30
+bloques zstd) en **cada** tramo buscando un evento de canal que no existe. En la zona densa
+hay ~250 tramos por segundo de canción. El recorte tiene una pista de tempo corta y no lo
+sufría.
+
+**Causa del teclado (apareció al arreglar el roll):** el flujo visual se recortaba a 8 M palabras.
+El teclado lo lee en el tiempo de reproducción y el roll ~2 s adelante; a ~4,3 M palabras por
+segundo (830 s) la ventana entre los dos pasa de 8 M, el recorte le quitaba al teclado sus
+palabras y el teclado caía al camino lento (merge sin plegar): ~1,2 s congelado cada ~3 s. Antes
+no se veía porque el roll iba atrasado y el flujo nunca crecía tanto.
+
+**Cambios:**
+
+1. `TrackStorage::channelEnd`: byte siguiente al último evento de canal de la pista (se anota en
+   el escaneo, viaja en la imagen del feed y en la carga paralela). Todos los cursores que leen
+   eventos de canal (`mergeReset`, feed, tramos visuales, reconstrucciones del teclado) terminan
+   ahí (`cursorEnd`): una pista solo de tempo queda terminada al instante y una cola sin notas
+   no se relee. La salida no cambia.
+2. Flujo visual: se guardan hasta 48 M palabras (antes 8 M) y no se planea otro tramo mientras
+   haya 32 M palabras detrás del teclado (`visualRoomAhead`, también en
+   `wmp_visual_span_end_js` y en la decodificación local). Así el recorte forzado no le quita
+   palabras al teclado; si una zona necesitara más, el roll se adelanta menos en vez de congelar
+   el teclado.
+
+**Medición:**
+
+| | Antes | Ahora |
+|---|---|---|
+| Host, decode de los helpers en 832-836 s, archivo entero | 1,30 s por s de canción (posicionar 3,3 s de 6,6) | **0,63 s** (igual que el recorte) |
+| Host, 826-840 s, 2 s de adelanto: caídas del teclado al merge / recortes forzados | 156 / 4169 | **0 / 0**; teclado 0,14 → 0,06 s por s |
+| Chromium (4 hilos, `?helpers=3`), archivo entero, 826-840 s: cuadros con el roll atrasado | 846 de 852 (hasta 10,5 s) | **0 de 860**, adelanto ~1,97 s |
+| Igual, teclado | 59,4/s (el roll atrasado) / 36,6/s solo con el arreglo 1 | **60,1/s**, latencia media 2,9 ms |
+| Host, feed del synth con 3 helpers, 826-834 s | 1,03 s | 1,05 s (sin cambio: sus pedidos son 32× más largos) |
+
+**Verificación:** `feeder_check/check.sh` 24 IDENTICAL, ningún DIFFER; `visual_check` con el
+archivo entero: roll, cierres y teclado IDENTICAL entre merge, flujo local y helpers;
+`feed_parallel` IDENTICAL; pruebas de host del CI y compilación local pasan.
+
+**Pendiente / no verificado:**
+
+- En las PCs del usuario con la canción entera (24 núcleos, 8 helpers). Memoria: el flujo puede
+  llegar a ~480 MB en zonas que lo necesiten (antes ~80 MB); a 4,3 M palabras/s usa ~100 MB.
+- Siguen abiertos los crujidos a 24576 voces y el robo caro en modo "Stack gain".
