@@ -8,9 +8,10 @@
   python3 tools/browser_bench.py shot PAGE OUT.png      screenshot (e.g. audio.html)
 
 Options: --url http://127.0.0.1:8080  --headed
-Chromium: Playwright's (PLAYWRIGHT_BROWSERS_PATH, e.g. /opt/pw-browsers). Headless
+Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
 Chromium normally has no real GPU: WebGPU results there are not representative."""
 import asyncio
+import os
 import sys
 
 from playwright.async_api import async_playwright
@@ -19,6 +20,8 @@ args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = [a for a in sys.argv[1:] if a.startswith("--")]
 url = next((f.split("=", 1)[1] for f in flags if f.startswith("--url=")), "http://127.0.0.1:8080")
 headed = "--headed" in flags
+chromium = os.environ.get("WASMIDI_CHROMIUM") or (
+    "/opt/pw-browsers/chromium" if os.path.exists("/opt/pw-browsers/chromium") else None)
 
 
 async def main():
@@ -27,7 +30,7 @@ async def main():
     mode = args[0]
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=not headed,
+            headless=not headed, executable_path=chromium,
             args=["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--autoplay-policy=no-user-gesture-required"])
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
         page.on("console", lambda m: print("[console]", m.type, m.text) if m.type in ("error", "warning") else None)

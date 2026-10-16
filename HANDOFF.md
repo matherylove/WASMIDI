@@ -4489,3 +4489,29 @@ Revisión anterior entregada: `wasmidi-main-rev73-gpu-audio-windows.zip`.
 correr (sin red).
 
 Última revisión entregada: `wasmidi-main-rev73.1-claude-code.zip`.
+
+## 69. Revisión 73.2 — primer build local en Claude Code
+
+**Pedido:** comprobar si el entorno de Claude Code puede correr `tools/dev_setup.sh`
+(el host anterior no podía).
+
+**Resultado:** contenedor de 4 núcleos, 15 GB, con red. `dev_setup.sh` instala emsdk
+3.1.56, Qt 6.8.3 (`gcc_64` y `wasm_singlethread`) y Playwright; Qt necesitó permitir
+`download.qt.io` en la red del entorno. `local_build.sh` compila los 79 objetos y arma
+`site/` (≈5 min con las pruebas de host).
+
+**Causas y cambios:**
+- La validación del parser (`midi_parser_bootstrap_smoke.cjs`) fallaba con
+  `Cannot convert a BigInt value to a number` al crecer la memoria: el `node` del PATH
+  era Node 22 y el CI usa Node 24 (Memory64). `tools/dev_env.sh` antepone al PATH el
+  Node 24 que trae emsdk.
+- `browser_bench.py` no arrancaba: el Playwright de pip (1.64) pide un build de Chromium
+  distinto del preinstalado. Ahora usa `$WASMIDI_CHROMIUM`, o `/opt/pw-browsers/chromium`
+  si existe, o el de Playwright.
+- Bit de ejecución en `dev_setup.sh`, `local_build.sh` y los `.py` de `tools/` con shebang.
+
+**Verificado:** build completo y validaciones del CI en verde con Node 24;
+`browser_bench.py shot` captura `index.html` y `audio.html` y ambas páginas cargan.
+
+**No verificado:** benchmarks con `Hypernova.mid` y `MatheryLSD.sf2` (no están en
+`tools/data/`); WebGPU (Chromium headless sin GPU real).
