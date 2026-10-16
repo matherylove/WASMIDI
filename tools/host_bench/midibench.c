@@ -20,6 +20,7 @@ void ssw_set_steal_cap_percent(int) __attribute__((weak));
 int ssw_admission_dropped(void) __attribute__((weak));
 void ssw_set_render_limit_percent(int);
 void ssw_set_deterministic(int) __attribute__((weak));
+void ssw_set_vor_mode(int);
 int ssw_wgpu_set_enabled(int); void ssw_wgpu_begin_block(void); void ssw_wgpu_set_frame_base(int);
 uintptr_t ssw_wgpu_requests_ptr(void); int ssw_wgpu_request_count(void);
 int ssw_wgpu_collect_samples(uintptr_t, int, uintptr_t); float ssw_global_mix_gain(void);
@@ -31,7 +32,7 @@ typedef struct {
     uint32_t filter_enabled, filter_reset, segment, sustain_down;
     int32_t pending_off; uint32_t pad0, pad1, pad2;
     float position, pitch, gain_l, gain_r, env, decay_dec, sustain, attack_inc;
-    float release_alpha, loop_start, loop_end, playback_end, b0, b1, b2, a1, a2, z1l, z2l, z1r, z2r, pad3, pad4, pad5;
+    float release_alpha, loop_start, loop_end, playback_end, b0, b1, b2, a1, a2, z1l, z2l, z1r, z2r, vor_scale, vor_target, pad5;
 } emu_req;
 static float g_emu_z[1 << 17][4];
 static int16_t *g_pool; static long g_emu_voices;
@@ -47,7 +48,7 @@ static void emu_gpu_render(float *out, int frames) {
         const int ch = (int)q->sample_channels;
         float *z = g_emu_z[q->voice_id & ((1 << 17) - 1)];
         if (q->filter_reset) { z[0] = q->z1l; z[1] = q->z2l; z[2] = q->z1r; z[3] = q->z2r; }
-        float adv = 0.0f;
+        float adv = 0.0f, vs = q->vor_scale;
         for (uint32_t f = q->startup; f < q->frames; ++f) {
             pos = q->position + q->pitch * adv;
             if (q->loop_active && pos >= q->loop_end) pos = q->loop_start + fmodf(pos - q->loop_start, q->loop_end - q->loop_start);
@@ -71,7 +72,8 @@ static void emu_gpu_render(float *out, int frames) {
                 vl = fl;
             }
             const int o = (int)(q->out_offset + f);
-            if (o < frames) { out[o * 2] += vl * q->gain_l * env * g; out[o * 2 + 1] += vr * q->gain_r * env * g; }
+            if (o < frames) { out[o * 2] += vl * q->gain_l * env * vs * g; out[o * 2 + 1] += vr * q->gain_r * env * vs * g; }
+            vs = q->vor_target + (vs - q->vor_target) * q->release_alpha;
             if (pending > 0 && --pending == 0) { pending = -1; if (st != 3 && st != 4 && !q->sustain_down) st = 3; }
             if (st == 0) { env += q->attack_inc; if (env >= 1.0f) { env = 1.0f; st = 1; } }
             else if (st == 1) { env -= q->decay_dec; if (env <= q->sustain) { env = q->sustain; st = 2; } }
@@ -158,6 +160,7 @@ int main(int argc, char **argv) {
     if (getenv("STEALCAP") && ssw_set_steal_cap_percent) ssw_set_steal_cap_percent(atoi(getenv("STEALCAP")));
     if (getenv("LIMIT")) ssw_set_render_limit_percent(atoi(getenv("LIMIT")));
     if (getenv("DET") && ssw_set_deterministic) ssw_set_deterministic(1);
+    if (getenv("VORMODE")) ssw_set_vor_mode(atoi(getenv("VORMODE")));
     const int gpuemu = getenv("GPUEMU") != NULL;
     if (gpuemu) {
         static uint32_t table[4 * 65536]; uint32_t total = 0;

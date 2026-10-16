@@ -495,7 +495,7 @@ typedef struct {
     float release_alpha, loop_start, loop_end, playback_end;
     float b0, b1, b2, a1;
     float a2, z1l, z2l, z1r;
-    float z2r, pad3, pad4, pad5;
+    float z2r, vor_scale, vor_target, pad5;
 } wgpu_voice_request; /* 160 bytes; mirrored by the WGSL struct in snappysynth-webgpu.js */
 static uint32_t g_wgpu_serial = 1;
 static volatile LONG g_wgpu_frames = 0;
@@ -4160,7 +4160,9 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     if (v->startup_samples >= frames) return 0;
     if (fabsf(v->portamento_offset) > 0.0001f && fabsf(v->portamento_step) > 0.0f) return 0;
 #ifdef VOR
-    if (fabsf(v->vor_gain_scale - v->vor_gain_target) > 0.00001f) return 0;
+    /* A stack that lost copies fades its gain like the CPU loop; the kernel steps it (HANDOFF sec. 77). */
+    const int vor_fading = fabsf(v->vor_gain_scale - v->vor_gain_target) > 0.00001f;
+    const float vor_target = v->vor_gain_target;
 #endif
     const int sample_start = (v->sample_start >= 0 && v->sample_start < s_num) ? v->sample_start : 0;
     const int sample_end = (v->sample_end > sample_start && v->sample_end <= s_num) ? v->sample_end : s_num;
@@ -4180,7 +4182,7 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     }
     if (v->note_off_received && !sustain_down && env_state != ENV_RELEASE) env_state = ENV_RELEASE;
 #ifdef VOR
-    const float base_gain = v->base_gain * ch_render->gain_mul * v->vor_gain_scale;
+    const float base_gain = v->base_gain * ch_render->gain_mul * (vor_fading ? 1.0f : v->vor_gain_scale);
 #else
     const float base_gain = v->base_gain * ch_render->gain_mul;
 #endif
@@ -4233,6 +4235,13 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     r->playback_end = (float)(loop_active ? loop_end : sample_end);
     r->b0 = c_b0; r->b1 = c_b1; r->b2 = c_b2; r->a1 = c_a1; r->a2 = c_a2;
     r->z1l = v->z1_l; r->z2l = v->z2_l; r->z1r = v->z1_r; r->z2r = v->z2_r;
+#ifdef VOR
+    r->vor_scale = vor_fading ? v->vor_gain_scale : 1.0f;
+    r->vor_target = vor_fading ? vor_target : 1.0f;
+#else
+    r->vor_scale = 1.0f;
+    r->vor_target = 1.0f;
+#endif
     v->wgpu_serial = g_wgpu_serial;
     /* Closed-form advance of the same state machine the GPU kernel steps
      * through per sample (rev. 72): O(1) per voice instead of O(frames). */
@@ -4269,6 +4278,13 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     }
     if (remaining > 0 && env_state != ENV_OFF)
         advanced += wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_dec, release_alpha);
+#ifdef VOR
+    if (vor_fading && advanced > 0) {
+        float scale = vor_target + (v->vor_gain_scale - vor_target) * powf(release_alpha, (float)advanced);
+        if (fabsf(scale - vor_target) <= 0.00001f) scale = vor_target;
+        v->vor_gain_scale = scale;
+    }
+#endif
     if (env_state != ENV_OFF && advanced > 0) {
         pos += pitch * (float)advanced;
         if (loop_active && pos >= (float)loop_end) {
@@ -4360,7 +4376,7 @@ typedef struct voice_park {
     int porta_active, startup_samples;
     float porta_offset, porta_step;
 #ifdef VOR
-    float vor_gain_scale;
+    float vor_gain_scale, vor_target;
 #endif
 } voice_park;
 
@@ -4379,6 +4395,13 @@ static int voice_run_scalar(voice_park *p, float *mix, int frames) {
     const float gainL = p->gainL, gainR = p->gainR, pitch_mult = p->pitch_mult;
     const float c_b0 = p->c_b0, c_b1 = p->c_b1, c_b2 = p->c_b2, c_a1 = p->c_a1, c_a2 = p->c_a2;
     const float playback_end_f = (float)p->playback_end;
+#ifdef VOR
+    float vs = p->vor_gain_scale;
+    const float vt = p->vor_target;
+    const int fading = fabsf(vs - vt) > 0.00001f;
+#else
+    const int fading = 0;
+#endif
     int ended = 0;
     for (int f = p->f; f < frames; ++f) {
         if (!advance_voice_sample_state(v, p->sustain_down, &pending, &env_state, &env,
@@ -4387,7 +4410,7 @@ static int voice_run_scalar(voice_park *p, float *mix, int frames) {
             ended = 1;
             break;
         }
-        if (p->release_allow_decimate && env_state == ENV_RELEASE && env < RELEASE_DECIMATE_START &&
+        if (!fading && p->release_allow_decimate && env_state == ENV_RELEASE && env < RELEASE_DECIMATE_START &&
             (dc & p->decimate_mask_block) != 0) {
             mix[f * 2] += last_baseL * env;
             mix[f * 2 + 1] += last_baseR * env;
@@ -4441,10 +4464,23 @@ static int voice_run_scalar(voice_park *p, float *mix, int frames) {
         }
         last_baseL = vl * gainL;
         last_baseR = vr * gainR;
-        mix[f * 2] += last_baseL * env;
-        mix[f * 2 + 1] += last_baseR * env;
+#ifdef VOR
+        if (fading) {
+            mix[f * 2] += last_baseL * env * vs;
+            mix[f * 2 + 1] += last_baseR * env * vs;
+            vs = vt + (vs - vt) * p->release_alpha;
+            if (fabsf(vs - vt) <= 0.00001f) vs = vt;
+        } else
+#endif
+        {
+            mix[f * 2] += last_baseL * env;
+            mix[f * 2 + 1] += last_baseR * env;
+        }
         pos += pitch_mult; ++dc;
     }
+#ifdef VOR
+    p->vor_gain_scale = vs;
+#endif
     p->pos = pos; p->env = env; p->env_state = env_state;
     p->pending_note_off_samples = pending; p->decimate_counter = dc;
     p->last_baseL = last_baseL; p->last_baseR = last_baseR;
@@ -4493,6 +4529,9 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
     vq_f4 z1l = {0}, z2l = {0}, z1r = {0}, z2r = {0}, lastl = {0}, lastr = {0};
     vq_i4 state = {0}, alive = {0}, start = {0}, stop = {0}, filt = {0}, mono = {0};
     vq_i4 nointerp = {0}, allow_ni = {0}, decim = {0}, endf = {0};
+    /* VOR stack gain (scale -> target at the release rate); 1 for lanes that do not fade. */
+    vq_f4 vs = {1.0f, 1.0f, 1.0f, 1.0f}, vt = {1.0f, 1.0f, 1.0f, 1.0f}, va = {1.0f, 1.0f, 1.0f, 1.0f};
+    vq_i4 fade = {0};
     int dcount[4] = {0, 0, 0, 0}, first = frames, ended = 0;
     for (int k = 0; k < nl; ++k) {
         voice_park *p = lane[k];
@@ -4514,6 +4553,12 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
         filt[k] = p->filt ? -1 : 0; mono[k] = p->s_ch == 1 ? -1 : 0;
         nointerp[k] = p->no_interp ? -1 : 0; allow_ni[k] = p->release_allow_no_interp ? -1 : 0;
         decim[k] = p->release_allow_decimate ? -1 : 0;
+#ifdef VOR
+        if (fabsf(p->vor_gain_scale - p->vor_target) > 0.00001f) {
+            fade[k] = -1; decim[k] = 0;
+            vs[k] = p->vor_gain_scale; vt[k] = p->vor_target; va[k] = p->release_alpha;
+        }
+#endif
         endf[k] = p->playback_end;
         if (p->f < first) first = p->f;
         if (!alive[k]) p->f = frames;
@@ -4534,6 +4579,7 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
     const int16_t *dptr[4] = {vq_silent, vq_silent, vq_silent, vq_silent};
     for (int k = 0; k < nl; ++k) dptr[k] = lane[k]->data;
     const vq_f4 relthr = vq_sel(decim, decim_start, silence);
+    const int any_fade = vq_any(fade);
     for (int f = first; f < frames; ++f) {
         const vq_i4 fv = {f, f, f, f};
         vq_i4 act = alive & (fv >= start) & (fv < stop);
@@ -4585,6 +4631,8 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
             const vq_i4 st2 = act & ~mono, offr = act & ~mono & (vq_i4){1, 1, 1, 1};
             const vq_i4 step = offr + (vq_i4){1, 1, 1, 1};
             const int any_ni = vq_any(ni);
+            const vq_i4 wfade = act & fade;
+            vq_f4 wvs = vs;
             vq_f4 bl = zero, br = zero;
             int j = 0;
             for (; j < run; ++j) {
@@ -4610,12 +4658,18 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
                 wz2r = vr * fb2 - frr * fa2;
                 bl = fl * wgl;
                 br = vq_sel(mono, fl, frr) * wgr;
-                const vq_f4 l = bl * wenv, r = br * wenv;
+                vq_f4 e = wenv;
+                if (any_fade) {
+                    e = wenv * wvs;
+                    wvs = vq_sel(wfade, vt + (wvs - vt) * va, wvs);
+                }
+                const vq_f4 l = bl * e, r = br * e;
                 tl[(f + j) * 2] += (l[0] + l[1]) + (l[2] + l[3]);
                 tl[(f + j) * 2 + 1] += (r[0] + r[1]) + (r[2] + r[3]);
                 wpos += wpitch;
             }
             if (j > 0) {
+                vs = wvs;
                 env = vq_sel(act, wenv, env);
                 pos = vq_sel(act, wpos, pos);
                 lastl = vq_sel(act, bl, lastl);
@@ -4704,7 +4758,12 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
         const vq_f4 bl = vl * gl, br = vr * gr;
         lastl = vq_sel(act, bl, lastl);
         lastr = vq_sel(act, br, lastr);
-        const vq_f4 l = vq_sel(act, bl * env, zero), r = vq_sel(act, br * env, zero);
+        vq_f4 e = env;
+        if (any_fade) {
+            e = env * vs;
+            vs = vq_sel(act & fade, vt + (vs - vt) * va, vs);
+        }
+        const vq_f4 l = vq_sel(act, bl * e, zero), r = vq_sel(act, br * e, zero);
         tl[f * 2] += (l[0] + l[1]) + (l[2] + l[3]);
         tl[f * 2 + 1] += (r[0] + r[1]) + (r[2] + r[3]);
         pos = vq_sel(act, pos + pitch, pos);
@@ -4720,6 +4779,9 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
         p->decimate_counter += dcount[k];
         p->last_baseL = lastl[k]; p->last_baseR = lastr[k];
         v->z1_l = z1l[k]; v->z2_l = z2l[k]; v->z1_r = z1r[k]; v->z2_r = z2r[k];
+#ifdef VOR
+        if (fade[k]) p->vor_gain_scale = fabsf(vs[k] - vt[k]) <= 0.00001f ? vt[k] : vs[k];
+#endif
     }
     return ended;
 }
@@ -6641,7 +6703,7 @@ continue;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
-                                                                                                                                                                                                                                                                if (SSW_VOICE_QUAD && channels == 2 && vor_fast_ok && (s_ch == 1 || s_ch == 2) && !half_rate_candidate &&
+                                                                                                                                                                                                                                                                if (SSW_VOICE_QUAD && channels == 2 && (s_ch == 1 || s_ch == 2) && !half_rate_candidate &&
                                                                                                                                                                                                                                                                     g_voice_park_count < RENDER_TILE_VOICES) {
                                                                                                                                                                                                                                                                     voice_park *pk = &g_voice_park[g_voice_park_count++];
                                                                                                                                                                                                                                                                     pk->v = v; pk->data = data; pk->f = f_start; pk->s_ch = s_ch; pk->filt = filter_enabled;
@@ -6660,7 +6722,7 @@ continue;
                                                                                                                                                                                                                                                                     pk->porta_active = porta_active; pk->porta_offset = porta_offset; pk->porta_step = porta_step;
                                                                                                                                                                                                                                                                     pk->startup_samples = startup_samples;
                                                                                                                                                                                                                                                                 #ifdef VOR
-                                                                                                                                                                                                                                                                    pk->vor_gain_scale = vor_gain_scale;
+                                                                                                                                                                                                                                                                    pk->vor_gain_scale = vor_gain_scale; pk->vor_target = vor_gain_target;
                                                                                                                                                                                                                                                                 #endif
                                                                                                                                                                                                                                                                     continue;
                                                                                                                                                                                                                                                                 }

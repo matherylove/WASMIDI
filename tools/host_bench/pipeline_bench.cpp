@@ -28,6 +28,7 @@ void ssw_set_admission_percent(int);
 void ssw_set_steal_cap_percent(int);
 int ssw_admission_dropped(void);
 void ssw_set_deterministic(int);
+void ssw_set_vor_mode(int);
 int ssw_active_voices(void), ssw_steals(void), ssw_dropped_notes(void), ssw_worker_count(void);
 int ssw_set_debug_metrics(int);
 int ssw_path_fast_voices(void), ssw_path_scalar_voices(void), ssw_path_simd_voice_voices(void);
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
     if (getenv("ADMIT")) ssw_set_admission_percent(atoi(getenv("ADMIT")));
     if (getenv("STEALCAP")) ssw_set_steal_cap_percent(atoi(getenv("STEALCAP")));
     if (getenv("DET")) ssw_set_deterministic(1);
+    if (getenv("VORMODE")) ssw_set_vor_mode(atoi(getenv("VORMODE")));
     if (getenv("PATHS")) ssw_set_debug_metrics(1);
     const bool gpuside = getenv("GPUSIDE") != nullptr;
     if (gpuside) { static uint32_t table[4 * 65536]; uint32_t total = 0;

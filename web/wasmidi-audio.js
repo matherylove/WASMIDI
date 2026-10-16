@@ -39,7 +39,7 @@
 
     const settings = Object.assign({
         maxVoices: 1024, workers: 0, blockFrames: 512, numBuffers: 16,
-        noteSharding: 0, softClip: true, gpu: false, volume: 100
+        noteSharding: 0, softClip: true, stackGain: true, gpu: false, volume: 100
     }, (() => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch (_) { return {}; } })());
 
     function saveSettings() {
@@ -246,6 +246,7 @@
         settings.numBuffers = Math.max(2, Number($("c-buffers").value) | 0);
         settings.noteSharding = Number($("c-sharding").value) | 0;
         settings.softClip = $("c-softclip").checked;
+        settings.stackGain = $("c-stackgain").checked;
         saveSettings();
     }
 
@@ -256,6 +257,7 @@
         $("c-buffers").value = settings.numBuffers;
         $("c-sharding").value = String(settings.noteSharding);
         $("c-softclip").checked = !!settings.softClip;
+        $("c-stackgain").checked = !!settings.stackGain;
         $("volume").value = settings.volume;
         $("gpu").setAttribute("aria-pressed", settings.gpu ? "true" : "false");
         $("gpu").textContent = settings.gpu ? "GPU" : "CPU";
@@ -273,6 +275,7 @@
             softClip: settings.softClip
         });
         b.setVolume(settings.volume);
+        b.setOverlapGain(!!settings.stackGain);
         b.setGpu(!!settings.gpu);
         S.configApplied = true;
     }

@@ -79,7 +79,7 @@
 
         // Voice renderer runtime switches.
         softClip: true,
-        overlapGain: false,
+        overlapGain: true,     // stacked copies sum their gain (rev. 81)
         gpu: false,
         gpuStatus: "off",
 
