@@ -395,7 +395,7 @@ static steal_static_meta* g_steal_static = NULL;
 #endif
 #if SSW_NOTEOFF_OPEN_LIST
 typedef struct { int vid; uint32_t gen; } open_entry;
-typedef struct { open_entry *e; int count, cap; LONG epoch; } open_key_list;
+typedef struct { open_entry *e; int count, cap; LONG epoch; uint32_t last_order; int unsorted; } open_key_list;
 static open_key_list g_open[MIDI_CHANNEL_COUNT][MIDI_KEY_COUNT];
 static volatile LONG g_open_clear_epoch[MIDI_CHANNEL_COUNT][MIDI_KEY_COUNT];
 static uint32_t *g_voice_gen = NULL;
@@ -2345,7 +2345,7 @@ static inline int open_entry_keep(int ch, int key, const open_entry *oe) {
 static inline open_key_list *open_list_for(int ch, int key) {
     open_key_list *ol = &g_open[ch][key];
     const LONG epoch = load_relaxed_long(&g_open_clear_epoch[ch][key]);
-    if (ol->epoch != epoch) { ol->count = 0; ol->epoch = epoch; }
+    if (ol->epoch != epoch) { ol->count = 0; ol->epoch = epoch; ol->last_order = 0; ol->unsorted = 0; }
     return ol;
 }
 static inline void open_append(int ch, int key, int vid) {
@@ -2365,6 +2365,9 @@ static inline void open_append(int ch, int key, int vid) {
             ol->cap = cap;
         }
     }
+    if (ol->count == 0) { ol->last_order = 0; ol->unsorted = 0; }
+    if (voices[vid].key_order_id < ol->last_order) ol->unsorted = 1;
+    ol->last_order = voices[vid].key_order_id;
     ol->e[ol->count].vid = vid;
     ol->e[ol->count].gen = gen;
     ++ol->count;
@@ -2644,43 +2647,57 @@ if (g_voice_gen) {
 #if SSW_NOTEOFF_OPEN_LIST && SSW_NOTEOFF_FIFO
 /* The n note-offs of one stacked event (cutoffs first_cutoff .. first_cutoff+n-1) in one
  * pass over the open list, with the result of n calls of the FIFO path above (HANDOFF
- * sec. 75): each one releases the first entry in list order that is still open, has no
- * pending note-off and is not newer than its cutoff. */
+ * sec. 75-76): each one releases the first entry in list order that is still open, has no
+ * pending note-off and is not newer than its cutoff. The list is read only up to the last
+ * entry released; dead entries before it are dropped and the rest is kept as is. Entries
+ * are appended in note-on order, so the list is sorted by key_order_id unless
+ * open_append saw otherwise. */
 static inline void keyqueue_apply_noteoff_batch(int ch, int key, unsigned int first_cutoff, int n,
                                                 int release_delay) {
     open_key_list *ol = open_list_for(ch, key);
-    int w = 0, sorted = 1;
-    unsigned int last_order = 0;
-    for (int r = 0; r < ol->count; ++r) {
-        const open_entry oe = ol->e[r];
-        if (!open_entry_live(ch, key, &oe)) continue;
-        const unsigned int order = voices[oe.vid].key_order_id;
-        if (w > 0 && order < last_order) sorted = 0;
-        last_order = order;
-        ol->e[w++] = oe;
-    }
-    ol->count = w;
-    int p = 0;
-    for (int s = 0; s < n; ++s) {
-        const unsigned int cutoff = first_cutoff + (unsigned int)s;
-        while (p < w && voices[ol->e[p].vid].pending_note_off_samples >= 0) ++p;
-        if (p >= w) return;
-        int q = p;
-        if (voices[ol->e[q].vid].key_order_id > cutoff) {
-            if (sorted) continue;
-            for (++q; q < w; ++q) {
-                const voice *u = &voices[ol->e[q].vid];
-                if (u->pending_note_off_samples < 0 && u->key_order_id <= cutoff) break;
-            }
-            if (q >= w) continue;
+    const int count = ol->count;
+    int r = 0, w = 0, s = 0;
+    while (s < n) {
+        while (r < count) {
+            const open_entry oe = ol->e[r];
+            if (!open_entry_live(ch, key, &oe)) { ++r; continue; }
+            if (voices[oe.vid].pending_note_off_samples < 0) break;
+            ol->e[w++] = oe;
+            ++r;
         }
-        voice *v = &voices[ol->e[q].vid];
+        if (r >= count) break;
+        const unsigned int cutoff = first_cutoff + (unsigned int)s;
+        voice *v = &voices[ol->e[r].vid];
+        if (v->key_order_id > cutoff) {
+            if (!ol->unsorted) {
+                /* Every open entry is at least this new: the cutoffs below it find nothing. */
+                const unsigned int skip = v->key_order_id - first_cutoff;
+                if (skip >= (unsigned int)n) break;
+                s = (int)skip;
+                continue;
+            }
+            int q = r + 1;
+            for (; q < count; ++q) {
+                const open_entry oe = ol->e[q];
+                const voice *u = &voices[oe.vid];
+                if (u->pending_note_off_samples < 0 && u->key_order_id <= cutoff &&
+                    open_entry_live(ch, key, &oe)) break;
+            }
+            ++s;
+            if (q >= count) continue;
+            v = &voices[ol->e[q].vid];
+        } else {
+            ol->e[w++] = ol->e[r];
+            ++r;
+            ++s;
+        }
 #ifdef VOR
         if (v->vor_stack_count > 1 && v->vor_pending_note_offs < INT_MAX) ++v->vor_pending_note_offs;
 #endif
         v->pending_note_off_samples = keyqueue_noteoff_delay_for_voice(v, release_delay);
-        if (q == p) ++p;
     }
+    if (w != r) memmove(&ol->e[w], &ol->e[r], sizeof(open_entry) * (size_t)(count - r));
+    ol->count = w + (count - r);
 }
 #endif
 
@@ -7027,8 +7044,8 @@ g_worker_count = desired;
                                                                                                                                                                                                                                                                 g_worker_mix_has_data = (int*)calloc(g_worker_count, sizeof(int));
 
                                                                                                                                                                                                                                                                 int note_map_by_channel = (max_voices <= g_worker_count * STEAL_CHANNEL_MAP_VOICES_PER_WORKER);
-                                                                                                                                                                                                                                                                /* Auto: one event thread at every voice count (rev. 72, HANDOFF sec. 66). */
-note_map_by_channel = 2;
+                                                                                                                                                                                                                                                                /* Auto: one event thread up to 4096 voices, hash above (rev. 80, HANDOFF sec. 76). */
+note_map_by_channel = (max_voices <= 4096) ? 2 : 0;
                                                                                                                                                                                                                                                                 {
                                                                                                                                                                                                                                                                 const char *sharding_env = getenv("SS_NOTE_SHARDING");
                                                                                                                                                                                                                                                                 if (sharding_env && sharding_env[0]) {
@@ -7370,7 +7387,7 @@ g_steal_score = (float*)malloc(sizeof(float) * (size_t)max_voices);
 free(g_voice_gen);
 g_voice_gen = (uint32_t*)calloc((size_t)max_voices, sizeof(uint32_t));
 for (int oc = 0; oc < MIDI_CHANNEL_COUNT; ++oc)
-    for (int ok = 0; ok < MIDI_KEY_COUNT; ++ok) { g_open[oc][ok].count = 0; g_open[oc][ok].epoch = 0; g_open_clear_epoch[oc][ok] = 0; }
+    for (int ok = 0; ok < MIDI_KEY_COUNT; ++ok) { g_open[oc][ok].count = 0; g_open[oc][ok].epoch = 0; g_open[oc][ok].last_order = 0; g_open[oc][ok].unsorted = 0; g_open_clear_epoch[oc][ok] = 0; }
 #endif
 #if SSW_STEAL_STATIC_CACHE
 g_steal_static = (steal_static_meta*)calloc(

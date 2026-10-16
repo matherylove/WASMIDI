@@ -735,11 +735,19 @@ void sfz_invalidate_region_cache(sfz_instrument* inst) {
     sfz_free_selector_cache(inst);
 }
 
+static int sfz_rebuild_selector_cache(sfz_instrument* inst);
+
+/* The count tables are only needed for a rebuild; zeroing them on every lookup cost more
+ * than the lookup (HANDOFF sec. 76). */
 static int sfz_ensure_selector_cache(sfz_instrument* inst) {
-    int counts[3][SFZ_SELECTOR_PROGRAM_BUCKETS] = {{0}};
-    int key_counts[3][SFZ_SELECTOR_PROGRAM_BUCKETS][128] = {{{0}}};
     if (!inst) return 0;
     if (inst->selector_cache_revision == inst->region_revision) return 1;
+    return sfz_rebuild_selector_cache(inst);
+}
+
+static int sfz_rebuild_selector_cache(sfz_instrument* inst) {
+    int counts[3][SFZ_SELECTOR_PROGRAM_BUCKETS] = {{0}};
+    int key_counts[3][SFZ_SELECTOR_PROGRAM_BUCKETS][128] = {{{0}}};
 
     sfz_selector_lock_acquire(&g_selector_cache_lock);
     if (inst->selector_cache_revision == inst->region_revision) {

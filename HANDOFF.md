@@ -4985,3 +4985,63 @@ validación.
 - Lo que queda en el lado CPU del modo GPU es la fase de eventos y reserva de voces (serial con
   el reparto Single): robos (`steal_voice_fast`), un ordenamiento por edad de voces, la
   preparación de las peticiones. Siguiente paso de la etapa 3.
+
+## 76. Revisión 80 — Auto reparte los eventos con Hash por encima de 4096 voces; búsqueda de regiones y note-offs más baratos
+
+**Pedido:** seguir hacia 24576 voces estables (1024 por worker en el Ryzen 9 5900X); hoy el
+usuario solo llega a 6144.
+
+**Causa:** con todas las voces en la GPU (rev. 79) lo que queda en la CPU es la fase de eventos
+(note-ons, robos, note-offs). Con el reparto Single (Auto desde la rev. 72) esa fase corre en un
+solo hilo mientras los demás esperan, y con 24576 voces cada robo recorre hasta 512 voces del
+pool. En el contenedor (4 hilos) son ~8 ms por bloque de 10,7 ms en el pico de The Nuker 4: con
+24 workers el render se reparte, pero esa fase no, así que es el techo también en modo CPU.
+
+**Cambios:**
+
+1. **Auto = Single hasta 4096 voces, Hash por encima** (`Voice/voice.c`, selección del reparto).
+   Con Hash cada worker procesa los eventos de sus teclas (canal × 128 + tecla, módulo
+   workers) con su propio pool: 24576 voces con 24 workers son 1024 por worker, y cada robo
+   recorre un pool chico. La rev. 72 había elegido Single con mediciones de 1 núcleo en modo CPU
+   (Hash costaba más CPU total con el render del pool lleno); con el render en la GPU y los
+   arreglos de la rev. 79 eso se invirtió: Hash es más barato incluso en CPU total.
+   Channel/Hash/Single en el botón siguen igual.
+2. **Búsqueda de regiones SFZ** (`Parser/sfz_parser.c`): `sfz_ensure_selector_cache` ponía en
+   cero dos tablas de conteo (~200 KB en la pila) en cada búsqueda aunque la caché estuviera al
+   día. Ahora compara la revisión primero y solo reconstruye si cambió.
+3. **Note-offs apilados en una pasada, sin escaneo previo** (`keyqueue_apply_noteoff_batch`): la
+   lista abierta por tecla lleva si se agregó fuera de orden (`last_order`, `unsorted`) en vez de
+   comprobarlo recorriéndola en cada evento; la compactación y los cutoffs avanzan juntos en un
+   solo recorrido.
+4. `tools/host_bench/pipeline_bench.cpp`: `SHARD` (0 auto, 1 channel, 2 hash, 3 single).
+
+**Medición (host, recorte del pico de The Nuker 4 con 1,5 s de arranque, 2 s, 4 workers,
+`DET=1`, tiempo de render / tiempo real):**
+
+| | Antes | Regiones | + note-offs | Single → Hash |
+|---|---|---|---|---|
+| 24576 voces, modo GPU (lado CPU) | 0,87× | 0,78× | 0,81× (ruido) | **0,62×** |
+| 24576 voces, modo CPU | 2,96× | 2,76× | 2,73× (3 s) | 2,73× (contra 2,87× Single) |
+| 24576 voces, modo GPU, 1 núcleo (CPU total) | — | — | 0,91× | **0,74×** |
+| 6144 voces, modo CPU / GPU | — | — | 0,78× / 0,22× | 0,76× / 0,18× |
+
+Espera en la fase de eventos (`alloc`, suma de los workers que esperan) con 24576 voces en modo
+GPU: 24,6/34,9 → 15,6/22,8 ms por bloque. Regiones y note-offs: WAV **idéntico** en modo
+determinístico (Single) a 6144 y 24576 voces.
+
+**Audio con Hash:** con Hash el resultado depende del momento en que cada worker toma voces
+libres de otro (préstamo de la lista libre), así que dos corridas no dan el mismo WAV ni con
+`DET=1`; el modo determinístico byte a byte sigue siendo Single. Contra Single (24576 voces):
+nivel por segundo dentro de 0,4% y espectro a 0,38-0,45 dB de media, del orden de lo que varían
+dos corridas de Hash entre sí.
+
+**Verificación:** arneses del CI del synth (`worker_cycle_smoke` con 8192 voces y 24 workers
+ahora corre en Hash), build local completo.
+
+**Pendiente / no verificado:**
+
+- En las PCs del usuario: WASMIDI Audio y la app con 12288 y 24576 voces, modo CPU y GPU, con
+  Sharding en Auto (ahora Hash) contra Single. El contenedor tiene 4 hilos: con 24 workers la
+  fase de eventos se reparte 24 veces, cosa que acá no se puede medir.
+- Si el reparto por teclas queda desbalanceado en algún MIDI (todas las notas en pocas teclas),
+  ese worker frena el bloque; Single no tiene ese problema.

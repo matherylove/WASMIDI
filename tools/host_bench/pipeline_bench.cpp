@@ -3,7 +3,7 @@
 // reports feed and render cost per second of song. Optional WAV per point.
 //   ./pipeline_bench SF2 MID WORKERS DUR START [START...]
 // Env: VOICES (1024), FEED=0 (send every event; the synth admits), ADMIT, STEALCAP, DET=1,
-//      WAV=prefix (writes prefix_<start>.wav), GPUSIDE=1 (voices go to the WebGPU request list and
+//      SHARD (0 auto, 1 channel, 2 hash, 3 single), WAV=prefix (writes prefix_<start>.wav), GPUSIDE=1 (voices go to the WebGPU request list and
 //      are not rendered: the CPU side of the GPU mode)
 #include "bpfa_midi_store.hpp"
 #include <algorithm>
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     const MidiDocument& md = store.metadata();
     printf("index %.0f s, %llu notes, %.1f s\n", ms(t0) / 1000.0, (unsigned long long)md.noteCount, md.durationSeconds);
 
-    if (!ssw_init_ex(SR, 2, 32, BLOCK, 16, 0, voices, 0, workers, 0, 1, 1, 0, 1)) { puts("init fail"); return 1; }
+    if (!ssw_init_ex(SR, 2, 32, BLOCK, 16, 0, voices, 0, workers, getenv("SHARD") ? atoi(getenv("SHARD")) : 0, 1, 1, 0, 1)) { puts("init fail"); return 1; }
     if (ssw_load_sf2(argv[1]) <= 0) { puts("sf2 fail"); return 1; }
     ssw_warmup();
     if (getenv("ADMIT")) ssw_set_admission_percent(atoi(getenv("ADMIT")));
