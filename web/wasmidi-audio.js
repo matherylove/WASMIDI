@@ -88,7 +88,10 @@
         const b = bridge();
         if (b && b.clearLocalMidiSource) b.clearLocalMidiSource();
         S.feedDirect = false;
-        S.parser = new Worker("midi-parser-worker.js?v=" + encodeURIComponent(VERSION));
+        // The page query reaches the Worker for its overrides (?helpers=N, ?rawlimit=MiB).
+        const query = new URLSearchParams(location.search);
+        query.set("v", VERSION);
+        S.parser = new Worker("midi-parser-worker.js?" + query.toString());
         S.parserReady = new Promise(resolve => { S.parserReadyResolve = resolve; });
         S.parser.onmessage = event => onParserMessage(event.data || {});
         S.parser.onerror = event => log("Parser worker error: " + (event.message || event), "err");

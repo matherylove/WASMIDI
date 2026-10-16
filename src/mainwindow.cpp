@@ -384,9 +384,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserBaseUrl =
                 new URL('./', window.location.href).href;
+            // The page query reaches the Worker for its overrides (?helpers=N, ?rawlimit=MiB).
             const parserWorkerPrelude =
                 'self.__wasmidiMidiParserBaseUrl = ' +
-                JSON.stringify(parserBaseUrl) + ';\n';
+                JSON.stringify(parserBaseUrl) + ';\n' +
+                'self.__wasmidiPageQuery = ' +
+                JSON.stringify(window.location.search) + ';\n';
             const createParserWorker = () => {
                 const blobUrl = URL.createObjectURL(
                     new Blob(

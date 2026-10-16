@@ -2674,6 +2674,7 @@ bool MidiMappedStore::buildLiveSnapshot(
     expire(impl_->liveCcDensity, impl_->liveCcCount, ccStartTick);
 
     std::array<uint64_t, 128> ownerRank{};
+    std::array<uint32_t, 128> ownerKey{};
     uint64_t activeVoices = 0;
     for (const auto& entry : impl_->liveVisualState.pending) {
         if (entry.second.empty())
@@ -2697,8 +2698,11 @@ bool MidiMappedStore::buildLiveSnapshot(
             (uint64_t(owner.startTick) << 32) |
             (uint64_t(track & 0xffffu) << 16) |
             ((count - 1u) & 0xffffu);
-        if (pitchCount == count || rank >= ownerRank[pitch]) {
+        // Equal ranks (two channels of one track) go to the higher key, not to hash order.
+        if (pitchCount == count || rank > ownerRank[pitch] ||
+            (rank == ownerRank[pitch] && key > ownerKey[pitch])) {
             ownerRank[pitch] = rank;
+            ownerKey[pitch] = key;
             output.keys.globalColors[pitch] = owner.color & 0x0fu;
             output.keys.trackColors[pitch] = (owner.color >> 4) & 0x0fu;
         }

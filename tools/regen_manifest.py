@@ -59,6 +59,7 @@ FILES = [
     "web/coi-serviceworker.js",
     "web/midi-parser-worker.js",
     "web/parser-bench.html",
+    "web/visual-bench.html",
     "web/midi-parser-helper.js",
     "web/snappysynth-webgpu.js",
     "web/audio.html",

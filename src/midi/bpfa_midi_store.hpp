@@ -127,6 +127,23 @@ public:
     uint64_t synthFeedBlock() const { return feedBlock_; }
     double synthFeedBlockSeconds() const;
 
+    // Visual stream (HANDOFF sec. 71): the renderer sweep and the live snapshot read one
+    // stream of folded note/controller words in (tick, track) order, decoded here span by
+    // span or by the decode helpers. Disabled, both walk the merge heap as before.
+    void setVisualStreamEnabled(bool enabled) { visualEnabled_ = enabled; }
+    bool visualStreamEnabled() const { return visualEnabled_; }
+    // false: buildRenderSweep only consumes what appendVisualResult delivered.
+    void setVisualAutoDecode(bool enabled) { visualAutoDecode_ = enabled; }
+    uint32_t visualStreamHead() const { return visHead_; }
+    bool visualStreamDone() const { return visDone_; }
+    // End tick of a span from startTick that holds about sourceEvents events (from the density).
+    uint32_t visualSpanEnd(uint32_t startTick, uint64_t sourceEvents) const;
+    bool decodeVisualLocal(uint32_t endTick);
+    bool buildVisualRequest(uint32_t startTick, uint32_t endTick, std::vector<uint8_t>& request) const;
+    bool decodeVisualRequest(const uint8_t* request, std::size_t size, std::vector<uint8_t>& result);
+    // Results must arrive in order: each one starts where the stream ends.
+    bool appendVisualResult(const uint8_t* result, std::size_t size);
+
     void resetRenderCursor(uint32_t startTick, bool perTrackColors);
     bool buildRenderSweep(uint32_t endTick, std::size_t maxSourceEvents, std::vector<VisualNote>& appends,
                           std::vector<RenderClose>& closes, uint32_t& appendBase, bool& complete,
@@ -426,6 +443,59 @@ private:
     FeedSourceFetch externalFetch_ = nullptr;
     void* externalFetchUser_ = nullptr;
     mutable std::vector<uint8_t> externalScratch_;
+
+    bool buildRenderSweepStream(uint32_t endTick, std::size_t maxWords, std::vector<VisualNote>& appends,
+                                std::vector<RenderClose>& closes, bool& complete, uint32_t& nextTick,
+                                bool& hasNextTick);
+    void renderStep(uint32_t tick, uint32_t message, uint16_t track, uint32_t count,
+                    std::vector<VisualNote>& appends, std::vector<RenderClose>& closes);
+    void visualReset(uint32_t startTick);
+    void visualDecodeSpan(std::vector<Cursor>& cursors, uint32_t endTick, std::vector<EventWord>& events,
+                          std::vector<uint16_t>& tracks, bool& anyLeft);
+    void visualAppend(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t endTick,
+                      bool anyLeft);
+    void visualTrim();
+    bool visualEnabled_ = true;
+    bool visualAutoDecode_ = true;
+    bool visValid_ = false;
+    bool visDone_ = false;
+    std::vector<EventWord> visEvents_;
+    std::vector<uint16_t> visTracks_;
+    uint64_t visBase_ = 0;          // absolute index of visEvents_[0]
+    uint32_t visStart_ = 0;         // the stream holds every event in [visStart_, visHead_)
+    uint32_t visHead_ = 0;
+    MergeCursor visCursor_;
+    uint32_t visCursorTick_ = ~0u;
+    std::vector<FeedWord> visRaw_;
+    std::vector<uint16_t> visRawTrack_;
+    std::vector<uint32_t> visOrder_;
+    std::vector<EventWord> visSpanEvents_;
+    std::vector<uint16_t> visSpanTracks_;
+    uint64_t renderPos_ = 0;        // absolute index of the next word for the sweep
+
+    // Live snapshot on the stream: per (track, channel, key) the number of open notes and
+    // the newest one still open (offs close the oldest first, so it only changes on a note-on
+    // or when the key empties). A flat key table up to LiveFlatKeys keys.
+    struct LiveKey { uint64_t total = 0; uint32_t tailStart = 0; uint32_t activeAt = ~0u; uint8_t tailColor = 0; };
+    struct LiveDeferred { uint32_t tick; uint32_t message; uint16_t track; uint32_t count; };
+    bool buildLiveSnapshotMerge(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
+                                bool forceReset);
+    bool buildLiveSnapshotStream(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
+                                 bool forceReset);
+    void applyLiveEvent(uint32_t tick, uint32_t message, uint16_t track, uint32_t count);
+    LiveKey* liveKey(uint32_t key, bool create);
+    void liveClearKey(uint32_t key, LiveKey& k);
+    void liveReset();
+    std::vector<LiveKey> liveFlat_;
+    std::unordered_map<uint32_t, LiveKey> liveMap_;
+    bool liveUseFlat_ = false;
+    std::vector<uint32_t> liveActive_;     // keys with notes, in no particular order
+    std::vector<LiveDeferred> liveDeferred_;
+    uint32_t liveNextTick_ = 0;     // every event before it was applied (or deferred)
+    bool liveOnStream_ = false;
+    bool liveCursorSynced_ = false;
+    bool liveSinceVisualReset_ = false;  // a live snapshot ran since the stream restarted
+    uint64_t livePos_ = 0;
 
     MergeCursor renderCursor_;
     bool renderPerTrackColors_ = false;

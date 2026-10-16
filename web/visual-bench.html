@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WASMIDI visual benchmark</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { margin: 2rem auto; max-width: 56rem; padding: 0 1rem; background: #111; color: #ddd; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { text-align: right; padding: .3rem .5rem; border-bottom: 1px solid #333; font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  pre { background: #1b1b1b; padding: .8rem; overflow-x: auto; }
+  input[type=number] { width: 6rem; }
+  button { padding: .4rem 1rem; }
+  label { margin-right: 1rem; }
+</style>
+</head>
+<body>
+<h1>WASMIDI visual benchmark</h1>
+<p>Carga un MIDI con el worker del parser de la app y reproduce un tramo sin dibujar ni sonar:
+pide el barrido del roll y el estado del teclado como lo hace la app, a 60 cuadros por segundo,
+y mide si llegan a tiempo. Sirve para ver si el roll, el teclado y los contadores alcanzan el
+tiempo real en tu PC sin que la GPU ni el synth influyan. <code>?helpers=N</code> fuerza la
+cantidad de Workers auxiliares; <code>?rawlimit=0</code> fuerza la fuente comprimida (los
+auxiliares solo existen con ella).</p>
+<p><input id="file" type="file" accept=".mid,.midi,audio/midi"></p>
+<p><label>Desde (s) <input id="start" type="number" value="0" min="0" step="0.1"></label>
+<label>Duración (s) <input id="duration" type="number" value="20" min="1" step="1"></label>
+<label>Roll adelante (s) <input id="lookahead" type="number" value="2" min="0.2" step="0.1"></label>
+<button id="run" disabled>Medir</button></p>
+<div id="status"></div>
+<table id="rows" hidden>
+  <thead><tr><th>Segundo</th><th>Cuadros</th><th>Roll atrasado</th><th>Adelanto mín. (s)</th>
+  <th>Teclado/s</th><th>Latencia media (ms)</th><th>Latencia máx. (ms)</th></tr></thead>
+  <tbody></tbody>
+</table>
+<h2>Resultado para copiar</h2>
+<pre id="report">—</pre>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fileInput = $("file"), runButton = $("run"), statusBox = $("status"), report = $("report");
+fileInput.addEventListener("change", () => { runButton.disabled = !fileInput.files.length; });
+
+runButton.addEventListener("click", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  runButton.disabled = true;
+  const start = Math.max(0, Number($("start").value) || 0);
+  const duration = Math.max(1, Number($("duration").value) || 20);
+  const lookahead = Math.max(0.2, Number($("lookahead").value) || 2);
+  const tbody = $("rows").querySelector("tbody");
+  tbody.textContent = "";
+  $("rows").hidden = false;
+  const query = new URLSearchParams(location.search);
+  query.set("bench", String(Date.now()));
+  const worker = new Worker("midi-parser-worker.js?" + query.toString());
+  const t0 = performance.now();
+  let loadMs = 0, songSeconds = 0;
+  // Song time -> tick at 1/240 s steps over the measured span plus the roll lookahead.
+  const STEP = 1 / 240;
+  let ticks = null;
+  const tickAt = s => {
+    const x = Math.max(0, (s - start) / STEP), i = Math.min(ticks.length - 2, Math.floor(x));
+    return ticks[i] + (ticks[i + 1] - ticks[i]) * Math.min(1, x - i);
+  };
+  const secondsAt = tick => {
+    let lo = 0, hi = ticks.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ticks[mid] <= tick) lo = mid; else hi = mid - 1; }
+    return start + lo * STEP;
+  };
+
+  let safeThrough = 0, rollReady = false, pending = null, requestId = 0, helpers = 0, helpersTimer = 0;
+  const lines = [];
+  let second = null;
+  const totals = { frames: 0, behind: 0, replies: 0, latency: 0, maxLatency: 0, minLead: Infinity };
+  const newSecond = index => ({ index, frames: 0, behind: 0, minLead: Infinity, replies: 0, latency: 0, maxLatency: 0 });
+  function flushSecond() {
+    if (!second) return;
+    const s = second;
+    const row = document.createElement("tr");
+    const avg = s.replies ? s.latency / s.replies : 0;
+    const cells = [(start + s.index).toFixed(0), s.frames, s.behind,
+      Number.isFinite(s.minLead) ? s.minLead.toFixed(2) : "—", s.replies, avg.toFixed(1), s.maxLatency.toFixed(1)];
+    row.innerHTML = cells.map(() => "<td></td>").join("");
+    cells.forEach((c, i) => { row.cells[i].textContent = String(c); });
+    tbody.appendChild(row);
+    lines.push((start + s.index).toFixed(0) + " s: frames " + s.frames + ", roll behind " + s.behind +
+      ", min lead " + row.cells[3].textContent + " s, keyboard " + s.replies + "/s, latency avg " +
+      avg.toFixed(1) + " max " + s.maxLatency.toFixed(1) + " ms");
+  }
+
+  function finish(text) {
+    flushSecond();
+    const avg = totals.replies ? totals.latency / totals.replies : 0;
+    report.textContent = [
+      "file: " + file.name + " (" + (file.size / 1048576).toFixed(1) + " MB), load " + (loadMs / 1000).toFixed(1) + " s",
+      "browser: " + navigator.userAgent,
+      "deviceMemory: " + (navigator.deviceMemory || "?") + " GB, cores: " + (navigator.hardwareConcurrency || "?") +
+        ", query: " + (location.search || "—"),
+      "span: " + start + " s + " + duration + " s, roll lookahead " + lookahead + " s, decode helpers " + helpers,
+      ...lines,
+      "total: frames " + totals.frames + ", roll behind " + totals.behind + ", min lead " +
+        (Number.isFinite(totals.minLead) ? totals.minLead.toFixed(2) : "—") + " s, keyboard " +
+        (totals.replies / duration).toFixed(1) + "/s, latency avg " + avg.toFixed(1) + " max " +
+        totals.maxLatency.toFixed(1) + " ms (" + text + ")"
+    ].join("\n");
+    statusBox.textContent = text;
+    worker.terminate();
+    runButton.disabled = false;
+  }
+
+  function play() {
+    const begin = performance.now();
+    worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
+      endTick: Math.ceil(tickAt(start + lookahead)), urgentThrough: Math.ceil(tickAt(start + 0.5)),
+      perTrack: false, reset: true });
+    // The playhead waits until the first visible window is ready, like the app after a seek.
+    const waitReady = () => {
+      if (!rollReady || safeThrough < tickAt(start + 0.1)) { setTimeout(waitReady, 5); return; }
+      statusBox.textContent = "Reproduciendo…";
+      const playStart = performance.now();
+      statusBox.dataset.firstWindowMs = String(playStart - begin);
+      const frame = () => {
+        const elapsed = (performance.now() - playStart) / 1000;
+        if (elapsed >= duration) { finish("Listo (primera ventana del roll en " + Math.round(playStart - begin) + " ms)"); return; }
+        const s = start + elapsed;
+        const index = Math.floor(elapsed);
+        if (!second || second.index !== index) { flushSecond(); second = newSecond(index); }
+        const tick = tickAt(s);
+        worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
+          endTick: Math.ceil(tickAt(s + lookahead)), urgentThrough: Math.ceil(tickAt(s + 0.5)),
+          perTrack: false, reset: false });
+        const lead = secondsAt(safeThrough) - s;
+        second.frames++; totals.frames++;
+        if (safeThrough < tick) { second.behind++; totals.behind++; }
+        second.minLead = Math.min(second.minLead, lead);
+        totals.minLead = Math.min(totals.minLead, lead);
+        if (!pending) {
+          pending = { id: ++requestId, at: performance.now() };
+          worker.postMessage({ type: "key-state", tick, npsStartTick: tickAt(Math.max(start, s - 0.25)),
+            ccStartTick: tickAt(Math.max(start, s - 1)), requestId: pending.id, generation: 1, reset: false });
+        }
+        setTimeout(frame, 1000 / 60);
+      };
+      frame();
+    };
+    waitReady();
+  }
+
+  worker.onmessage = event => {
+    const m = event.data || {};
+    if (m.type === "worker-ready") {
+      statusBox.textContent = "Cargando…";
+      worker.postMessage({ type: "parse", file });
+    } else if (m.type === "progress") {
+      statusBox.textContent = "Cargando: " + m.percent + "% " + m.stage;
+    } else if (m.type === "result-end") {
+      loadMs = performance.now() - t0;
+      worker.postMessage({ type: "doc-info" });
+    } else if (m.type === "doc-info") {
+      songSeconds = m.duration;
+      const count = Math.ceil((duration + lookahead + 1) / STEP) + 2;
+      const seconds = [];
+      for (let i = 0; i < count; ++i) seconds.push(Math.min(songSeconds, start + i * STEP));
+      worker.postMessage({ type: "tick-at", seconds });
+    } else if (m.type === "tick-at") {
+      ticks = m.ticks;
+      // The helpers start with the first roll request; give them a moment, as playback
+      // would after loading a file.
+      statusBox.textContent = "Preparando el roll…";
+      worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
+        endTick: Math.floor(tickAt(start)), urgentThrough: Math.floor(tickAt(start)), perTrack: false, reset: true });
+      helpersTimer = setTimeout(() => { helpersTimer = 0; play(); }, 8000);
+    } else if (m.type === "helpers-ready") {
+      helpers = m.helpers;
+      if (helpersTimer) { clearTimeout(helpersTimer); helpersTimer = 0; play(); }
+    } else if (m.type === "sharp-render-reset") {
+      rollReady = true;
+      safeThrough = 0;
+    } else if (m.type === "sharp-render-delta") {
+      safeThrough = Math.max(safeThrough, m.safeThrough || 0);
+    } else if (m.type === "live-state") {
+      if (pending && (m.requestId >>> 0) === pending.id) {
+        const ms = performance.now() - pending.at;
+        pending = null;
+        if (second) {
+          second.replies++; second.latency += ms; second.maxLatency = Math.max(second.maxLatency, ms);
+          totals.replies++; totals.latency += ms; totals.maxLatency = Math.max(totals.maxLatency, ms);
+        }
+      }
+    } else if (m.type === "runtime-error" || m.type === "error") {
+      finish("Error: " + (m.requestType ? m.requestType + ": " : "") + m.message);
+    }
+  };
+  worker.onerror = e => finish("Error del worker: " + (e.message || e));
+});
+</script>
+</body>
+</html>

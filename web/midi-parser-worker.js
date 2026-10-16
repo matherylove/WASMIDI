@@ -12,9 +12,22 @@ const FAST_SOURCE_MIN_BYTES = 256 * 1024 * 1024;
 const FAST_SOURCE_DEFAULT_BYTES = 512 * 1024 * 1024;
 const FAST_SOURCE_MAX_BYTES = 1024 * 1024 * 1024;
 
+// Page overrides (HANDOFF sec. 71): ?helpers=N decode helpers, ?rawlimit=MiB raw source
+// limit, ?visualstream=0 roll and keyboard without the visual stream.
+function pageOverride(name) {
+    let query = self.__wasmidiPageQuery;
+    if (query == null) {
+        try { query = self.location.search; } catch (_) { query = ""; }
+    }
+    const value = new URLSearchParams(query || "").get(name);
+    return value !== null && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
 // zstd only when keeping the MIDI raw could exceed the parser heap (16 GiB) or the
 // machine's RAM (HANDOFF sec. 54). navigator.deviceMemory is coarse and capped at 8 GiB.
 function rawSourceLimitBytes(wholeFileCopied) {
+    const forced = pageOverride("rawlimit");
+    if (forced !== null) return Math.max(0, forced) * 1024 * 1024;
     const GiB = 1024 * 1024 * 1024;
     const heapRoom = 16 * GiB - 2 * GiB;
     const deviceGiB = Number(self.navigator && self.navigator.deviceMemory);
@@ -452,6 +465,7 @@ let sharpRenderRunning = false;
 let sharpRenderReady = false;
 let sharpRenderPerTrack = false;
 let sharpRenderCompletedTarget = 0;
+let sharpRenderStarved = false;
 
 function copyWasmBytes(Module, address, byteLength) {
     const base = pointerToNumber(address, "mapped result pointer");
@@ -634,8 +648,10 @@ async function drainSharpRenderer() {
 
     try {
         const Module = await getModule();
+        sharpRenderStarved = false;
         while (mappedFileReady && sharpRenderReady &&
                sharpRenderCompletedTarget < sharpRenderTarget) {
+            visualPump(Module);
             // Keep SnappySynth responsive without demoting the renderer to the
             // old page-at-the-last-second model. One bounded source sweep is
             // followed by an event-loop yield.
@@ -652,8 +668,12 @@ async function drainSharpRenderer() {
             const sourceBudget = sharpRenderSafeThrough < sharpRenderUrgentThrough
                 ? SHARP_RENDER_URGENT_SOURCE_BUDGET
                 : SHARP_RENDER_SOURCE_BUDGET;
-            if (!Module._wmp_build_render_sweep_js(
-                    target, sourceBudget)) {
+            const sweepStart = performance.now();
+            const swept = Module._wmp_build_render_sweep_js(target, sourceBudget);
+            visualStats.sweepMs += performance.now() - sweepStart;
+            ++visualStats.sweeps;
+            visualStatsTick();
+            if (!swept) {
                 throw new Error(parserErrorText(
                     Module,
                     "Could not sweep SharpMIDI renderer events"));
@@ -718,6 +738,13 @@ async function drainSharpRenderer() {
                     sharpRenderCompletedTarget, target);
                 if (target === sharpRenderTarget)
                     break;
+            } else if (visualPoolActive && hasNextTick &&
+                       nextTick >= sizeToNumber(Module._wmp_visual_head_js(), "visual head") &&
+                       !Module._wmp_visual_done_js()) {
+                // The helpers have not returned the next span yet; visualPump resumes.
+                sharpRenderStarved = true;
+                ++visualStats.starved;
+                break;
             }
 
             // Always return to the event loop after one bounded resident sweep.
@@ -729,7 +756,7 @@ async function drainSharpRenderer() {
         }
     } finally {
         sharpRenderRunning = false;
-        if (mappedFileReady && sharpRenderReady &&
+        if (mappedFileReady && sharpRenderReady && !sharpRenderStarved &&
             sharpRenderCompletedTarget < sharpRenderTarget)
             setTimeout(() => { void drainSharpRenderer(); }, 0);
     }
@@ -761,6 +788,7 @@ async function requestSharpRenderer(message) {
         sharpRenderSafeThrough = sharpRenderCompletedTarget;
         sharpRenderReady = true;
         Module._wmp_reset_render_cursor_js(startTick, perTrack ? 1 : 0);
+        visualRestart(Module);
         postMessage({
             type: "sharp-render-reset",
             generation,
@@ -775,6 +803,8 @@ async function requestSharpRenderer(message) {
         Math.max(sharpRenderUrgentThrough,
             Math.max(startTick, Number(message.urgentThrough) || startTick))) >>> 0;
 
+    if (!feedPool)
+        feedStartPool().catch(error => console.warn("[WASMIDI visual] helper pool unavailable", error));
     void drainSharpRenderer();
 }
 
@@ -785,9 +815,12 @@ async function buildKeyState(message) {
     const tick = Math.max(0, Math.min(0xffffffff, Number(message.tick) || 0));
     const npsStartTick = Math.max(0, Math.min(tick, Number(message.npsStartTick) || 0));
     const ccStartTick = Math.max(0, Math.min(tick, Number(message.ccStartTick) || 0));
+    const liveStart = performance.now();
     if (!Module._wmp_build_live_snapshot_js(
             tick, npsStartTick, ccStartTick, message.reset ? 1 : 0))
         throw new Error(parserErrorText(Module, "Could not build mapped live state"));
+    visualStats.liveMs += performance.now() - liveStart;
+    ++visualStats.lives;
     const words = sizeToNumber(Module._wmp_key_snapshot_word_count_js(), "live snapshot words");
     const bytes = words
         ? copyWasmBytes(Module, Module._wmp_key_snapshot_ptr_js(), words * 4)
@@ -1316,9 +1349,112 @@ function feedFillSequential(Module) {
     feedPostBatch(Module, fill.generation, out);
 }
 
+// ---- Visual stream (HANDOFF sec. 71) ----
+// With the helper pool the folded stream that the roll sweep and the keyboard/counters read
+// is decoded in spans by the same helpers (feed spans go first) and appended here in order;
+// the sweep waits for the next span.
+const VISUAL_SPAN_WORDS = 1 << 19;
+let visualPoolActive = false;
+let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
+// ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
+const visualStats = { at: 0, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0,
+    starved: 0, local: 0 };
+function visualStatsTick() {
+    if (pageOverride("visualdebug") !== 1) return;
+    const now = performance.now();
+    if (!visualStats.at) visualStats.at = now;
+    if (now - visualStats.at < 1000) return;
+    const v = visualStats;
+    console.info("[WASMIDI visual] " + Math.round(now - v.at) + " ms: sweep " + v.sweepMs.toFixed(0) + " ms/" + v.sweeps +
+        ", live " + v.liveMs.toFixed(0) + " ms/" + v.lives + ", append " + v.appendMs.toFixed(0) + " ms/" + v.spans +
+        " spans " + (v.bytes / 1048576).toFixed(1) + " MiB, starved " + v.starved + ", pool " + (visualPoolActive ? "on" : "off") +
+        ", queue " + visualQueue.length + ", feed pending " + (feedPool ? feedPool.pending.length : 0));
+    Object.assign(v, { at: now, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0, starved: 0 });
+}
+let visualQueue = [];
+let visualSequence = 0;
+let visualPlanned = 0;
+
+function visualRestart(Module) {
+    ++visualSequence;
+    visualQueue = [];
+    if (feedPool) feedPool.visualPending = [];
+    visualPlanned = sizeToNumber(Module._wmp_visual_head_js(), "visual head");
+}
+
+function visualPump(Module) {
+    const pool = feedPool;
+    if (!visualStreamOn) return;
+    if (!visualPoolActive) {
+        if (!pool || !pool.ready) return;
+        Module._wmp_visual_config_js(1, 0);
+        visualPoolActive = true;
+        visualRestart(Module);
+    }
+    if (!pool || !pool.ready) return;
+    let appended = false;
+    const appendStart = performance.now();
+    while (visualQueue.length && visualQueue[0].result) {
+        const entry = visualQueue.shift();
+        ++visualStats.spans;
+        visualStats.bytes += entry.result.length;
+        const ptr = pointerToNumber(Module._wmp_feed_buffer_js(entry.result.length), "visual buffer");
+        if (!ptr) throw new Error(parserErrorText(Module, "Could not allocate the visual buffer"));
+        Module.HEAPU8.set(entry.result, ptr);
+        if (!Module._wmp_visual_append_js(entry.result.length))
+            throw new Error(parserErrorText(Module, "Could not append the visual span"));
+        appended = true;
+    }
+    visualStats.appendMs += performance.now() - appendStart;
+    while (visualQueue.length < pool.helpers.length * 2 && visualPlanned <= sharpRenderTarget) {
+        const end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, VISUAL_SPAN_WORDS), "visual span end");
+        if (end <= visualPlanned) break;
+        if (!Module._wmp_visual_request_js(visualPlanned, end))
+            throw new Error(parserErrorText(Module, "Could not plan the visual span"));
+        const request = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(),
+            sizeToNumber(Module._wmp_feed_buffer_size_js(), "visual request size"));
+        pool.lastId = (pool.lastId || 0) + 1;
+        const entry = { id: pool.lastId, kind: "visual", sequence: visualSequence, request, result: null };
+        visualQueue.push(entry);
+        pool.visualPending.push(entry);
+        visualPlanned = end;
+    }
+    feedDispatch();
+    if (appended && sharpRenderStarved && !sharpRenderRunning) {
+        sharpRenderStarved = false;
+        void drainSharpRenderer();
+    }
+}
+
+function visualOnResult(entry, m) {
+    if (entry.sequence !== visualSequence) return;
+    entry.result = new Uint8Array(m.result);
+    getModule().then(Module => visualPump(Module)).catch(error => {
+        console.error("[WASMIDI visual]", error);
+        postMessage({ type: "runtime-error", requestType: "sharp-render",
+            message: error && error.message ? error.message : String(error) });
+    });
+}
+
+function visualPoolStopped(Module) {
+    if (!visualPoolActive) return;
+    visualPoolActive = false;
+    visualQueue = [];
+    ++visualSequence;
+    // Local decoding resumes where the appended spans end.
+    Module._wmp_visual_config_js(1, 1);
+    if (sharpRenderStarved) {
+        sharpRenderStarved = false;
+        void drainSharpRenderer();
+    }
+}
+
 // ---- Helper pool ----
 
 function feedHelperCount() {
+    const forced = pageOverride("helpers");
+    if (forced !== null)
+        return Math.min(FEED_HELPERS_MAX, Math.max(0, Math.floor(forced)));
     const cores = Number(self.navigator && self.navigator.hardwareConcurrency) || 1;
     return Math.min(FEED_HELPERS_MAX, Math.max(0, Math.floor(cores / 3)));
 }
@@ -1349,7 +1485,7 @@ async function feedStartPool() {
     }
     const url = new URL("midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
         WASMIDI_MIDI_PARSER_BASE_URL).href;
-    const pool = { ready: false, failed: false, helpers: [], pending: [] };
+    const pool = { ready: false, failed: false, helpers: [], pending: [], visualPending: [] };
     feedPool = pool;
     const inits = [];
     for (let h = 0; h < helpers; ++h) {
@@ -1360,7 +1496,7 @@ async function feedStartPool() {
             worker.onmessage = event => {
                 const m = event.data || {};
                 if (m.type === "feed-ready") resolve();
-                else if (m.type === "feed-result") feedOnResult(helper, m);
+                else if (m.type === "feed-result" || m.type === "visual-result") feedOnResult(helper, m);
                 else if (m.type === "feed-error") {
                     reject(new Error(m.message || "Synth feed helper failed"));
                     feedPoolFailed(m.message);
@@ -1384,7 +1520,9 @@ async function feedStartPool() {
         pool.ready = true;
         console.info("[WASMIDI synth feed] " + helpers + " decode helpers, " +
             (slabCount * slabBytes / 1048576).toFixed(0) + " MiB shared source");
+        postMessage({ type: "helpers-ready", helpers });
         if (feedFill) feedPump(Module);
+        if (sharpRenderReady) void drainSharpRenderer();
     } catch (_) {}
 }
 
@@ -1398,7 +1536,10 @@ function feedPoolFailed(message) {
     feedQueue = [];
     ++feedSequence;
     // Restart the sequential feed exactly where the stitch stopped.
-    getModule().then(Module => { if (feedFill) feedFillSequential(Module); });
+    getModule().then(Module => {
+        visualPoolStopped(Module);
+        if (feedFill) feedFillSequential(Module);
+    });
 }
 
 function feedDispatch() {
@@ -1406,11 +1547,11 @@ function feedDispatch() {
     if (!pool || !pool.ready) return;
     for (const helper of pool.helpers) {
         if (helper.busy) continue;
-        const entry = pool.pending.shift();
+        const entry = pool.pending.shift() || pool.visualPending.shift();
         if (!entry) return;
         helper.busy = entry;
-        helper.worker.postMessage({ type: "feed-decode", id: entry.id, request: entry.request.buffer },
-            [entry.request.buffer]);
+        helper.worker.postMessage({ type: entry.kind === "visual" ? "visual-decode" : "feed-decode",
+            id: entry.id, request: entry.request.buffer }, [entry.request.buffer]);
         entry.request = null;
     }
 }
@@ -1418,7 +1559,9 @@ function feedDispatch() {
 function feedOnResult(helper, m) {
     const entry = helper.busy;
     helper.busy = null;
-    if (entry && entry.id === m.id && entry.sequence === feedSequence) {
+    if (entry && entry.id === m.id && entry.kind === "visual") {
+        visualOnResult(entry, m);
+    } else if (entry && entry.id === m.id && entry.sequence === feedSequence) {
         entry.result = new Uint8Array(m.result);
         getModule().then(Module => feedPump(Module));
     }
@@ -1518,6 +1661,14 @@ self.onmessage = async event => {
                 maxTick: info[0], duration: info[1], ticksPerBeat: info[2],
                 notes: info[3], tracks: info[4], format: info[5]
             });
+            return;
+        }
+        // Song seconds to ticks for a list of times (visual-bench.html).
+        if (message.type === "tick-at") {
+            const Module = await getModule();
+            const seconds = Array.from(message.seconds || []);
+            const ticks = new Float64Array(seconds.map(t => Number(Module._wmp_seconds_to_tick_js(Number(t) || 0))));
+            postMessage({ type: "tick-at", ticks }, [ticks.buffer]);
             return;
         }
         if (message.type === "text-events") {
@@ -1644,6 +1795,8 @@ self.onmessage = async event => {
         const rawLimit = rawSourceLimitBytes(!!self.__wasmidiMidiParserWholeFile);
         if (typeof Module._wmp_set_raw_source_limit_js === "function")
             Module._wmp_set_raw_source_limit_js(rawLimit);
+        visualStreamOn = pageOverride("visualstream") !== 0;
+        Module._wmp_visual_config_js(visualStreamOn ? 1 : 0, 1);
         const ok = await parallelParse(Module, file, total, total > rawLimit) ||
             Module._wmp_parse_file_js(total);
         if (!ok) {

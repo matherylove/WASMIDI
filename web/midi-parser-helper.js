@@ -4,7 +4,8 @@
 
 // Parallel MIDI load helper (HANDOFF sec. 60): indexes a contiguous range of tracks
 // with the same Memory64 parser core and returns the partial index as one buffer. The
-// same script runs the synth feed helpers (HANDOFF sec. 70).
+// same script runs the synth feed helpers (HANDOFF sec. 70) and the visual span helpers
+// (HANDOFF sec. 71).
 
 let corePromise = null;
 
@@ -56,17 +57,18 @@ async function feedMessage(m) {
             postMessage({ type: "feed-ready" });
             return;
         }
+        const visual = m.type === "visual-decode";
         const request = new Uint8Array(m.request);
         const ptr = Number(Module._wmp_feed_buffer_js(request.length));
         if (!ptr)
             throw new Error(errorText(Module, "No memory for the synth feed request"));
         Module.HEAPU8.set(request, ptr);
-        if (!Module._wmp_feed_decode_js(request.length))
-            throw new Error(errorText(Module, "Synth feed decode failed"));
+        if (!(visual ? Module._wmp_visual_decode_js(request.length) : Module._wmp_feed_decode_js(request.length)))
+            throw new Error(errorText(Module, visual ? "Visual span decode failed" : "Synth feed decode failed"));
         const out = Number(Module._wmp_feed_buffer_ptr_js());
         const size = Number(Module._wmp_feed_buffer_size_js());
         const result = Module.HEAPU8.slice(out, out + size);
-        postMessage({ type: "feed-result", id: m.id, result: result.buffer }, [result.buffer]);
+        postMessage({ type: visual ? "visual-result" : "feed-result", id: m.id, result: result.buffer }, [result.buffer]);
     } catch (error) {
         postMessage({ type: "feed-error", message: error && error.message ? error.message : String(error) });
     }
@@ -75,7 +77,7 @@ const feedBase = { baseUrl: "", version: "" };
 
 self.onmessage = async event => {
     const m = event.data || {};
-    if (m.type === "feed-init" || m.type === "feed-decode") {
+    if (m.type === "feed-init" || m.type === "feed-decode" || m.type === "visual-decode") {
         await feedMessage(m);
         return;
     }
