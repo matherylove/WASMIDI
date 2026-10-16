@@ -1,7 +1,6 @@
 // CPU model of the tile path (HANDOFF sec. 38): draws a dense synthetic stream raw and
 // through grid-aligned culled tiles with pixel-centre scissors, and counts pixels
-// whose colour differs. Aligned frames must give 0; misaligned frames show the
-// tile-grid approximation BPFA also accepts.
+// whose colour differs. Aligned and misaligned frames must give 0 (HANDOFF sec. 73).
 // c++ -O2 -std=c++17 -Isrc -o /tmp/cullsim tools/renderer_check/cull_tile_sim.cpp src/renderer/note_raster_compositor.cpp
 #include "renderer/note_raster_compositor.hpp"
 #include <cstdio>

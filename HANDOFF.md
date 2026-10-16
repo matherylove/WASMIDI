@@ -4765,3 +4765,50 @@ Smoke del parser del CI: OK (en el build local).
 
 **No verificado:** las PCs del usuario; saltos justo después del pico en el navegador (las
 densidades todavía decodifican ese segundo en el Worker del parser: ~0,6 s en host).
+
+## 73. Revisión 77 — Las notas muy cortas dejaban huecos en el roll
+
+**Pedido (Dekx):** "las notas muy pequeñas desaparecen dejando un hueco", en todo The Nuker 4.
+
+**Causa:** los tiles culleados (§38) se cullean sobre su propia grilla de píxeles, pero se
+dibujan corridos una fracción de píxel según dónde cae el inicio del tile en el cuadro. El
+culling decidía por centros de píxel: una nota corta que cubría el centro de una columna la
+reclamaba entera y descartaba las notas de atrás en esa columna. Corrida la grilla, la nota
+corta ya no cubre la muestra de esa columna (o cubre otra) y lo que había atrás no se dibuja:
+queda el fondo. Al revés también: una nota que no cubría ningún centro se descartaba aunque en
+el cuadro corrido sí pinta. En `tools/renderer_check/cull_tile_sim.cpp` (flujo sintético
+denso, tiles y cuadros desalineados) el 0,135% de los píxeles salía distinto del dibujo sin
+tiles.
+
+**Cambio** (`CullViewport`, `src/renderer/note_raster_compositor.cpp`): una columna queda
+tapada solo cuando las notas de adelante cubren todos sus ticks. Las columnas que una nota
+cubre enteras se marcan en el bitset de siempre. En las columnas de los bordes se guarda el
+rango de ticks cubierto (bitset `partial` + `partialRange`, sin limpiar el arreglo de rangos;
+los rangos que se tocan se unen y una columna pasa al bitset cuando el rango la cubre entera).
+Una nota sobrevive si alguna columna que toca no está tapada en su tramo. La comparación es en
+ticks enteros, no en píxeles: la GPU calcula los bordes de cada nota con la misma función
+monótona del tick, así que si los ticks de una nota están dentro de la unión de las de
+adelante, cualquier muestra que pinte también la pinta alguna de adelante, con cualquier
+corrimiento y cualquier redondeo. La regla de capas no cambia.
+
+**Medición:**
+
+| | Antes | Después |
+|---|---|---|
+| `cull_tile_sim`: píxeles distintos (362 cuadros desalineados) | 0,1351% | **0** |
+| `cull_tile_sim`: notas que quedan en los tiles | 42,7% | 43,6% |
+| Tiles de 1920 columnas, mismo flujo: notas que quedan / tiempo | 2,82 M / 315 ms | 3,09 M / 348 ms |
+
+En los conjuntos sintéticos del CI (`tools/note_raster_compositor_check.cpp`, notas de
+fracción de píxel) se descarta menos (crashpoint 1M: 76% → 57%; raster 640: 73% → 25%) porque
+ahora se conservan las notas que no cubren un centro en la grilla del tile y sí pintan corridas.
+El check cambió en eso: la nota sin centro debe sobrevivir, y se agregaron dos casos (una nota
+que tapa media columna no esconde a la de atrás; dos que entre las dos la cubren sí).
+
+**Verificación:** check del compositor TODO OK, `cull_tile_sim` 0 píxeles distintos,
+`tools/renderer_check/check.sh` compila, build local completo (pruebas de host del CI + wasm +
+validación del sitio) OK.
+
+**No verificado:** en las PCs con The Nuker 4 (si queda algún hueco con `?tiles=0` también,
+es otra cosa: sin tiles cada nota de menos de un píxel que no cubre un centro no se dibuja,
+igual que antes).
