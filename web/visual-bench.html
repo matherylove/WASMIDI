@@ -57,7 +57,7 @@ runButton.addEventListener("click", () => {
   query.set("bench", String(Date.now()));
   const worker = new Worker("midi-parser-worker.js?" + query.toString());
   const t0 = performance.now();
-  let loadMs = 0, songSeconds = 0;
+  let loadMs = 0, songSeconds = 0, pausedMs = 0;
   // Song time -> tick at 1/240 s steps over the measured span plus the roll lookahead.
   const STEP = 1 / 240;
   let ticks = null;
@@ -122,9 +122,28 @@ runButton.addEventListener("click", () => {
       statusBox.textContent = "Reproduciendo…";
       const playStart = performance.now();
       statusBox.dataset.firstWindowMs = String(playStart - begin);
+      // A hidden tab gets throttled timers: the song clock and the measurement pause.
+      let hiddenAt = document.hidden ? playStart : 0;
+      const onVisibility = () => {
+        if (document.hidden) {
+          if (!hiddenAt) hiddenAt = performance.now();
+          if (pending) pending.discard = true;
+        } else if (hiddenAt) {
+          pausedMs += performance.now() - hiddenAt;
+          hiddenAt = 0;
+        }
+      };
+      document.addEventListener("visibilitychange", onVisibility);
       const frame = () => {
-        const elapsed = (performance.now() - playStart) / 1000;
-        if (elapsed >= duration) { finish("Listo (primera ventana del roll en " + Math.round(playStart - begin) + " ms)"); return; }
+        if (hiddenAt) { statusBox.textContent = "En pausa (pestaña oculta)"; setTimeout(frame, 100); return; }
+        statusBox.textContent = "Reproduciendo…";
+        const elapsed = (performance.now() - playStart - pausedMs) / 1000;
+        if (elapsed >= duration) {
+          document.removeEventListener("visibilitychange", onVisibility);
+          finish("Listo (primera ventana del roll en " + Math.round(playStart - begin) + " ms" +
+            (pausedMs > 0 ? ", en pausa " + (pausedMs / 1000).toFixed(1) + " s con la pestaña oculta" : "") + ")");
+          return;
+        }
         const s = start + elapsed;
         const index = Math.floor(elapsed);
         if (!second || second.index !== index) { flushSecond(); second = newSecond(index); }
@@ -184,8 +203,9 @@ runButton.addEventListener("click", () => {
     } else if (m.type === "live-state") {
       if (pending && (m.requestId >>> 0) === pending.id) {
         const ms = performance.now() - pending.at;
+        const discard = pending.discard;
         pending = null;
-        if (second) {
+        if (second && !discard) {
           second.replies++; second.latency += ms; second.maxLatency = Math.max(second.maxLatency, ms);
           totals.replies++; totals.latency += ms; totals.maxLatency = Math.max(totals.maxLatency, ms);
         }

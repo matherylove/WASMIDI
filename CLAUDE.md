@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§73). Este archivo resume el estado al cierre de la rev. 77 y dice
+`HANDOFF.md` (§1-§74). Este archivo resume el estado al cierre de la rev. 78 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -125,7 +125,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 77)
+## Estado actual (rev. 78)
 
 Rendimiento medido por el usuario:
 
@@ -156,6 +156,12 @@ Rendimiento medido por el usuario:
 - Rev. 77 (HANDOFF §73): los tiles del roll dejaban huecos donde había notas muy cortas
   (culling por centros de píxel y tiles dibujados corridos). Ahora una columna se tapa solo
   si las notas de adelante cubren todos sus ticks: 0 píxeles distintos en `cull_tile_sim`.
+- Rev. 78 (HANDOFF §74): WasmiSynth renderiza las voces estéreo del bucle genérico de a
+  cuatro con vectores (SIMD128 en wasm): ~1,5× menos CPU por voz en host; recorte del pico a
+  6144 voces en Chromium: carga 162% → 128%, underruns 368 → 128; ≤ 1 LSB de diferencia.
+  El usuario: 6144 voces estables en el 5900X; la meta de 24576 necesita el synth por GPU.
+  `visual-bench.html` se pausa con la pestaña oculta; WASMIDI Audio suena oculta con todo
+  lo visual congelado (`browser_bench.py audio ... --hide=S`).
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -178,19 +184,22 @@ Mecanismos activos y cómo desactivarlos:
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |
 | WebGPU | botón CPU/GPU |
 | Trampolín de `worker_cycle` | `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` |
+| Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§72)
+## Pendientes abiertos (ver HANDOFF §67-§74)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
    en WASMIDI y WASMIDI Audio, con MatheryLSD, sin diferencia audible frente a un MIDI
    sin robos ni descartes. Hecho en la rev. 74: (a) admisión en el parser y (b)
    decodificación repartida para el synth. Hecho en la rev. 75: etapa 2, roll/teclado/
-   gráficos desde el flujo visual con helpers. Falta: etapa 3, synth por GPU estilo
-   Kestrel; probar el archivo completo de 20,9 GB en las PCs (`visual-bench.html` y la
-   app); helpers con fuente cruda; saltos justo después del pico (las densidades del reset
-   decodifican ese segundo en el Worker del parser).
+   gráficos desde el flujo visual con helpers. Rev. 78: render de 4 voces por vectores.
+   Medido por el usuario con la canción entera: 6144 voces estables en el 5900X (meta 24576
+   = 1024 × 24 workers) y el roll se atrasa en 830-858 s con 8 helpers (faltan las líneas
+   `[WASMIDI visual]` de ese tramo). Falta: etapa 3, synth por GPU estilo Kestrel; helpers
+   con fuente cruda; saltos justo después del pico (las densidades del reset decodifican
+   ese segundo en el Worker del parser).
 2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
    ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
    (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.

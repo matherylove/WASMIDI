@@ -4256,6 +4256,412 @@ static void compact_worker_voices(worker_data *wd, int ss_profile) {
     }
 }
 
+/* Voices that reach the per-sample loop of worker_cycle with stereo output are parked and
+ * rendered four at a time with lane vectors at the end of their tile (HANDOFF sec. 74).
+ * Each lane keeps the per-sample arithmetic of the scalar loop; a lane that reaches a case
+ * the vectors do not cover leaves at that frame and finishes in voice_run_scalar.
+ * Rollback: -DSSW_VOICE_QUAD=0. */
+#ifndef SSW_VOICE_QUAD
+#    define SSW_VOICE_QUAD 1
+#endif
+typedef float vq_f4 __attribute__((vector_size(16)));
+typedef int vq_i4 __attribute__((vector_size(16)));
+
+typedef struct voice_park {
+    voice *v;
+    const int16_t *data;
+    int f, s_ch, filt, sustain_down;
+    float pos, env;
+    int env_state, pending_note_off_samples, decimate_counter;
+    float last_baseL, last_baseR;
+    float gainL, gainR, pitch_mult;
+    float c_b0, c_b1, c_b2, c_a1, c_a2;
+    float attack_inc, decay_dec, sustain_level, release_alpha;
+    int no_interp, release_allow_no_interp, release_allow_decimate, decimate_mask_block;
+    int loop_active, loop_start, loop_end, playback_end;
+    int porta_active, startup_samples;
+    float porta_offset, porta_step;
+#ifdef VOR
+    float vor_gain_scale;
+#endif
+} voice_park;
+
+static __thread voice_park g_voice_park[RENDER_TILE_VOICES];
+static __thread int g_voice_park_count = 0;
+
+/* The scalar loop of worker_cycle for a parked voice, from frame p->f. Returns 1 when the
+ * voice ended (advance_voice_sample_state returned 0). */
+static int voice_run_scalar(voice_park *p, float *mix, int frames) {
+    voice *v = p->v;
+    const int16_t *data = p->data;
+    const int sch = p->s_ch, filt = p->filt;
+    float pos = p->pos, env = p->env;
+    int env_state = p->env_state, pending = p->pending_note_off_samples, dc = p->decimate_counter;
+    float last_baseL = p->last_baseL, last_baseR = p->last_baseR;
+    const float gainL = p->gainL, gainR = p->gainR, pitch_mult = p->pitch_mult;
+    const float c_b0 = p->c_b0, c_b1 = p->c_b1, c_b2 = p->c_b2, c_a1 = p->c_a1, c_a2 = p->c_a2;
+    const float playback_end_f = (float)p->playback_end;
+    int ended = 0;
+    for (int f = p->f; f < frames; ++f) {
+        if (!advance_voice_sample_state(v, p->sustain_down, &pending, &env_state, &env,
+                                        p->attack_inc, p->decay_dec, p->sustain_level,
+                                        p->release_alpha)) {
+            ended = 1;
+            break;
+        }
+        if (p->release_allow_decimate && env_state == ENV_RELEASE && env < RELEASE_DECIMATE_START &&
+            (dc & p->decimate_mask_block) != 0) {
+            mix[f * 2] += last_baseL * env;
+            mix[f * 2 + 1] += last_baseR * env;
+            pos += pitch_mult; ++dc; continue;
+        }
+        if (pos >= playback_end_f) {
+            if (p->loop_active && p->loop_end > p->loop_start) {
+                pos = wrap_loop_position(pos, p->loop_start, p->loop_end);
+            } else {
+                if (!v->note_off_received) {
+                    v->note_off_received = 1;
+                    env_state = ENV_RELEASE;
+                }
+                pos += pitch_mult; ++dc; continue;
+            }
+        }
+        const int use_no_interp = p->no_interp ||
+            (p->release_allow_no_interp && env_state == ENV_RELEASE && env < RELEASE_SIMPLE_NO_INTERP);
+        const int pi = (int)pos;
+        float vl, vr;
+        if (use_no_interp) {
+            vl = (float)data[sch == 1 ? pi : pi * 2];
+            vr = sch == 1 ? vl : (float)data[pi * 2 + 1];
+        } else {
+            int next = pi + 1;
+            if (next >= p->playback_end) next = p->loop_active ? p->loop_start : pi;
+            const float frac = pos - (float)pi;
+            if (sch == 1) {
+                float s1 = (float)data[pi], s2 = (float)data[next];
+                vl = vr = s1 + (s2 - s1) * frac;
+            } else {
+                float s1l = (float)data[pi * 2], s2l = (float)data[next * 2];
+                float s1r = (float)data[pi * 2 + 1], s2r = (float)data[next * 2 + 1];
+                vl = s1l + (s2l - s1l) * frac;
+                vr = s1r + (s2r - s1r) * frac;
+            }
+        }
+        if (filt) {
+            float filtered_l = v->z1_l + vl * c_b0;
+            v->z1_l = v->z2_l + vl * c_b1 - filtered_l * c_a1;
+            v->z2_l = vl * c_b2 - filtered_l * c_a2;
+            vl = filtered_l;
+            if (sch == 1) {
+                vr = vl;
+            } else {
+                float filtered_r = v->z1_r + vr * c_b0;
+                v->z1_r = v->z2_r + vr * c_b1 - filtered_r * c_a1;
+                v->z2_r = vr * c_b2 - filtered_r * c_a2;
+                vr = filtered_r;
+            }
+        }
+        last_baseL = vl * gainL;
+        last_baseR = vr * gainR;
+        mix[f * 2] += last_baseL * env;
+        mix[f * 2 + 1] += last_baseR * env;
+        pos += pitch_mult; ++dc;
+    }
+    p->pos = pos; p->env = env; p->env_state = env_state;
+    p->pending_note_off_samples = pending; p->decimate_counter = dc;
+    p->last_baseL = last_baseL; p->last_baseR = last_baseR;
+    return ended;
+}
+
+/* The voice_done_ws tail of worker_cycle. */
+static void voice_park_finish(voice_park *p, int frames, int *need_compact) {
+    voice *v = p->v;
+    if (p->porta_active) {
+        float porta_step = p->porta_step;
+        float next_offset = p->porta_offset + porta_step * (float)frames;
+        if ((porta_step < 0.0f && next_offset <= 0.0f) ||
+            (porta_step > 0.0f && next_offset >= 0.0f)) {
+            next_offset = 0.0f;
+            porta_step = 0.0f;
+        }
+        v->portamento_offset = next_offset;
+        v->portamento_step = porta_step;
+    }
+    v->position = p->pos;
+    v->env_level = p->env;
+    v->env_state = p->env_state;
+    v->startup_samples = p->startup_samples;
+    v->pending_note_off_samples = p->pending_note_off_samples;
+#ifdef VOR
+    v->vor_gain_scale = p->vor_gain_scale;
+#endif
+    if (p->env_state != ENV_SUSTAIN || v->note_off_received || v->kill_now ||
+        p->pending_note_off_samples >= 0) {
+        *need_compact = 1;
+    }
+}
+
+static inline vq_f4 vq_sel(vq_i4 m, vq_f4 a, vq_f4 b) {
+    return (vq_f4)((m & (vq_i4)a) | (~m & (vq_i4)b));
+}
+static inline int vq_any(vq_i4 m) { return (m[0] | m[1] | m[2] | m[3]) != 0; }
+
+/* Renders up to four parked voices together. Lanes that leave early keep their frame in
+ * p->f and are finished by the caller with voice_run_scalar. Returns a bit per lane that
+ * ended (silent release). */
+static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) {
+    vq_f4 pos = {0}, pitch = {0}, env = {0}, envm = {0}, enva = {0}, sus = {0}, dec = {0};
+    vq_f4 gl = {0}, gr = {0}, b0 = {0}, b1 = {0}, b2 = {0}, a1 = {0}, a2 = {0};
+    vq_f4 z1l = {0}, z2l = {0}, z1r = {0}, z2r = {0}, lastl = {0}, lastr = {0};
+    vq_i4 state = {0}, alive = {0}, start = {0}, stop = {0}, filt = {0}, mono = {0};
+    vq_i4 nointerp = {0}, allow_ni = {0}, decim = {0}, endf = {0};
+    int dcount[4] = {0, 0, 0, 0}, first = frames, ended = 0;
+    for (int k = 0; k < nl; ++k) {
+        voice_park *p = lane[k];
+        pos[k] = p->pos; pitch[k] = p->pitch_mult; env[k] = p->env;
+        state[k] = p->env_state;
+        envm[k] = p->env_state == ENV_RELEASE ? p->release_alpha : 1.0f;
+        enva[k] = p->env_state == ENV_ATTACK ? p->attack_inc
+                : (p->env_state == ENV_DECAY ? -p->decay_dec : 0.0f);
+        sus[k] = p->sustain_level; dec[k] = p->decay_dec;
+        gl[k] = p->gainL; gr[k] = p->gainR;
+        b0[k] = p->c_b0; b1[k] = p->c_b1; b2[k] = p->c_b2; a1[k] = p->c_a1; a2[k] = p->c_a2;
+        z1l[k] = p->v->z1_l; z2l[k] = p->v->z2_l; z1r[k] = p->v->z1_r; z2r[k] = p->v->z2_r;
+        lastl[k] = p->last_baseL; lastr[k] = p->last_baseR;
+        alive[k] = (p->env_state == ENV_ATTACK || p->env_state == ENV_DECAY ||
+                    p->env_state == ENV_SUSTAIN || p->env_state == ENV_RELEASE) ? -1 : 0;
+        start[k] = p->f;
+        stop[k] = p->pending_note_off_samples > 0 ? p->f + p->pending_note_off_samples - 1 : frames;
+        if (stop[k] > frames) stop[k] = frames;
+        filt[k] = p->filt ? -1 : 0; mono[k] = p->s_ch == 1 ? -1 : 0;
+        nointerp[k] = p->no_interp ? -1 : 0; allow_ni[k] = p->release_allow_no_interp ? -1 : 0;
+        decim[k] = p->release_allow_decimate ? -1 : 0;
+        endf[k] = p->playback_end;
+        if (p->f < first) first = p->f;
+        if (!alive[k]) p->f = frames;
+    }
+    const vq_f4 endpos = __builtin_convertvector(endf, vq_f4);
+    const vq_f4 one = {1.0f, 1.0f, 1.0f, 1.0f}, zero = {0.0f, 0.0f, 0.0f, 0.0f};
+    const vq_f4 silence = {VOICE_SILENCE, VOICE_SILENCE, VOICE_SILENCE, VOICE_SILENCE};
+    const vq_f4 decim_start = {RELEASE_DECIMATE_START, RELEASE_DECIMATE_START,
+                               RELEASE_DECIMATE_START, RELEASE_DECIMATE_START};
+    const vq_f4 ni_start = {RELEASE_SIMPLE_NO_INTERP, RELEASE_SIMPLE_NO_INTERP,
+                            RELEASE_SIMPLE_NO_INTERP, RELEASE_SIMPLE_NO_INTERP};
+    const vq_i4 st_att = {ENV_ATTACK, ENV_ATTACK, ENV_ATTACK, ENV_ATTACK};
+    const vq_i4 st_dec = {ENV_DECAY, ENV_DECAY, ENV_DECAY, ENV_DECAY};
+    const vq_i4 st_sus = {ENV_SUSTAIN, ENV_SUSTAIN, ENV_SUSTAIN, ENV_SUSTAIN};
+    const vq_i4 st_rel = {ENV_RELEASE, ENV_RELEASE, ENV_RELEASE, ENV_RELEASE};
+    float *const tl = mix;
+    static const int16_t vq_silent[4] = {0, 0, 0, 0};
+    const int16_t *dptr[4] = {vq_silent, vq_silent, vq_silent, vq_silent};
+    for (int k = 0; k < nl; ++k) dptr[k] = lane[k]->data;
+    const vq_f4 relthr = vq_sel(decim, decim_start, silence);
+    for (int f = first; f < frames; ++f) {
+        const vq_i4 fv = {f, f, f, f};
+        vq_i4 act = alive & (fv >= start) & (fv < stop);
+        /* Lanes at their pending note-off frame leave here for the scalar loop. */
+        const vq_i4 at_stop = alive & (fv == stop) & (stop < frames);
+        if (vq_any(at_stop)) {
+            for (int k = 0; k < nl; ++k) if (at_stop[k]) { lane[k]->f = f; alive[k] = 0; }
+        }
+        if (!vq_any(act)) {
+            if (!vq_any(alive)) break;
+            continue;
+        }
+        /* A run of frames in which no lane starts, stops, reaches the end of its sample
+         * (next index stays inside) or crosses an envelope boundary. */
+        int run = frames - f;
+        for (int k = 0; k < nl; ++k) {
+            if (!alive[k]) continue;
+            const int b = f < start[k] ? start[k] - f : stop[k] - f;
+            if (b < run) run = b;
+            if (act[k] && pitch[k] > 0.0f) {
+                const float margin = 2.0f + (float)frames * endpos[k] * (1.0f / 8388608.0f);
+                const float room = (endpos[k] - margin - pos[k]) / pitch[k];
+                const int r = room > 0.0f ? (int)room : 0;
+                if (r < run) run = r;
+            }
+        }
+        if (run >= 2) {
+            /* Inside the run the inactive lanes read a silent sample with zero gain and
+             * keep a constant envelope, so the loop needs no lane masks. */
+            const vq_i4 isatt = act & (state == st_att), isdec = act & (state == st_dec);
+            const vq_i4 isrel = act & (state == st_rel);
+            const vq_i4 fa = act & filt, fs = fa & ~mono;
+            const vq_i4 ni = act & (nointerp | (allow_ni & isrel & (env < ni_start)));
+            const vq_i4 ni_cross = isrel & allow_ni & ~ni;
+            const vq_f4 inf = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
+            const vq_f4 hi = vq_sel(isatt, one, inf);
+            vq_f4 lo = vq_sel(isdec, sus, vq_sel(isrel, relthr, -inf));
+            lo = vq_sel(ni_cross & (lo < ni_start), ni_start, lo);
+            const vq_f4 wenvm = vq_sel(act, envm, one), wenva = vq_sel(act, enva, zero);
+            const vq_f4 wgl = vq_sel(act, gl, zero), wgr = vq_sel(act, gr, zero);
+            const vq_f4 wpitch = vq_sel(act, pitch, zero);
+            vq_f4 wpos = vq_sel(act, pos, zero), wenv = env;
+            const vq_f4 fb0 = vq_sel(fa, b0, one), fb1 = vq_sel(fa, b1, zero), fb2 = vq_sel(fa, b2, zero);
+            const vq_f4 fa1 = vq_sel(fa, a1, zero), fa2 = vq_sel(fa, a2, zero);
+            vq_f4 wz1l = vq_sel(fa, z1l, zero), wz2l = vq_sel(fa, z2l, zero);
+            vq_f4 wz1r = vq_sel(fs, z1r, zero), wz2r = vq_sel(fs, z2r, zero);
+            const int16_t *rp[4];
+            for (int k = 0; k < 4; ++k) rp[k] = act[k] ? dptr[k] : vq_silent;
+            const vq_i4 st2 = act & ~mono, offr = act & ~mono & (vq_i4){1, 1, 1, 1};
+            const vq_i4 step = offr + (vq_i4){1, 1, 1, 1};
+            const int any_ni = vq_any(ni);
+            vq_f4 bl = zero, br = zero;
+            int j = 0;
+            for (; j < run; ++j) {
+                const vq_f4 en = wenv * wenvm + wenva;
+                if (vq_any((en >= hi) | (en <= lo))) break;
+                wenv = en;
+                const vq_i4 ip = __builtin_convertvector(wpos, vq_i4);
+                vq_f4 fr = wpos - __builtin_convertvector(ip, vq_f4);
+                if (any_ni) fr = vq_sel(ni, zero, fr);
+                const vq_i4 il = ip + (ip & st2), ir = il + offr;
+                const vq_i4 nl2 = il + step, nr2 = ir + step;
+                const vq_f4 s1l = {rp[0][il[0]], rp[1][il[1]], rp[2][il[2]], rp[3][il[3]]};
+                const vq_f4 s1r = {rp[0][ir[0]], rp[1][ir[1]], rp[2][ir[2]], rp[3][ir[3]]};
+                const vq_f4 s2l = {rp[0][nl2[0]], rp[1][nl2[1]], rp[2][nl2[2]], rp[3][nl2[3]]};
+                const vq_f4 s2r = {rp[0][nr2[0]], rp[1][nr2[1]], rp[2][nr2[2]], rp[3][nr2[3]]};
+                const vq_f4 vl = s1l + (s2l - s1l) * fr;
+                const vq_f4 vr = s1r + (s2r - s1r) * fr;
+                const vq_f4 fl = wz1l + vl * fb0;
+                wz1l = wz2l + vl * fb1 - fl * fa1;
+                wz2l = vl * fb2 - fl * fa2;
+                const vq_f4 frr = wz1r + vr * fb0;
+                wz1r = wz2r + vr * fb1 - frr * fa1;
+                wz2r = vr * fb2 - frr * fa2;
+                bl = fl * wgl;
+                br = vq_sel(mono, fl, frr) * wgr;
+                const vq_f4 l = bl * wenv, r = br * wenv;
+                tl[(f + j) * 2] += (l[0] + l[1]) + (l[2] + l[3]);
+                tl[(f + j) * 2 + 1] += (r[0] + r[1]) + (r[2] + r[3]);
+                wpos += wpitch;
+            }
+            if (j > 0) {
+                env = vq_sel(act, wenv, env);
+                pos = vq_sel(act, wpos, pos);
+                lastl = vq_sel(act, bl, lastl);
+                lastr = vq_sel(act, br, lastr);
+                z1l = vq_sel(fa, wz1l, z1l); z2l = vq_sel(fa, wz2l, z2l);
+                z1r = vq_sel(fs, wz1r, z1r); z2r = vq_sel(fs, wz2r, z2r);
+            }
+            for (int k = 0; k < nl; ++k) dcount[k] += act[k] ? j : 0;
+            f += j;
+            if (j == run) { --f; continue; }
+        }
+        const vq_f4 env0 = env, envm0 = envm, enva0 = enva;
+        const vq_i4 state0 = state;
+        env = vq_sel(act, env * envm + enva, env);
+        const vq_i4 att = act & (state == st_att) & (env >= one);
+        const vq_i4 dcy = act & (state == st_dec) & (env <= sus);
+        const vq_i4 dead = act & (state == st_rel) & (env <= silence);
+        if (vq_any(att | dcy)) {
+            env = vq_sel(att, one, env);
+            state = (att & st_dec) | (~att & state);
+            enva = vq_sel(att, -dec, enva);
+            env = vq_sel(dcy, sus, env);
+            state = (dcy & st_sus) | (~dcy & state);
+            enva = vq_sel(dcy, zero, enva);
+        }
+        vq_i4 leave = act & ~dead & decim & (state == st_rel) & (env < decim_start);
+        const vq_i4 at_end = act & ~dead & ~leave & (pos >= endpos);
+        if (vq_any(at_end)) {
+            for (int k = 0; k < nl; ++k) {
+                if (!at_end[k]) continue;
+                voice_park *p = lane[k];
+                if (p->loop_active && p->loop_end > p->loop_start)
+                    pos[k] = wrap_loop_position(pos[k], p->loop_start, p->loop_end);
+                else
+                    leave[k] = -1;
+            }
+        }
+        if (vq_any(dead | leave)) {
+            for (int k = 0; k < nl; ++k) {
+                if (dead[k]) {
+                    state[k] = ENV_OFF; alive[k] = 0; lane[k]->f = frames; ended |= 1 << k;
+                    if (lane[k]->pending_note_off_samples > 0)
+                        lane[k]->pending_note_off_samples -= f - start[k] + 1;
+                } else if (leave[k]) {
+                    env[k] = env0[k]; envm[k] = envm0[k]; enva[k] = enva0[k]; state[k] = state0[k];
+                    alive[k] = 0; lane[k]->f = f;
+                }
+            }
+            act &= ~(dead | leave);
+            if (!vq_any(act)) continue;
+        }
+        vq_i4 pi = __builtin_convertvector(pos, vq_i4);
+        vq_f4 frac = pos - __builtin_convertvector(pi, vq_f4);
+        const vq_i4 ni = nointerp | (allow_ni & (state == st_rel) & (env < ni_start));
+        frac = vq_sel(ni, zero, frac);
+        vq_f4 s1l = zero, s2l = zero, s1r = zero, s2r = zero;
+        for (int k = 0; k < nl; ++k) {
+            if (!act[k]) continue;
+            const voice_park *p = lane[k];
+            const int16_t *d = p->data;
+            const int i = pi[k];
+            int next = i + 1;
+            if (next >= p->playback_end) next = p->loop_active ? p->loop_start : i;
+            if (p->s_ch == 1) {
+                s1l[k] = s1r[k] = (float)d[i];
+                s2l[k] = s2r[k] = (float)d[next];
+            } else {
+                s1l[k] = (float)d[i * 2]; s1r[k] = (float)d[i * 2 + 1];
+                s2l[k] = (float)d[next * 2]; s2r[k] = (float)d[next * 2 + 1];
+            }
+        }
+        vq_f4 vl = s1l + (s2l - s1l) * frac;
+        vq_f4 vr = s1r + (s2r - s1r) * frac;
+        const vq_i4 fa = act & filt;
+        if (vq_any(fa)) {
+            const vq_f4 fl = z1l + vl * b0;
+            z1l = vq_sel(fa, z2l + vl * b1 - fl * a1, z1l);
+            z2l = vq_sel(fa, vl * b2 - fl * a2, z2l);
+            const vq_f4 fr = z1r + vr * b0;
+            const vq_i4 fs = fa & ~mono;
+            z1r = vq_sel(fs, z2r + vr * b1 - fr * a1, z1r);
+            z2r = vq_sel(fs, vr * b2 - fr * a2, z2r);
+            vl = vq_sel(fa, fl, vl);
+            vr = vq_sel(fa, vq_sel(mono, fl, fr), vr);
+        }
+        const vq_f4 bl = vl * gl, br = vr * gr;
+        lastl = vq_sel(act, bl, lastl);
+        lastr = vq_sel(act, br, lastr);
+        const vq_f4 l = vq_sel(act, bl * env, zero), r = vq_sel(act, br * env, zero);
+        tl[f * 2] += (l[0] + l[1]) + (l[2] + l[3]);
+        tl[f * 2 + 1] += (r[0] + r[1]) + (r[2] + r[3]);
+        pos = vq_sel(act, pos + pitch, pos);
+        for (int k = 0; k < nl; ++k) dcount[k] += act[k] ? 1 : 0;
+    }
+    for (int k = 0; k < nl; ++k) {
+        voice_park *p = lane[k];
+        voice *v = p->v;
+        if (alive[k]) p->f = frames;
+        if (p->pending_note_off_samples > 0 && !(ended & (1 << k)))
+            p->pending_note_off_samples -= (p->f > start[k] ? p->f : start[k]) - start[k];
+        p->pos = pos[k]; p->env = env[k]; p->env_state = state[k];
+        p->decimate_counter += dcount[k];
+        p->last_baseL = lastl[k]; p->last_baseR = lastr[k];
+        v->z1_l = z1l[k]; v->z2_l = z2l[k]; v->z1_r = z1r[k]; v->z2_r = z2r[k];
+    }
+    return ended;
+}
+
+static void voice_park_flush(float *mix, int frames, int *need_compact) {
+    const int n = g_voice_park_count;
+    g_voice_park_count = 0;
+    for (int base = 0; base < n; base += 4) {
+        voice_park *lane[4];
+        int nl = n - base < 4 ? n - base : 4;
+        for (int k = 0; k < nl; ++k) lane[k] = &g_voice_park[base + k];
+        const int ended = voice_quad_render(lane, nl, mix, frames);
+        for (int k = 0; k < nl; ++k) {
+            voice_park *p = lane[k];
+            if (!(ended & (1 << k)) && p->f < frames) voice_run_scalar(p, mix, frames);
+            voice_park_finish(p, frames, need_compact);
+        }
+    }
+}
+
 static int worker_cycle(int widx, worker_data *wd) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
 const int ss_profile = debug_metrics_on();
@@ -6157,6 +6563,30 @@ continue;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
+                                                                                                                                                                                                                                                                if (SSW_VOICE_QUAD && channels == 2 && vor_fast_ok && (s_ch == 1 || s_ch == 2) && !half_rate_candidate &&
+                                                                                                                                                                                                                                                                    g_voice_park_count < RENDER_TILE_VOICES) {
+                                                                                                                                                                                                                                                                    voice_park *pk = &g_voice_park[g_voice_park_count++];
+                                                                                                                                                                                                                                                                    pk->v = v; pk->data = data; pk->f = f_start; pk->s_ch = s_ch; pk->filt = filter_enabled;
+                                                                                                                                                                                                                                                                    pk->sustain_down = sustain_down;
+                                                                                                                                                                                                                                                                    pk->pos = pos; pk->env = env; pk->env_state = env_state;
+                                                                                                                                                                                                                                                                    pk->pending_note_off_samples = pending_note_off_samples; pk->decimate_counter = decimate_counter;
+                                                                                                                                                                                                                                                                    pk->last_baseL = last_baseL; pk->last_baseR = last_baseR;
+                                                                                                                                                                                                                                                                    pk->gainL = gainL; pk->gainR = gainR; pk->pitch_mult = pitch_mult;
+                                                                                                                                                                                                                                                                    pk->c_b0 = c_b0; pk->c_b1 = c_b1; pk->c_b2 = c_b2; pk->c_a1 = c_a1; pk->c_a2 = c_a2;
+                                                                                                                                                                                                                                                                    pk->attack_inc = attack_inc; pk->decay_dec = decay_dec;
+                                                                                                                                                                                                                                                                    pk->sustain_level = sustain_level; pk->release_alpha = release_alpha;
+                                                                                                                                                                                                                                                                    pk->no_interp = no_interp; pk->release_allow_no_interp = release_allow_no_interp;
+                                                                                                                                                                                                                                                                    pk->release_allow_decimate = release_allow_decimate; pk->decimate_mask_block = decimate_mask_block;
+                                                                                                                                                                                                                                                                    pk->loop_active = loop_active; pk->loop_start = loop_start; pk->loop_end = loop_end;
+                                                                                                                                                                                                                                                                    pk->playback_end = playback_end;
+                                                                                                                                                                                                                                                                    pk->porta_active = porta_active; pk->porta_offset = porta_offset; pk->porta_step = porta_step;
+                                                                                                                                                                                                                                                                    pk->startup_samples = startup_samples;
+                                                                                                                                                                                                                                                                #ifdef VOR
+                                                                                                                                                                                                                                                                    pk->vor_gain_scale = vor_gain_scale;
+                                                                                                                                                                                                                                                                #endif
+                                                                                                                                                                                                                                                                    continue;
+                                                                                                                                                                                                                                                                }
+
                                                                                                                                                                                                                                                                 for (int f=f_start; f<frames; ++f) {
                                                                                                                                                                                                                                                                 if (!advance_voice_sample_state(v,
                                                                                                                                                                                                                                                                 sustain_down,
@@ -6414,6 +6844,7 @@ need_compact = 1;
 }
 // In cross-thread render, avoid touching owner's release pool here
 }
+if (g_voice_park_count > 0) voice_park_flush(mix, frames, &need_compact);
 if (wgpu_tile_count > 0) wgpu_flush_tile(widx, wgpu_tile_count, frames); // end for (LONG k = idx; k < end; ++k)
 } // end consumer for (;;)
 
