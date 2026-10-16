@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§67). Este archivo resume el estado al cierre de la rev. 72 y dice
+`HANDOFF.md` (§1-§68). Este archivo resume el estado al cierre de la rev. 73 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -98,13 +98,33 @@ Bancos de prueba (necesitan los archivos de prueba del usuario, ver abajo):
 - `tools/host_bench/large_midi_bench.cpp` — carga e índice de MIDIs gigantes.
 - `tools/feeder_check/*_compare.cpp` aceptan `BPFA_ZSTD=1` y `BPFA_PARALLEL=N`.
 
-**El host de desarrollo anterior tenía 1 núcleo**: no medía paralelismo real. Si este
-entorno tiene varios núcleos, red o Chromium, aprovecharlo: con emsdk 3.1.56 + Qt 6.8.3
-se puede compilar localmente y medir en Chromium headless (Playwright) sirviendo
-`site/` con `Cross-Origin-Opener-Policy: same-origin` y
-`Cross-Origin-Embedder-Policy: require-corp`.
+**El host de desarrollo anterior tenía 1 núcleo, sin red ni emsdk**: no medía
+paralelismo real ni podía compilar el wasm. En Claude Code, si hay red y varios núcleos,
+compilar y medir localmente:
 
-## Estado actual (rev. 72)
+```sh
+tools/dev_setup.sh                 # una vez: emsdk 3.1.56, Qt 6.8.3 (aqt), Playwright/Chromium
+source tools/dev_env.sh            # en cada shell que compila
+tools/local_build.sh               # pruebas de host del CI + compilación + site/ (mismos pasos del CI)
+python3 tools/serve_site.py site 8080 &          # sirve con COOP/COEP (pthreads)
+python3 tools/browser_bench.py parser tools/data/Hypernova.mid
+python3 tools/browser_bench.py audio tools/data/Hypernova.mid tools/data/MatheryLSD.sf2 30
+python3 tools/browser_bench.py shot audio.html /tmp/audio.png
+```
+
+`tools/run_ci_step.py "<nombre del paso>"` ejecuta cualquier paso `run:` del workflow tal
+cual (sin copias que se desincronicen); sin argumentos lista los pasos. Chromium headless
+no suele tener GPU real: los resultados de WebGPU ahí no son representativos.
+
+### Archivos de prueba
+
+No están en el repo (son grandes y del usuario). Ponerlos en `tools/data/` (ignorado por
+git) o pedírselos: **Hypernova.mid** (≈500 MB, 26 pistas, 960 PPQ, 44,7 M notas; zona
+densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid**
+(15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
+con letras, `tools/feeder_check` genera MIDIs sintéticos.
+
+## Estado actual (rev. 73)
 
 Rendimiento medido por el usuario:
 
@@ -113,6 +133,11 @@ Rendimiento medido por el usuario:
   paralelo, rev. 67).
 - WasmiSynth en host, Hypernova zona densa, 1024 voces, 1 worker: 1,57× tiempo real
   (rev. 67) → **0,67×** con admisión + tope de robos (rev. 68).
+- 12288 voces cuestan ~8× más CPU que 1024 (el pool se llena); los workers casi no
+  agregan costo. Auto usa Single siempre (rev. 72).
+- Modo GPU (rev. 73): costo del lado CPU 6,2 → 2,8 ms (1024 voces) y 57 → 9,3 ms
+  (12288 voces) por bloque de 11,6 ms; avance de estado en forma cerrada y reserva de
+  peticiones por tile. **Sin verificar en un navegador con GPU real.**
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -133,29 +158,24 @@ Mecanismos activos y cómo desactivarlos:
 | Trampolín de `worker_cycle` | `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (en orden de llegada; ver HANDOFF §67)
+## Pendientes abiertos (ver HANDOFF §67-§68)
 
-1. **WebGPU con 12 workers mucho más lento que con 1 worker** (con 1 worker rinde igual
-   que CPU). Sin investigar; hipótesis en §67.
-2. **"¿Dónde están los controles?"** — pregunta del usuario sin contexto suficiente;
-   aclarar a qué controles se refiere antes de tocar nada.
-3. **Ventanas/paneles minimizados no deben usar CPU ni GPU** y deben poder reanudarse
-   rápido y barato. Aclarar si habla de la pestaña/ventana del navegador minimizada, de
-   paneles de la app o de WASMIDI Audio.
-4. **Optimizar el uso de recursos de lo visual sin que se vea choppy**, con pocos frames
-   o de mala calidad.
-5. **Bug: a veces, tras cambiar de synth, el programa descarga la SoundFont y no puede
-   cargar otra.**
-6. Los anteriores sin cerrar: confirmar en el navegador que el shader WGSL compila y
-   que WebGPU anda (rev. 70); objetivo pedido de 60 fps mínimo y 1024 voces constantes
-   en The Nuker 3 (plan de §60 del chat: decodificación repartida durante la
-   reproducción, teclado/gráficos sin decodificar, tiles culleados repartidos);
-   reconstrucción del teclado en seeks lejanos de The Nuker (~15 s); coordinador que
-   también tome tiles de render; GUI cosmética; mapeo GM de instrumentos/drums;
-   precisión de CC.
-
-El usuario dijo explícitamente **"no hagas nada todavía"** sobre los puntos 2-5 al
-pedir este handoff: empezar aclarando y proponiendo.
+1. **Meta del usuario: The Nuker 3 y 4 en tiempo real de principio a fin a 1024
+   voces** (Ryzen 9 5900X), sin quedarse sin frames; synth, roll, teclado, contadores y
+   gráficos en tiempo real, sin perder calidad ni descartar notas "hasta que la canción
+   no se reconozca". WasmiSynth a 1024 voces no es el cuello; lo es alimentarlo (~44 M
+   eventos/s a mitad de The Nuker 3). Propuesto y **esperando respuesta del usuario**:
+   (a) admisión en el parser (descartar ahí los note-ons que el synth no admitiría, con
+   sus note-offs emparejados FIFO por canal/tecla); (b) decodificación repartida entre
+   los helpers persistentes de la carga paralela; después, tiles culleados repartidos
+   para el roll y teclado/contadores sin decodificación propia (plan en HANDOFF §60 y en
+   la propuesta previa a la rev. 68).
+2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
+   ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
+   (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.
+3. Anteriores: reconstrucción del teclado en seeks lejanos de The Nuker (~15 s);
+   que el hilo coordinador también tome tiles de render; GUI cosmética; mapeo GM de
+   instrumentos/drums; precisión de CC.
 
 ## Errores a no repetir (detalle en HANDOFF §7)
 
@@ -170,6 +190,8 @@ pedir este handoff: empezar aclarando y proponiendo.
 - No comparar mediciones que cambian dos variables a la vez.
 - No editar `HANDOFF.md` reemplazando bloques: solo agregar o corregir en el lugar.
 - No afirmar que una herramienta no existe sin buscarla en todo el sistema.
+- No dejar la descarga a GPU del motor encendida mientras el JS no la atiende (rev. 73):
+  cualquier cambio en el ciclo de vida del core debe apagarla primero.
 
 ## Licencias de las referencias
 

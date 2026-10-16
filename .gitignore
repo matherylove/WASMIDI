@@ -1,0 +1,6 @@
+build/
+site/
+tools/data/
+__pycache__/
+node_modules/
+*.wav

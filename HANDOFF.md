@@ -4459,4 +4459,33 @@ pendiente para la meta: admisión en el parser (descartar ahí los note-ons que 
 no admitiría, con sus note-offs), y decodificación repartida entre los helpers
 persistentes de la carga paralela.
 
-Última revisión entregada: `wasmidi-main-rev73-gpu-audio-windows.zip`.
+Revisión anterior entregada: `wasmidi-main-rev73-gpu-audio-windows.zip`.
+
+---
+
+## 68. Revisión 73.1 — paso a Claude Code
+
+**Pedido del usuario:** mover todo el proyecto a Claude Code y recibir lo necesario.
+
+**Cambios (sin tocar código de la app):**
+
+- `CLAUDE.md` actualizado al estado de la rev. 73 (lo lee Claude Code al empezar):
+  proyecto, forma de trabajo, build, verificación, archivos de prueba, estado, pendientes
+  (la meta de The Nuker en tiempo real queda primera, esperando respuesta del usuario),
+  errores a no repetir y licencias.
+- Herramientas para compilar y medir fuera de GitHub Actions con las mismas versiones:
+  `tools/dev_setup.sh` (emsdk 3.1.56, Qt 6.8.3 por aqt, Playwright/Chromium),
+  `tools/dev_env.sh`, `tools/local_build.sh` (pruebas de host + configure + build +
+  validación + `site/`), `tools/run_ci_step.py` (ejecuta cualquier paso `run:` del
+  workflow por nombre, así lo local no se desincroniza del CI),
+  `tools/serve_site.py` (servidor con COOP/COEP/CORP) y `tools/browser_bench.py`
+  (Chromium headless: `parser` corre `parser-bench.html`, `audio` carga MIDI+SF2 en
+  WASMIDI Audio y registra voces/carga/búfer/underruns por segundo, `shot` captura).
+- `.gitignore`: `build/`, `site/`, `tools/data/` (archivos de prueba), `*.wav`.
+
+**Verificado acá:** `run_ci_step.py` corre el paso de pruebas de host del CI completo
+(exit 0); `serve_site.py` devuelve los tres encabezados; `browser_bench.py shot` captura
+`audio.html` en Chromium headless. `dev_setup.sh` y `local_build.sh` no se pudieron
+correr (sin red).
+
+Última revisión entregada: `wasmidi-main-rev73.1-claude-code.zip`.
