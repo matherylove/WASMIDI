@@ -4120,4 +4120,59 @@ C con el mismo algoritmo):**
 del `mapAsync` y la ganancia de rendimiento. Probar con el botón GPU y mirar el estado del
 panel ("active (N MB of samples on the GPU)" o el motivo de "unavailable") y la consola.
 
-Última revisión entregada: `wasmidi-main-rev70-webgpu.zip`.
+Revisión anterior entregada: `wasmidi-main-rev70-webgpu.zip`.
+
+---
+
+## 64. Revisión 71 — WASMIDI Audio (reproductor solo de audio)
+
+**Pedido del usuario:** un reproductor HTML estilo Winamp, con el estilo visual y de GUI
+de dekx.cc y sus programas, que use el sistema completo de WASMIDI pero solo para audio
+con WasmiSynth, para aislar los problemas de audio de los del piano roll, el teclado y
+los gráficos. Nombre: **WASMIDI Audio**.
+
+**Archivos nuevos (`web/`, desplegados por el CI junto al sitio):**
+
+- `audio.html`: dos ventanas apiladas con el kit de ventanas de Dekxtopia (barra de
+  título degradada, botones de caption, barra de menú con Home / WebAssembly MIDI Player /
+  WASMIDI Audio, barra de estado, group boxes). Ventana principal estilo Winamp: LCD con
+  reloj VT323, estado (PLAY/PAUSE/STOP), marquesina con el nombre del MIDI, lecturas de
+  voces activas, carga de render, llenado del búfer y underruns, medidor; barra de
+  posición; transporte (reinicio, play, pausa, stop, abrir MIDI, abrir SF2, CPU/GPU,
+  volumen). Ventana "Info": datos del MIDI (archivo, tamaño, formato, pistas, notas, PPQ,
+  duración, SoundFont), configuración de WasmiSynth (voces, workers, bloque, búferes,
+  sharding, limitador, Apply) con lecturas (workers, motor, notas descartadas, robos) y un
+  registro con los tiempos de cada etapa de carga. Arrastrar y soltar `.mid`/`.sf2`;
+  espacio = play/pausa.
+- `audio.css`: la base de `dekx.css` copiada (variables, `.win`, caption, menú, botones,
+  campos, status bar, group) más los estilos del reproductor. Se copia en vez de enlazar
+  `dekx.cc/dekx.css` porque la página corre con COEP `require-corp` (pthreads) y una hoja
+  de otro origen sin CORP no cargaría. Las fuentes de Google se piden con `crossorigin`.
+- `wasmidi-audio.js`: orquesta lo mismo que `mainwindow.cpp` para el audio, sin Qt:
+  worker del parser (`parse`, progreso, `doc-info`), `WasmidiSnappyBridge`
+  (`ensureBackend`, `configure`, `loadSoundfontFile`, `play/pause/stop/seek`,
+  `scheduleBatch`, `getAudioClock`, `setVolume`, `setGpu`) y el mismo protocolo de
+  alimentación del synth: `synth-reset` con generación, espera del ACK
+  `synth-cursor-reset`, `synth-pump` con el mismo horizonte (2-4 s según bloque y
+  búferes), cola del pedido más lejano, `synth-more`, `synth-pump-deferred`,
+  `synth-batch` → `scheduleBatch`. Configuración guardada en `localStorage`
+  (`wasmidiAudio`).
+
+**Cambios para que funcione sin el documento de Qt:**
+
+- `midi_worker_core.cpp`: exports `wmp_seconds_to_tick_js` y `wmp_document_info_js`
+  ([maxTick, duración, PPQ, notas, pistas, formato]); en CMake.
+- `midi-parser-worker.js`: mensaje `doc-info`; `synth-reset` acepta `seconds` y
+  `synth-pump` acepta `endSeconds` (se convierten a ticks en el worker).
+- CI: copia los tres archivos y reemplaza `?v=dev` en `audio.html` por la versión del
+  build (igual que en `index.html`).
+
+**Qué aísla:** usa el mismo parser (BPFA, carga paralela incluida), el mismo bridge,
+worker, AudioWorklet y motor que la app, y el mismo protocolo de alimentación; no crea
+el renderer, ni pide barridos visuales, teclado o páginas al worker del parser, que
+queda dedicado al synth. No usa el límite dinámico de velocity de la app (piso 0).
+
+**No verificable acá:** todo corre en el navegador (aislamiento cross-origin, AudioWorklet,
+workers). Archivos JS con `node --check`; exports C++ compilados con stub.
+
+Última revisión entregada: `wasmidi-main-rev71-wasmidi-audio.zip`.

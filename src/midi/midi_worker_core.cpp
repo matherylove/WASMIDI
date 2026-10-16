@@ -862,6 +862,39 @@ double wmp_tick_to_seconds_js(double tick)
             tick, 0.0, double(g_mappedStore.metadata().maxTick))));
 }
 
+// WASMIDI Audio (HANDOFF sec. 64) drives the synth without the Qt player, so it asks
+// the parser for the timeline it would otherwise read from the packed document.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_seconds_to_tick_js(double seconds)
+{
+    if (!g_mappedStore.valid() || !std::isfinite(seconds))
+        return 0.0;
+    const auto& md = g_mappedStore.metadata();
+    return std::clamp<double>(md.secondsToTick(std::max(0.0, seconds)), 0.0, double(md.maxTick));
+}
+
+double g_documentInfo[6];
+
+// [maxTick, durationSeconds, ticksPerBeat, noteCount, trackCount, format]
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_document_info_js()
+{
+    if (!g_mappedStore.valid())
+        return 0.0;
+    const auto& md = g_mappedStore.metadata();
+    g_documentInfo[0] = double(md.maxTick);
+    g_documentInfo[1] = double(md.durationSeconds);
+    g_documentInfo[2] = double(md.ticksPerBeat);
+    g_documentInfo[3] = double(md.noteCount);
+    g_documentInfo[4] = double(md.trackCount);
+    g_documentInfo[5] = double(md.format);
+    return pointerToJsAddress(g_documentInfo);
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif

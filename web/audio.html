@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="WASMIDI Audio — WasmiSynth MIDI player without the piano roll.">
+<title>WASMIDI Audio — Dekxtopia</title>
+<script src="coi-serviceworker.js?v=dev"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400..700&family=VT323&display=swap" rel="stylesheet" crossorigin="anonymous">
+<link rel="stylesheet" href="audio.css?v=dev">
+<script src="snappysynth_bridge.js?v=dev"></script>
+</head>
+<body class="wa">
+<div class="wa-stack">
+
+  <div class="win wa-main" id="main">
+    <div class="win-title">
+      <span class="win-icon"><svg viewBox="0 0 12 12" width="12" height="12" shape-rendering="crispEdges" aria-hidden="true"><path fill="#c4b5fd" d="M4 0h8v2h-8zM4 2h2v6h-2zM10 2h2v7h-2z"/><path fill="#a78bfa" d="M1 7h5v1h-5zM0 8h6v3h-6zM1 11h4v1h-4z"/><path fill="#f0abfc" d="M7 8h5v1h-5zM6 9h6v2h-6zM7 11h4v1h-4z"/></svg></span>
+      <span class="win-text">WASMIDI Audio</span>
+      <span class="win-ctl" aria-hidden="true"><span class="cap-btn"><svg viewBox="0 0 6 7" width="6" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 5h6v2h-6z"/></svg></span><span class="cap-btn"><svg viewBox="0 0 9 9" width="9" height="9" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h9v2h-9zM0 2h1v7h-1zM8 2h1v7h-1zM0 8h9v1h-9z"/></svg></span><span class="cap-btn close"><svg viewBox="0 0 8 7" width="8" height="7" shape-rendering="crispEdges"><path fill="currentColor" d="M0 0h2v1h-2zM6 0h2v1h-2zM1 1h2v1h-2zM5 1h2v1h-2zM2 2h4v1h-4zM3 3h2v1h-2zM2 4h4v1h-4zM1 5h2v1h-2zM5 5h2v1h-2zM0 6h2v1h-2zM6 6h2v1h-2z"/></svg></span></span>
+    </div>
+    <nav class="win-menu" aria-label="Site">
+      <a href="https://dekx.cc/"><u>H</u>ome</a>
+      <a href="./"><u>W</u>ebAssembly MIDI Player</a>
+      <a href="audio.html" class="active" aria-current="page">WASMIDI <u>A</u>udio</a>
+    </nav>
+    <div class="win-body win-pad">
+      <div class="lcd">
+        <div>
+          <div class="clock" id="clock">00:00<small id="total">00:00</small></div>
+          <div class="state stop" id="state"><i></i><span>IDLE</span></div>
+        </div>
+        <div class="right">
+          <div class="marquee" id="marquee"><span>WASMIDI Audio</span></div>
+          <div class="readouts">
+            <div><b>Voices</b><span id="r-voices">0</span></div>
+            <div><b>Load</b><span id="r-load">0%</span></div>
+            <div><b>Buffer</b><span id="r-buffer">0%</span></div>
+            <div><b>Underruns</b><span id="r-underruns">0</span></div>
+          </div>
+          <div class="meter"><i id="meter-load"></i></div>
+        </div>
+      </div>
+
+      <div class="seek">
+        <input type="range" id="seek" min="0" max="1" step="0.01" value="0" aria-label="Position" disabled>
+      </div>
+
+      <div class="transport">
+        <button type="button" id="restart" aria-label="Restart" title="Restart" disabled><svg viewBox="0 0 9 8" width="9" height="8" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h2v8h-2zM8 0h1v8h-1zM7 1h1v6h-1zM6 2h1v4h-1zM5 3h1v2h-1z"/></svg></button>
+        <button type="button" id="play" aria-label="Play" title="Play (Space)" disabled><svg viewBox="0 0 6 8" width="6" height="8" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h1v8h-1zM1 1h1v6h-1zM2 2h1v4h-1zM3 3h1v2h-1z"/></svg></button>
+        <button type="button" id="pause" aria-label="Pause" title="Pause (Space)" disabled><svg viewBox="0 0 7 8" width="7" height="8" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h2v8h-2zM5 0h2v8h-2z"/></svg></button>
+        <button type="button" id="stop" aria-label="Stop" title="Stop" disabled><svg viewBox="0 0 7 7" width="7" height="7" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h7v7h-7z"/></svg></button>
+        <button type="button" id="open-midi" title="Open MIDI">MIDI…</button>
+        <button type="button" id="open-sf2" title="Open SoundFont">SF2…</button>
+        <button type="button" id="gpu" title="WasmiSynth engine: CPU or WebGPU" aria-pressed="false">CPU</button>
+        <span class="spacer"></span>
+        <label class="vol"><span>VOL</span><input type="range" id="volume" min="0" max="100" step="1" value="100" aria-label="Volume"></label>
+      </div>
+      <p class="drop-hint">Drop a .mid and a .sf2 here. Audio only: no piano roll, keyboard or graphs.</p>
+      <input type="file" id="midi-input" accept=".mid,.midi,.kar,audio/midi" hidden>
+      <input type="file" id="sf2-input" accept=".sf2,.sf3,.sfz" hidden>
+    </div>
+    <div class="win-status">
+      <span class="status-cell grow" id="status">Idle</span>
+      <span class="status-cell term" id="synth-status">WasmiSynth</span>
+    </div>
+  </div>
+
+  <div class="win win-child">
+    <div class="win-title">
+      <span class="win-icon"><svg viewBox="0 0 10 11" width="10" height="11" shape-rendering="crispEdges" aria-hidden="true"><path fill="#6f6a98" d="M0 0h7v1h-7zM0 1h1v10h-1zM9 3h1v8h-1zM0 10h10v1h-10zM6 1h2v1h-2zM8 2h1v1h-1z"/><path fill="#dcd8f0" d="M1 1h5v9h-5zM6 2h2v8h-2zM8 3h1v7h-1z"/><path fill="#8a83bd" d="M2 4h4v1h-4zM2 6h6v1h-6zM2 8h5v1h-5z"/></svg></span>
+      <span class="win-text">WASMIDI Audio — Info</span>
+    </div>
+    <div class="win-body win-pad">
+      <div class="info-grid">
+        <div class="group">
+          <span class="legend">MIDI</span>
+          <dl class="kv">
+            <dt>File</dt><dd id="i-file">—</dd>
+            <dt>Size</dt><dd id="i-size">—</dd>
+            <dt>Format</dt><dd id="i-format">—</dd>
+            <dt>Tracks</dt><dd id="i-tracks">—</dd>
+            <dt>Notes</dt><dd id="i-notes">—</dd>
+            <dt>PPQ</dt><dd id="i-ppq">—</dd>
+            <dt>Length</dt><dd id="i-duration">—</dd>
+            <dt>SoundFont</dt><dd id="i-sf2">—</dd>
+          </dl>
+        </div>
+        <div class="group">
+          <span class="legend">WasmiSynth</span>
+          <div class="cfg">
+            <span>Voices</span><input type="number" id="c-voices" min="1" max="5000000" step="1">
+            <span>Workers</span><input type="number" id="c-workers" min="0" max="256" step="1" title="0 = auto">
+            <span>Block</span><input type="number" id="c-block" min="64" max="8192" step="64">
+            <span>Buffers</span><input type="number" id="c-buffers" min="2" max="64" step="1">
+            <span>Sharding</span><select id="c-sharding"><option value="0">Auto</option><option value="1">Channel</option><option value="2">Hash</option><option value="3">Single</option></select>
+            <span>Output</span><label class="check"><input type="checkbox" id="c-softclip"> Limiter</label>
+            <span></span><div class="row"><button type="button" id="apply">Apply</button></div>
+          </div>
+          <dl class="kv" style="margin-top:8px">
+            <dt>Workers</dt><dd id="r-workers">0</dd>
+            <dt>Engine</dt><dd id="r-engine">CPU</dd>
+            <dt>Dropped</dt><dd id="r-dropped">0</dd>
+            <dt>Steals</dt><dd id="r-steals">0</dd>
+          </dl>
+        </div>
+      </div>
+      <div class="log" id="log" aria-live="polite"></div>
+    </div>
+  </div>
+
+</div>
+<script src="wasmidi-audio.js?v=dev"></script>
+</body>
+</html>

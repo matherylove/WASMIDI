@@ -1151,6 +1151,26 @@ self.onmessage = async event => {
             await buildKeyState(message);
             return;
         }
+        // WASMIDI Audio (HANDOFF sec. 64): timeline queries and seconds-based requests.
+        if (message.type === "doc-info") {
+            const Module = await getModule();
+            const ptr = Number(Module._wmp_document_info_js());
+            const info = ptr ? new Float64Array(Module.HEAPU8.buffer, ptr, 6) : new Float64Array(6);
+            postMessage({
+                type: "doc-info",
+                maxTick: info[0], duration: info[1], ticksPerBeat: info[2],
+                notes: info[3], tracks: info[4], format: info[5]
+            });
+            return;
+        }
+        if ((message.type === "synth-reset" || message.type === "synth-pump") &&
+            (Number.isFinite(message.seconds) || Number.isFinite(message.endSeconds))) {
+            const Module = await getModule();
+            if (Number.isFinite(message.seconds))
+                message.tick = Math.floor(Number(Module._wmp_seconds_to_tick_js(message.seconds)));
+            if (Number.isFinite(message.endSeconds))
+                message.endTick = Math.ceil(Number(Module._wmp_seconds_to_tick_js(message.endSeconds)));
+        }
         if (message.type === "synth-reset") {
             synthPriorityUntil = performance.now() + 1;
             await resetSynthCursor(message);
