@@ -17,6 +17,7 @@ constexpr uint64_t CheckpointEventInterval = 256;
 constexpr uint64_t SnapshotEventInterval = 131072;
 constexpr std::size_t SnapshotMaxNotes = 65536;
 constexpr uint64_t SnapshotBudgetNotes = 16ull * 1024ull * 1024ull;
+constexpr uint64_t SnapshotMinTrackNotes = 4096;
 #ifndef WASMIDI_BPFA_NOTE_STORE
 #define WASMIDI_BPFA_NOTE_STORE 0
 #endif
@@ -434,8 +435,9 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         std::vector<OpenNode> openPool;
         uint32_t openFree = NoNode;
         std::array<uint32_t, 16u * 128u> openHead{}, openTail{};
-        uint64_t snapshotNotesUsed = 0;
         const uint64_t snapshotBudget = partialActive_ ? partial_.snapshotBudget : SnapshotBudgetNotes;
+        const uint64_t snapshotBytes = std::max<uint64_t>(1u, partialActive_ ? partial_.rangeEnd - partial_.rangeBegin : size);
+        uint64_t trackSnapshotBudget = 0;
         for (uint16_t t = trackBegin; t < trackEnd; ++t) {
             {
                 // Chunk headers are read in file order so the single pass never jumps ahead.
@@ -449,7 +451,10 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 tracks_[t].byteBegin = position + 8;
                 tracks_[t].byteEnd = position + 8 + length;
                 position += 8ull + length;
+                trackSnapshotBudget = std::max<uint64_t>(SnapshotMinTrackNotes,
+                                                         snapshotBudget * uint64_t(length) / snapshotBytes);
             }
+            uint64_t snapshotInterval = SnapshotEventInterval, snapshotNotesUsed = 0;
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
             uint64_t events = 0, order = 0;
@@ -558,8 +563,19 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 ++events;
                 if ((events % CheckpointEventInterval) == 0)
                     storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
-                if ((events % SnapshotEventInterval) == 0 && openCount <= SnapshotMaxNotes &&
-                    snapshotNotesUsed + openCount <= snapshotBudget) {
+                if ((events % snapshotInterval) == 0 && openCount <= SnapshotMaxNotes &&
+                    openCount <= trackSnapshotBudget) {
+                    while (snapshotNotesUsed + openCount > trackSnapshotBudget) {
+                        snapshotInterval *= 2u;
+                        snapshotNotesUsed = 0;
+                        auto& snaps = storage.snapshots;
+                        snaps.erase(std::remove_if(snaps.begin(), snaps.end(), [&](const VisualSnapshot& v) {
+                            return v.resume.eventIndex % snapshotInterval != 0; }), snaps.end());
+                        for (const VisualSnapshot& v : snaps) snapshotNotesUsed += v.notes.size();
+                    }
+                }
+                if ((events % snapshotInterval) == 0 && openCount <= SnapshotMaxNotes &&
+                    snapshotNotesUsed + openCount <= trackSnapshotBudget) {
                     snapshotNotesUsed += openCount;
                     VisualSnapshot snapshot;
                     snapshot.resume = {d.position, events, d.tick, d.runningStatus};
