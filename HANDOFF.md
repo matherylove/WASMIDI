@@ -5164,3 +5164,36 @@ archivo entero: roll, cierres y teclado IDENTICAL entre merge, flujo local y hel
 - En las PCs del usuario con la canción entera (24 núcleos, 8 helpers). Memoria: el flujo puede
   llegar a ~480 MB en zonas que lo necesiten (antes ~80 MB); a 4,3 M palabras/s usa ~100 MB.
 - Siguen abiertos los crujidos a 24576 voces y el robo caro en modo "Stack gain".
+
+## 79. Revisión 83 — Línea `[WASMIDI app]` por segundo en WASMIDI con `?visualdebug=1`
+
+**Pedido:** el usuario aclara que `visual-bench.html` y WASMIDI Audio rinden mucho mejor que
+WASMIDI, porque WASMIDI corre a la vez WasmiSynth, el roll, los gráficos y el teclado, y que todo
+junto tiene que andar sin lag ni cuadros perdidos. Lo bueno en los bancos sueltos no prueba nada
+sobre WASMIDI.
+
+**Por qué medir primero:** el Chromium del contenedor no tiene GPU. El roll de WASMIDI corre ahí a
+~13 cuadros/s aun con un MIDI liviano (los primeros 30 s de The Nuker 4, 1024 voces, casi sin
+voces activas), y el hilo principal pasa el 88% del tiempo en código del navegador (WebGL por
+software), no en wasm ni JS. Con el recorte de 828-838 s la página deja de responder al dar play.
+Nada de eso dice qué pasa con una GPU real, así que hace falta la medición en las PCs del usuario.
+
+**Cambio:** `web/wasmidi-app-debug.js` (lo inyecta el CI en `index.html`, como el bridge). Con
+`?visualdebug=1` escribe cada segundo, junto a las líneas `[WASMIDI visual]` del Worker del parser:
+
+- cuadros (requestAnimationFrame), cuántos tardaron más de 25 ms y el mayor hueco;
+- tareas largas del hilo principal (PerformanceObserver `longtask`): cantidad y ms;
+- teclado: respuestas/pedidos de `key-state` y su latencia media y máxima;
+- adelanto del roll en ticks (`safeThrough` de los deltas contra el tick del teclado);
+- synth: voces, carga de render, llenado del ring, underruns nuevos, workers y si la GPU está
+  encendida.
+
+Sin el parámetro no hace nada (ni envuelve `Worker`).
+
+**Verificación:** compilación local y pruebas de host del CI; WASMIDI en Chromium con
+`?visualdebug=1` escribe la línea cada segundo y sus números coinciden con los de
+`browser_bench.py app`.
+
+**Pendiente:** el log de WASMIDI del usuario con `?visualdebug=1` en los tramos con lag o
+cuadros perdidos (en GPU y en CPU) para decidir qué compite: hilo principal, GPU compartida
+entre el synth por WebGPU y el roll, o núcleos entre workers del synth y helpers.

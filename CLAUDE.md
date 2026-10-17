@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§78). Este archivo resume el estado al cierre de la rev. 82 y dice
+`HANDOFF.md` (§1-§79). Este archivo resume el estado al cierre de la rev. 83 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 82)
+## Estado actual (rev. 83)
 
 Rendimiento medido por el usuario:
 
@@ -189,6 +189,12 @@ Rendimiento medido por el usuario:
   hasta 48 M palabras y no planea más con 32 M detrás del teclado (con 8 M el teclado se
   congelaba ~1 s cada 3 s). Chromium, archivo entero, 826-840 s: roll atrasado 846 → 0
   cuadros, teclado 60/s.
+- Rev. 83 (HANDOFF §79): el usuario aclara que visual-bench y WASMIDI Audio rinden mucho mejor
+  que WASMIDI (synth + roll + gráficos + teclado a la vez) y que todo junto debe andar sin lag ni
+  cuadros perdidos: **verificar siempre en WASMIDI**. `?visualdebug=1` en WASMIDI escribe una línea
+  `[WASMIDI app]` por segundo (cuadros, tareas largas, teclado, adelanto del roll, synth). El
+  Chromium del contenedor no tiene GPU: ahí el roll de WASMIDI va a ~13 cuadros/s aun con un MIDI
+  liviano, no sirve para medir cuadros.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -200,7 +206,7 @@ Mecanismos activos y cómo desactivarlos:
 | Feed del synth desde el parser (admisión + echo plegado) | `?synthsource=feeder` (feeder JS) o `?synthsource=relay` |
 | Helpers de decodificación (feed y flujo visual) | se saltan solos con < 6 núcleos o fuente cruda; `?helpers=N` fuerza N (0 los apaga) |
 | Fuente cruda / zstd en el navegador | `?rawlimit=MiB` (`0` fuerza zstd) |
-| Flujo visual plegado (roll + teclado) | `?visualstream=0`; `?visualdebug=1` mide en consola |
+| Flujo visual plegado (roll + teclado) | `?visualstream=0`; `?visualdebug=1` mide en consola (Worker del parser y, en WASMIDI, `[WASMIDI app]`) |
 | Tiles culleados del roll | `?tiles=0` en la URL |
 | Límite de render del synth | `?synthlimit=0` / `ssw_set_render_limit_percent(0)` |
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |

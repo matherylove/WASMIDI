@@ -66,6 +66,7 @@ FILES = [
     "web/audio.css",
     "web/wasmidi-audio.js",
     "web/snappysynth-audio-worklet.js",
+    "web/wasmidi-app-debug.js",
     "web/snappysynth-worker.js",
     "web/snappysynth_bridge.js",
     "web/synth-feeder-worker.js",
