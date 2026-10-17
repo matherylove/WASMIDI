@@ -120,17 +120,18 @@ private:
     void drawSharpRing(uint32_t currentTick, uint32_t viewStart,
                        uint32_t viewEnd, uint32_t windowTicks,
                        bool notesReady = true);
-    void drawSharpRingRange(uint32_t viewEnd, bool notesReady);
+    uint32_t drawSharpRingRange(uint32_t viewEnd, bool notesReady);
 
     // BPFA-style culled tile cache (HANDOFF sec. 38).
     struct CullTile {
         uint32_t index = 0;
         GLuint vbo = 0;
         uint32_t count = 0;
-        bool raw = false;
+        uint32_t coverage = 0;
     };
-    void updateCullTiles(uint32_t viewStart, uint32_t windowTicks);
+    void updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady);
     void buildCullTile(uint32_t index, uint32_t windowTicks);
+    CullTile* findCullTileMutable(uint32_t index);
     void releaseCullTiles();
     const CullTile* findCullTile(uint32_t index) const;
     std::vector<CullTile> cullTiles_;
@@ -295,6 +296,12 @@ private:
     uint32_t sharpRemoteStartTick_ = 0;
     bool sharpRemoteWaitingReset_ = false;
     std::chrono::steady_clock::time_point sharpCatchUpAt_{};
+    std::chrono::steady_clock::time_point sharpHeldSince_{};
+    std::chrono::steady_clock::time_point sharpReadySince_{};
+    uint32_t sharpHeldTick_ = 0;
+    uint32_t sharpCatchUpLead_ = 0;
+    uint32_t sharpCatchUpFloor_ = 0;
+    uint32_t sharpCatchUpFrom_ = 0;
     bool rollFrameValid_ = false;
     int rollFrameWidth_ = 0;
     int rollFrameHeight_ = 0;

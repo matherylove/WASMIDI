@@ -265,4 +265,9 @@ if(EMSCRIPTEN)
         "-sMIN_WEBGL_VERSION=2"
         "-sMAX_WEBGL_VERSION=2"
     )
+    # Function names in wasmidi.wasm for DevTools profiles (local builds only).
+    option(WASMIDI_PROFILE_FUNCS "Keep function names in wasmidi.wasm" OFF)
+    if(WASMIDI_PROFILE_FUNCS)
+        target_link_options(wasmidi PRIVATE "--profiling-funcs")
+    endif()
 endif()

@@ -15,6 +15,12 @@ EM_JS(int, wasmidi_tiles_disabled, (), {
     try { return new URL(globalThis.location.href).searchParams.get("tiles") === "0" ? 1 : 0; }
     catch (_) { return 0; }
 });
+// ?rolldraw=0 skips the note draw calls (all CPU work stays): measures the roll's CPU
+// side where the GPU is software, as in headless Chromium (HANDOFF sec. 81).
+EM_JS(int, wasmidi_roll_draw_disabled, (), {
+    try { return new URL(globalThis.location.href).searchParams.get("rolldraw") === "0" ? 1 : 0; }
+    catch (_) { return 0; }
+});
 // Held roll frames (0) and roll catch-ups (1), read by ?visualdebug=1.
 EM_JS(void, wasmidi_roll_debug_count, (int catchUp), {
     if (catchUp)
@@ -22,9 +28,18 @@ EM_JS(void, wasmidi_roll_debug_count, (int catchUp), {
     else
         globalThis.__wasmidiRollHeld = (globalThis.__wasmidiRollHeld | 0) + 1;
 });
+EM_JS(void, wasmidi_roll_debug_drawn, (double instances, double raw, double resident), {
+    const root = globalThis;
+    root.__wasmidiRollDrawnMax = Math.max(root.__wasmidiRollDrawnMax || 0, instances);
+    root.__wasmidiRollRawMax = Math.max(root.__wasmidiRollRawMax || 0, raw);
+    root.__wasmidiRollResident = resident;
+    root.__wasmidiAppMemory = HEAP8.length;
+});
 #else
 static int wasmidi_tiles_disabled() { return 0; }
+static int wasmidi_roll_draw_disabled() { return 0; }
 static void wasmidi_roll_debug_count(int) {}
+static void wasmidi_roll_debug_drawn(double, double, double) {}
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -2612,6 +2627,10 @@ void GLRenderer::resetSharpRenderer(bool requestRemote)
     sharpRemotePendingAppends_.clear();
     sharpRemotePendingCloseWords_.clear();
     sharpRemotePendingCloseOffset_ = 0;
+    sharpCatchUpFloor_ = 0;
+    sharpCatchUpLead_ = 0;
+    sharpHeldSince_ = {};
+    sharpReadySince_ = {};
 
     // Head/tail/generation delimit the valid ring contents. Clearing the full
     // 2^23-note CPU mirror here writes roughly 96 MiB on every seek/reset and
@@ -3192,7 +3211,14 @@ void GLRenderer::regenerateSharpPalette()
     sharpPaletteUploadPending_ = true;
 }
 
-void GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
+static void drawNoteInstances(GLsizei count)
+{
+    static const bool skip = wasmidi_roll_draw_disabled() != 0;
+    if (!skip)
+        glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, count);
+}
+
+uint32_t GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
 {
     // Future geometry may already be resident in the ring/VBO. Do not submit
     // those instances to the GPU until their StartTick reaches this viewport;
@@ -3223,16 +3249,14 @@ void GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
         glBindVertexArray(noteVao_);
         if (first != 0) {
             setInstanceBase(start);
-            glDrawArraysInstanced(
-                GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(first));
+            drawNoteInstances(static_cast<GLsizei>(first));
         }
         if (second != 0) {
             setInstanceBase(0);
-            glDrawArraysInstanced(
-                GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(second));
+            drawNoteInstances(static_cast<GLsizei>(second));
         }
     }
-
+    return count;
 }
 
 void GLRenderer::drawSharpRing(
@@ -3242,7 +3266,7 @@ void GLRenderer::drawSharpRing(
     uint32_t windowTicks,
     bool notesReady)
 {
-    updateCullTiles(viewStart, windowTicks);
+    updateCullTiles(viewStart, viewEnd, windowTicks, notesReady);
 
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -3276,15 +3300,19 @@ void GLRenderer::drawSharpRing(
     glUniform1i(paletteUniform_, 0);
 
     bool drewTiles = false;
+    double drawn = 0.0, raw = 0.0;
     if (!cullTiles_.empty() && windowTicks != 0 && width_ > 0) {
         const uint32_t firstTile = viewStart / windowTicks;
         const uint32_t lastTile = viewEnd / windowTicks;
-        bool anyCulled = false;
-        for (uint32_t k = firstTile; k <= lastTile; ++k) {
-            const CullTile* tile = findCullTile(k);
-            if (tile && !tile->raw) anyCulled = true;
-        }
-        if (anyCulled) {
+        // A tile is drawn from its own buffer once it holds every note of its visible part.
+        const auto usable = [&](const CullTile* tile) {
+            return tile && tile->coverage >= std::min<uint64_t>(
+                viewEnd, (uint64_t(tile->index) + 1u) * windowTicks);
+        };
+        bool anyUsable = false;
+        for (uint32_t k = firstTile; k <= lastTile; ++k)
+            if (usable(findCullTile(k))) anyUsable = true;
+        if (anyUsable) {
             const double pixelsPerTick = double(width_) / double(windowTicks);
             glEnable(GL_SCISSOR_TEST);
             for (uint32_t k = firstTile; k <= lastTile; ++k) {
@@ -3297,7 +3325,7 @@ void GLRenderer::drawSharpRing(
                 if (px1 <= px0) continue;
                 glScissor(px0, 0, px1 - px0, height_);
                 const CullTile* tile = findCullTile(k);
-                if (tile && !tile->raw) {
+                if (usable(tile)) {
                     if (tile->count == 0) continue;
                     glBindVertexArray(cullVao_);
                     glBindBuffer(GL_ARRAY_BUFFER, tile->vbo);
@@ -3307,10 +3335,10 @@ void GLRenderer::drawSharpRing(
                         reinterpret_cast<void*>(offsetof(VisualNote, endTick)));
                     glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
                         reinterpret_cast<void*>(offsetof(VisualNote, packedData)));
-                    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4,
-                        static_cast<GLsizei>(tile->count));
+                    drawNoteInstances(static_cast<GLsizei>(tile->count));
+                    drawn += double(tile->count);
                 } else {
-                    drawSharpRingRange(viewEnd, notesReady);
+                    raw += double(drawSharpRingRange(viewEnd, notesReady));
                 }
             }
             glDisable(GL_SCISSOR_TEST);
@@ -3318,7 +3346,8 @@ void GLRenderer::drawSharpRing(
         }
     }
     if (!drewTiles)
-        drawSharpRingRange(viewEnd, notesReady);
+        raw += double(drawSharpRingRange(viewEnd, notesReady));
+    wasmidi_roll_debug_drawn(drawn + raw, raw, double(sharpHead_ - sharpTail_));
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -3446,6 +3475,14 @@ bool GLRenderer::renderRoll()
         sweepEnd = static_cast<uint32_t>(std::min<uint64_t>(
             rounded, document_->maxTick));
     }
+    // A catch-up's build reaches past the normal horizon; until the horizon passes
+    // it, that is still the horizon (a lower one would read as a backward seek).
+    if (sharpCatchUpFloor_ != 0u) {
+        if (currentTick < sharpCatchUpFrom_ || sweepEnd >= sharpCatchUpFloor_)
+            sharpCatchUpFloor_ = 0u;
+        else
+            sweepEnd = sharpCatchUpFloor_;
+    }
 
     // Keep at least two complete screens beyond the visible edge in the
     // Worker *and* applied to the VBO. This is the emergency watermark sent to
@@ -3507,18 +3544,29 @@ bool GLRenderer::renderRoll()
             }
         }
 
-        // Catch up (HANDOFF sec. 80): when everything built so far is already
-        // left of the screen, restart at the playhead instead of finishing it.
-        if (!needRebuild && !sharpRemoteRebuilding_ && !sharpRemoteWaitingReset_) {
+        // Catch up (HANDOFF sec. 80, 81): when everything built so far is already
+        // left of the screen, or no complete frame came for a second of playback,
+        // restart ahead of the playhead instead of finishing it. The jump grows
+        // while the notes keep arriving late.
+        bool catchUp = false;
+        if (!needRebuild && !sharpRemoteWaitingReset_) {
             uint32_t builtThrough = sharpRemoteSafeThrough_;
             for (const SharpRemoteBatch& batch : sharpRemoteBatches_)
                 if (batch.generation == sharpRemoteGeneration_)
                     builtThrough = std::max(builtThrough, batch.safeThrough);
+            if (sharpRemoteRebuilding_)
+                builtThrough = std::max(builtThrough, sharpRemoteStartTick_);
             const auto now = std::chrono::steady_clock::now();
-            if (builtThrough < viewStart &&
+            const bool heldTooLong = sharpHeldSince_ != std::chrono::steady_clock::time_point{} &&
+                now - sharpHeldSince_ >= std::chrono::seconds(1) &&
+                uint64_t(currentTick) >= uint64_t(sharpHeldTick_) + windowTicks / 4u;
+            if ((builtThrough < viewStart || heldTooLong) &&
                 now - sharpCatchUpAt_ >= std::chrono::seconds(1)) {
                 sharpCatchUpAt_ = now;
+                sharpHeldTick_ = currentTick;
+                sharpCatchUpLead_ = sharpCatchUpLead_ == 0u ? 1u : std::min(sharpCatchUpLead_ * 2u, 8u);
                 needRebuild = true;
+                catchUp = true;
                 wasmidi_roll_debug_count(1);
             }
         }
@@ -3546,9 +3594,17 @@ bool GLRenderer::renderRoll()
                     sharpRemoteBuildTarget_ = sweepEnd;
                     sharpRemoteBuildWindowTicks_ = windowTicks;
             sharpRemoteBuildPerTrack_ = perTrackColors_;
-                    sharpRemoteStartTick_ = viewStart > windowTicks
-                ? viewStart - windowTicks
-                : 0u;
+            const uint64_t restart = uint64_t(viewStart) +
+                (catchUp ? uint64_t(sharpCatchUpLead_) * windowTicks : 0u);
+            sharpRemoteStartTick_ = static_cast<uint32_t>(std::min<uint64_t>(
+                restart > windowTicks ? restart - windowTicks : 0u, document_->maxTick));
+            if (catchUp) {
+                sweepEnd = static_cast<uint32_t>(std::min<uint64_t>(document_->maxTick,
+                    std::max<uint64_t>(sweepEnd, uint64_t(sharpRemoteStartTick_) + uint64_t(windowTicks) * 3u)));
+                sharpRemoteBuildTarget_ = sweepEnd;
+                sharpCatchUpFloor_ = sweepEnd;
+                sharpCatchUpFrom_ = currentTick;
+            }
             sharpRemoteRequestedEnd_ = sweepEnd;
             sharpRemoteWaitingReset_ = true;
             sharpForceReset_ = false;
@@ -3591,7 +3647,24 @@ bool GLRenderer::renderRoll()
     // Never expose a half-generated visible window. This is the contingency
     // path only; the primary strategy is the multi-screen prefetch above.
     const bool notesReady = !document_->remoteIndexed ||
-        (!sharpRemoteWaitingReset_ && sharpRemoteSafeThrough_ >= viewEnd);
+        (!sharpRemoteWaitingReset_ && sharpRemoteSafeThrough_ >= viewEnd &&
+         sharpRemoteStartTick_ <= viewStart);
+    const auto frameNow = std::chrono::steady_clock::now();
+    if (notesReady) {
+        sharpHeldSince_ = {};
+        if (sharpReadySince_ == std::chrono::steady_clock::time_point{})
+            sharpReadySince_ = frameNow;
+        else if (frameNow - sharpReadySince_ >= std::chrono::seconds(5))
+            sharpCatchUpLead_ = 0u;
+    } else {
+        sharpReadySince_ = {};
+        // Waiting for the playhead to reach a catch-up's jump is not running late.
+        const bool waitingForPlayhead = document_->remoteIndexed && sharpRemoteStartTick_ > viewStart;
+        if (waitingForPlayhead || sharpHeldSince_ == std::chrono::steady_clock::time_point{}) {
+            sharpHeldSince_ = frameNow;
+            sharpHeldTick_ = currentTick;
+        }
+    }
 
     // Keep the last complete frame in the FBO until the notes for this one
     // arrive (HANDOFF sec. 80).
@@ -3619,6 +3692,13 @@ const GLRenderer::CullTile* GLRenderer::findCullTile(uint32_t index) const
     return nullptr;
 }
 
+GLRenderer::CullTile* GLRenderer::findCullTileMutable(uint32_t index)
+{
+    for (CullTile& tile : cullTiles_)
+        if (tile.index == index) return &tile;
+    return nullptr;
+}
+
 void GLRenderer::releaseCullTiles()
 {
     for (CullTile& tile : cullTiles_)
@@ -3626,7 +3706,7 @@ void GLRenderer::releaseCullTiles()
     cullTiles_.clear();
 }
 
-void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t windowTicks)
+void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady)
 {
     static const bool tilesDisabled = wasmidi_tiles_disabled() != 0;
     if (tilesDisabled || !document_ || !document_->remoteIndexed || windowTicks == 0 || width_ <= 0 ||
@@ -3660,11 +3740,26 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t windowTicks)
         }
     }
 
+    // The visible tiles are built (or brought up to date) now, even before the notes
+    // for their whole span have arrived: drawing them raw costs far more (HANDOFF sec. 81).
+    if (notesReady) {
+        const uint32_t lastTile = viewEnd / windowTicks;
+        for (uint32_t k = firstTile; k <= lastTile && k < firstTile + 64u; ++k) {
+            const uint64_t tileEnd = (uint64_t(k) + 1u) * windowTicks;
+            const uint64_t needed = std::min<uint64_t>(viewEnd, tileEnd);
+            const CullTile* tile = findCullTile(k);
+            if (tile && tile->coverage >= needed) continue;
+            if (sharpRemoteSafeThrough_ < needed) continue;
+            buildCullTile(k, windowTicks);
+        }
+    }
+
     const auto started = std::chrono::steady_clock::now();
     int built = 0;
     for (uint32_t k = firstTile; k < firstTile + 64u; ++k) {
-        if (findCullTile(k)) continue;
         const uint64_t tileEnd = (uint64_t(k) + 1u) * windowTicks;
+        const CullTile* tile = findCullTile(k);
+        if (tile && tile->coverage >= tileEnd) continue;
         if (tileEnd > sharpRemoteSafeThrough_) break;
         buildCullTile(k, windowTicks);
         ++built;
@@ -3679,20 +3774,36 @@ void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
     constexpr std::size_t kCullMinNotes = 50000;
     const uint32_t tileStart = index * windowTicks;
     const uint32_t tileEnd = tileStart + windowTicks;
-    CullTile tile;
-    tile.index = index;
+    CullTile* existing = findCullTileMutable(index);
+    if (!existing) {
+        cullTiles_.push_back(CullTile{});
+        existing = &cullTiles_.back();
+        existing->index = index;
+    }
+    CullTile& tile = *existing;
+    // Every note that starts, or closes, before the coverage tick is in the ring.
+    tile.coverage = std::min<uint32_t>(tileEnd, sharpRemoteSafeThrough_);
+    const auto upload = [&tile](const CompositorNote* notes, std::size_t count) {
+        tile.count = static_cast<uint32_t>(count);
+        if (count == 0) return;
+        if (!tile.vbo) glGenBuffers(1, &tile.vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, tile.vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(count * sizeof(CompositorNote)),
+            notes, GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    };
 
     cullInput_.clear();
+    const uint64_t collectEnd = tile.coverage == tileEnd ? uint64_t(tileEnd) : uint64_t(tile.coverage) + 1u;
     const uint32_t head = std::max(sharpHead_, sharpRemotePreparedHead_);
     for (uint32_t id = sharpTail_; id < head; ++id) {
         const VisualNote& note = ring_[std::size_t(id) & ringMask_];
-        if (note.startTick >= tileEnd) break;
+        if (note.startTick >= collectEnd) break;
         if (note.endTick != 0 && note.endTick <= tileStart) continue;
         cullInput_.push_back({ note.startTick, note.endTick, note.packedData });
     }
     if (cullInput_.size() < kCullMinNotes) {
-        tile.raw = true;
-        cullTiles_.push_back(tile);
+        upload(cullInput_.data(), cullInput_.size());
         return;
     }
 
@@ -3702,19 +3813,9 @@ void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
     settings.rasterWidth = width_;
     settings.firstKey = 0;
     settings.keyCount = 128;
-    settings.viewEndTick = tileEnd;
+    settings.viewEndTick = tile.coverage;
     CullViewport(cullInput_.data(), cullInput_.size(), settings, cullScratch_, cullResult_);
-
-    tile.count = static_cast<uint32_t>(cullResult_.notes.size());
-    if (tile.count != 0) {
-        glGenBuffers(1, &tile.vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, tile.vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-            static_cast<GLsizeiptr>(cullResult_.notes.size() * sizeof(CompositorNote)),
-            cullResult_.notes.data(), GL_STATIC_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-    }
-    cullTiles_.push_back(tile);
+    upload(cullResult_.notes.data(), cullResult_.notes.size());
 }
 
 
