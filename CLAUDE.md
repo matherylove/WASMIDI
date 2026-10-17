@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§79). Este archivo resume el estado al cierre de la rev. 83 y dice
+`HANDOFF.md` (§1-§80). Este archivo resume el estado al cierre de la rev. 84 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 83)
+## Estado actual (rev. 84)
 
 Rendimiento medido por el usuario:
 
@@ -195,6 +195,12 @@ Rendimiento medido por el usuario:
   `[WASMIDI app]` por segundo (cuadros, tareas largas, teclado, adelanto del roll, synth). El
   Chromium del contenedor no tiene GPU: ahí el roll de WASMIDI va a ~13 cuadros/s aun con un MIDI
   liviano, no sirve para medir cuadros.
+- Rev. 84 (HANDOFF §80): reglas del usuario de sincronía. Un underrun ya no atrasa el audio: el
+  worklet cuenta el silencio como tiempo y lo publica en el ring (`RING_STARVED`), el Worker salta
+  esos cuadros (`ssw_skip_to`) y el core descarta los note-on que quedaron más de 25 ms atrás
+  (con su note-off; `ssw_late_dropped`). El roll mantiene su último cuadro completo mientras faltan
+  notas y, si todo lo preparado quedó a la izquierda de la pantalla, reconstruye en la posición
+  actual. Chromium con 24576 voces (carga 360%): el reloj de audio avanza 1 s por segundo.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -213,6 +219,8 @@ Mecanismos activos y cómo desactivarlos:
 | Tope de robos por ciclo (25%) | `ssw_set_steal_cap_percent(0)` |
 | Limitador + bloqueador de DC | botón "Soft clip" apagado |
 | Suma de volumen de las pilas VOR / eco (rev. 81) | botón "Stack gain" (WASMIDI) o casilla Echo (Audio) |
+| WasmiSynth alcanza al reloj tras un underrun (rev. 84) | sin interruptor; `ssw_skip_to` no se llama si `RING_STARVED` queda en 0 |
+| Roll mantiene el último cuadro / se reconstruye si quedó atrás (rev. 84) | sin interruptor (`renderRoll`) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |
@@ -221,7 +229,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§78)
+## Pendientes abiertos (ver HANDOFF §67-§80)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,

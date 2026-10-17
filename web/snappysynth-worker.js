@@ -98,6 +98,7 @@ function renderOneBlockGpu(frames) {
     const writeFrame = gpuWriteFrame >= 0 ? gpuWriteFrame : Atomics.load(header, RING_WRITE);
     if (writeFrame < 0 || writeFrame + frames > audioRingCapacityFrames) return false;
     const generation = Atomics.load(header, RING_GENERATION);
+    catchUpToClock(header);
     const blockStart = renderSongTime;
     const outPtr = audioRingPcmPtr + writeFrame * Math.max(1, synthChannels) * 4;
     if (gpuActive) Module._ssw_wgpu_begin_block();
@@ -126,7 +127,8 @@ function renderOneBlockGpu(frames) {
     const now = performance.now();
     if (now - lastStatsReport > 250) {
         lastStatsReport = now;
-        postState("stats", { activeVoices: Module._ssw_active_voices(), renderSongTime, gpu: gpuStatus });
+        postState("stats", { activeVoices: Module._ssw_active_voices(), renderSongTime, gpu: gpuStatus,
+                             ...catchUpStats() });
     }
     return true;
 }
@@ -196,7 +198,40 @@ const RING_GENERATION = 3;
 const RING_CAPACITY = 4;
 const RING_CHANNELS = 5;
 const RING_BLOCK_FRAMES = 6;
+const RING_STARVED = 7;
 const RING_WORDS = 8;
+const CATCH_UP_KEEP_SECONDS = 0.025;
+
+let starvedSeen = 0;
+let starvedGeneration = -1;
+let catchUps = 0;
+let catchUpSeconds = 0.0;
+
+// Frames the worklet played as silence are skipped here too (HANDOFF sec. 80).
+function catchUpToClock(header) {
+    const generation = Atomics.load(header, RING_GENERATION);
+    if (generation !== starvedGeneration) {
+        starvedGeneration = generation;
+        starvedSeen = 0;
+    }
+    const starved = Atomics.load(header, RING_STARVED) >>> 0;
+    const pending = (starved - starvedSeen) >>> 0;
+    if (!pending) return;
+    starvedSeen = starved;
+    const seconds = pending / sampleRateHz;
+    renderSongTime += seconds;
+    Module._ssw_skip_to(renderSongTime, CATCH_UP_KEEP_SECONDS);
+    ++catchUps;
+    catchUpSeconds += seconds;
+}
+
+function catchUpStats() {
+    return {
+        catchUps,
+        catchUpSeconds,
+        lateDropped: Module._ssw_late_dropped ? Module._ssw_late_dropped() : 0
+    };
+}
 
 let audioRingHeaderPtr = 0;
 let audioRingPcmPtr = 0;
@@ -298,6 +333,7 @@ function resetAudioRing() {
     if (!header)
         return;
 
+    Atomics.store(header, RING_STARVED, 0);
     Atomics.add(header, RING_GENERATION, 1);
     dropGpuPending();
     Atomics.store(header, RING_READ, 0);
@@ -952,12 +988,9 @@ function renderOneBlock(frames) {
         if (!gpuActive) return false; // finish the GPU blocks before CPU-only ones
         return renderOneBlockGpu(frames);
     }
-    const blockStart =
-        renderSongTime;
-
-    const blockEnd =
-        blockStart +
-        frames / sampleRateHz;
+    const header = ringHeader();
+    if (!header || !audioRingPcmPtr)
+        return false;
 
     // Never gate PCM rendering on MIDI event coverage. The original
     // SnappySynth realtime backend keeps rendering the device timeline even
@@ -967,10 +1000,6 @@ function renderOneBlock(frames) {
     // silence" failure in WASMIDI. The C-side scheduled-event queue clamps late
     // events to the first not-yet-rendered sample while the multi-second event
     // scheduler normally keeps that path well ahead of the device.
-
-    const header = ringHeader();
-    if (!header || !audioRingPcmPtr)
-        return false;
 
     const available =
         Atomics.load(
@@ -1000,6 +1029,15 @@ function renderOneBlock(frames) {
         Atomics.load(
             header,
             RING_GENERATION);
+
+    catchUpToClock(header);
+
+    const blockStart =
+        renderSongTime;
+
+    const blockEnd =
+        blockStart +
+        frames / sampleRateHz;
 
     const outPtr =
         audioRingPcmPtr +
@@ -1055,7 +1093,8 @@ function renderOneBlock(frames) {
         postState("stats", {
             activeVoices:
                 Module._ssw_active_voices(),
-            renderSongTime
+            renderSongTime,
+            ...catchUpStats()
         });
     }
 

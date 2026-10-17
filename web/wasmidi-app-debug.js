@@ -2,7 +2,7 @@
 (function () {
   if (new URLSearchParams(location.search).get('visualdebug') !== '1') return;
   var st = { frames: 0, slow: 0, maxGap: 0, last: 0, longN: 0, longMs: 0,
-             req: 0, rep: 0, lat: [], pending: new Map(), tick: 0, safe: 0, deltas: 0, under: -1 };
+             req: 0, rep: 0, lat: [], pending: new Map(), tick: 0, safe: 0, deltas: 0, under: -1, held: 0 };
   var W = window.Worker;
   window.Worker = function (url, opts) {
     var w = new W(url, opts), post = w.postMessage.bind(w);
@@ -41,12 +41,16 @@
     console.info('[WASMIDI app] frames ' + st.frames + ' (>25 ms: ' + st.slow + ', max gap ' + st.maxGap.toFixed(0) +
       ' ms), long tasks ' + st.longN + ' (' + st.longMs.toFixed(0) + ' ms), keyboard ' + st.rep + '/' + st.req +
       ' latency avg ' + avg.toFixed(1) + ' max ' + max.toFixed(1) + ' ms, roll lead ' + Math.round(st.safe - st.tick) +
-      ' ticks (' + st.deltas + ' deltas), synth voices ' + (s ? s.activeVoices : '-') + ' load ' +
+      ' ticks (' + st.deltas + ' deltas), roll held ' + ((globalThis.__wasmidiRollHeld | 0) - st.held) +
+      ' catch-ups ' + (globalThis.__wasmidiRollCatchUps | 0) + ', synth voices ' + (s ? s.activeVoices : '-') + ' load ' +
       (s && s.renderLoadPercent != null ? Number(s.renderLoadPercent).toFixed(0) : '-') + '% ring ' +
       (s && s.ringFillPercent != null ? Number(s.ringFillPercent).toFixed(0) : '-') + '% underruns +' +
-      (st.under >= 0 && under >= 0 ? under - st.under : 0) + ' workers ' + (s ? s.workerCount : '-') +
+      (st.under >= 0 && under >= 0 ? under - st.under : 0) + ' caught up ' +
+      (s && s.catchUpSeconds != null ? (s.catchUpSeconds * 1000).toFixed(0) : '-') + ' ms (late notes ' +
+      (s ? s.lateDropped : '-') + ') workers ' + (s ? s.workerCount : '-') +
       ' gpu ' + (s ? (s.gpu ? (s.gpuStatus || 'on') : 'off') : '-'));
     st.under = under;
+    st.held = globalThis.__wasmidiRollHeld | 0;
     st.frames = st.slow = st.maxGap = st.longN = st.longMs = st.req = st.rep = st.deltas = 0;
   }, 1000);
 })();

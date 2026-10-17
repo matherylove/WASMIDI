@@ -22,6 +22,9 @@ static void voice_set_admit_budget_us(int us) { t_admit_budget = us; }
 static int g_admission_percent = 0;
 static int g_max_voices = 1024;
 static unsigned g_admission_dropped = 0;
+/* rev. 84 catch-up: note-ons before this frame are dropped. */
+static int64_t g_drop_before_frame = 0;
+static unsigned g_late_dropped = 0;
 static int g_soft_clip = 0;
 static int g_ssw_deterministic = 0;
 static int g_wgpu_js_base = 0;
@@ -385,6 +388,29 @@ int main(void) {
       }
       CHECK(ok, "budget=1 dropped a required ordering boundary"); }
     CHECK(t_frames_rendered == F, "budget=1 ordering path rendered %d frames", t_frames_rendered);
+
+    printf("15. catch-up drops note-ons behind the skip, keeps the rest\n");
+    clear_events();
+    { ssw_scheduled_event e[16]; int n = 0;
+      const int64_t base = g_song_frame;
+      for (int i = 0; i < 4; ++i) { e[n].sample_frame = base + i * 10; e[n++].message = noteon(2, 50 + i, 100); }
+      e[n].sample_frame = base + 45; e[n++].message = cc(2, 7, 90);
+      queue(e, n);
+      g_song_frame = base + 1000;        /* the worklet played 1000 frames of silence */
+      g_drop_before_frame = base + 25;   /* keep the last 975 frames */
+      g_late_dropped = 0; g_admission_dropped = 0; }
+    g_render_budget = 8;
+    run_block(F);
+    { int notes = 0, ccs = 0;
+      for (int i = 0; i < t_ndispatch; ++i) {
+        if ((t_dispatch_order[i] & 0xf0u) == 0x90u) ++notes;
+        if ((t_dispatch_order[i] & 0xf0u) == 0xb0u) ++ccs;
+      }
+      CHECK(notes == 1, "expected 1 kept note-on (frame 30), got %d", notes);
+      CHECK(ccs == 1, "late controller must still apply, got %d", ccs);
+      CHECK(g_late_dropped == 3, "expected 3 late drops, got %u", g_late_dropped);
+      CHECK(g_admission_dropped == 0, "late drops counted as admission: %u", g_admission_dropped); }
+    g_drop_before_frame = 0;
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL CHECKS PASSED", fails);
     return fails ? 1 : 0;

@@ -5197,3 +5197,72 @@ Sin el parámetro no hace nada (ni envuelve `Worker`).
 **Pendiente:** el log de WASMIDI del usuario con `?visualdebug=1` en los tramos con lag o
 cuadros perdidos (en GPU y en CPU) para decidir qué compite: hilo principal, GPU compartida
 entre el synth por WebGPU y el roll, o núcleos entre workers del synth y helpers.
+
+## 80. Revisión 84 — WasmiSynth alcanza al roll después de un underrun y el roll mantiene su último cuadro
+
+**Pedido:** dos reglas del usuario. (1) Si WasmiSynth se queda atrás del piano roll, siempre
+tiene que alcanzarlo para no desincronizarse. (2) Lo mismo para el roll: si se queda sin cuadros,
+se queda en el último que tiene hasta que llegue el nuevo, y si WasmiSynth va adelante, salta
+hasta él ignorando los cuadros que ya quedaron atrás.
+
+**Causa del desfase del audio:** el worklet solo contaba como tiempo reproducido el PCM que
+entregaba. En un underrun el dispositivo tocaba silencio, el reloj de audio no avanzaba y el
+Worker seguía renderizando desde donde iba: cada underrun dejaba el audio atrasado para siempre.
+El roll corre con el reloj de pared y solo acepta que el audio lo adelante
+(`presentationOffsetSeconds_` solo baja, §48), así que el audio quedaba detrás del roll.
+
+**Cambios del synth:**
+
+- Worklet (`snappysynth-audio-worklet.js`): en un underrun suma los cuadros de silencio a la
+  palabra 7 del encabezado del ring (`RING_STARVED`, antes libre) y cuenta el silencio como tiempo
+  reproducido. `flushRing` la pone en 0 antes de subir la generación.
+  Si el Worker reinicia el ring (seek, play con reinicio, stop, SF2 nueva) el worklet lo ve por el
+  cambio de generación y vuelve a esperar el primer bloque: ese silencio es el comienzo de otra
+  línea de tiempo, no un underrun que alcanzar.
+- Worker (`snappysynth-worker.js`, `catchUpToClock`): antes de cada bloque (CPU y GPU) lee los
+  cuadros de silencio nuevos, adelanta `renderSongTime` esa cantidad y llama a
+  `ssw_skip_to(tiempo, 0.025)`. Una generación nueva del ring reinicia la cuenta.
+- Core (`snappy_wasm_core.c`): `ssw_skip_to` mueve `g_song_frame` al destino y marca
+  `g_drop_before_frame` = destino − 25 ms. En `ssw_render_queued_into` los note-on anteriores a
+  esa marca no suenan (van a la FIFO de notas como descartados, así su note-off también se
+  descarta) y no cuentan en el histograma de admisión; los cuentan `ssw_late_dropped()`. Los
+  note-on de los últimos 25 ms y todos los demás eventos (CC, programa, pitch bend, SysEx,
+  note-offs de notas que sí sonaron) se aplican en el cuadro 0 del bloque siguiente, como antes,
+  así el estado del canal queda bien. `ssw_set_song_time` y `ssw_reset` borran la marca.
+- Estadísticas: el Worker publica `catchUps`, `catchUpSeconds` y `lateDropped`; el bridge los
+  guarda en `state`; la línea `[WASMIDI app]` muestra "caught up N ms (late notes M)" y
+  `browser_bench.py audio` también.
+
+**Cambios del roll (`gl_renderer.cpp`, `pianoroll.cpp`):**
+
+- Si las notas del cuadro no están listas (`notesReady` falso: reconstrucción pendiente o
+  `sharpRemoteSafeThrough_` antes del borde derecho), `renderRoll` no dibuja nada y devuelve
+  falso: el FBO de Qt conserva el último cuadro completo. Antes dibujaba el fondo, el cursor y
+  solo las notas ya preparadas (cuadro vacío o cortado). Si el tamaño cambió o nunca hubo un
+  cuadro completo, dibuja como antes. Los cuadros mantenidos no cuentan en los FPS.
+- Si todo lo que el Worker del parser preparó (instalado o en cola) termina antes del borde
+  izquierdo de la pantalla, el roll pide una reconstrucción en la posición actual (la misma de un
+  seek) en vez de terminar de preparar ticks que ya no se ven. Como mucho una por segundo, y no
+  durante otra reconstrucción.
+- `?visualdebug=1`: la línea `[WASMIDI app]` muestra "roll held N catch-ups M".
+
+**Verificación:**
+
+- Host: sintaxis del core, `node --check`, nuevo caso 15 en `tools/ssw_schedule_harness.c`
+  (3 note-on atrasados descartados, 1 conservado, el CC atrasado se aplica, nada contado como
+  admisión), `tools/local_build.sh` completo (pruebas de host del CI + wasm + `site/`). Prueba
+  de host con MatheryLSD: 1000 notas en 1 s, render hasta 0,209 s, salto de 0,5 s: 475 note-on
+  descartados (los de 0,209-0,684 s), 0 voces al final (ninguna nota colgada).
+- Chromium (4 hilos, sin GPU), WASMIDI Audio, `nuker4_553.mid`:
+  - 24576 voces (carga 360-650%, cientos de underruns): el reloj avanza 1,00 s por segundo
+    (0,83 → 5,86 s en 5 s) y la canción de 6 s termina a los 6 s. Antes ese reloj avanzaba al
+    ritmo del render (~0,3 s por segundo).
+  - 1024 voces: 0 underruns, 0 ms de alcance, 0 notas atrasadas (sin cambio).
+- Chromium, WASMIDI completo, `nuker4_000.mid` con `--seek=6` (nueva opción de
+  `browser_bench.py app`): el seek mantiene 1 cuadro y el roll sigue dibujando bien (captura).
+
+**No verificado:** con GPU real; que la reconstrucción por atraso del roll se dispare en las PCs
+del usuario (en el contenedor el roll nunca se quedó atrás en el tramo liviano y el pesado
+congela la página por WebGL por software). Una nota larga que empezó más de 25 ms antes del
+destino de un salto no suena: se eligió así para no disparar de golpe todas las notas del tramo
+perdido.

@@ -294,6 +294,10 @@ private:
     uint32_t sharpRemoteUrgentThrough_ = 0;
     uint32_t sharpRemoteStartTick_ = 0;
     bool sharpRemoteWaitingReset_ = false;
+    std::chrono::steady_clock::time_point sharpCatchUpAt_{};
+    bool rollFrameValid_ = false;
+    int rollFrameWidth_ = 0;
+    int rollFrameHeight_ = 0;
 
     // Remote resets/seeks stream progressively into the same persistent ring.
     // Partial same-tick batches remain hidden until that tick is safe, but the

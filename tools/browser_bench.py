@@ -15,6 +15,7 @@
 Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
          --query=helpers=3 (appended to the page URL)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
+         --seek=S (app: at second S click the position slider near the start)
          --hide=S (audio: from second S on, the page reports itself hidden, like a tab in
                    the background; the clock on the page must stop while the audio goes on)
 Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
@@ -85,10 +86,12 @@ async def main():
                 st = await page.evaluate("""() => { const s = WasmidiSnappyBridge.state; return {
                     t: WasmidiSnappyBridge.getAudioClock(), voices: s.activeVoices, load: s.renderLoadPercent,
                     buffer: s.ringFillPercent, underruns: s.underruns, dropped: s.droppedNotes, gpu: s.gpuStatus,
+                    caught: s.catchUpSeconds || 0, late: s.lateDropped || 0,
                     shown: document.getElementById("clock").textContent }; }""")
-                print("%3d s  clock %7.2f  shown %s  voices %6s  load %5s%%  buffer %5s%%  underruns %s  dropped %s  gpu %s" % (
+                print("%3d s  clock %7.2f  shown %s  voices %6s  load %5s%%  buffer %5s%%  underruns %s  caught up %5.0f ms"
+                      "  late notes %s  dropped %s  gpu %s" % (
                     second + 1, st["t"] or 0, st["shown"], st["voices"], round(st["load"] or 0), round(st["buffer"] or 0),
-                    st["underruns"], st["dropped"], st["gpu"]))
+                    st["underruns"], st["caught"] * 1000, st["late"], st["dropped"], st["gpu"]))
             print(await page.text_content("#log"))
         elif mode == "visual":
             await page.goto(url + "/visual-bench.html" + qs)
@@ -160,7 +163,10 @@ async def main():
             await page.wait_for_function("() => window.__wb.loaded", timeout=3600000)
             await page.wait_for_timeout(3000)
             await page.mouse.click(25, 175)  # play, after the file row appears
+            seek_at = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--seek=")), None)
             for second in range(int(seconds)):
+                if seek_at is not None and second == seek_at:
+                    await page.mouse.click(110, 170)  # position slider, about 18% of the song
                 await page.wait_for_timeout(1000)
                 st = await page.evaluate("""() => { const s = window.__wb, lat = s.lat.splice(0);
                     const r = { req: s.req, rep: s.rep, n: lat.length, avg: lat.length ? lat.reduce((a, b) => a + b) / lat.length : 0,

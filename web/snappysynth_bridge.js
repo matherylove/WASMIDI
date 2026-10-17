@@ -19,6 +19,9 @@
         rebalanced: 0,     // free voices returned to the global pool, per second
         droppedNotes: 0,   // note-ons lost with no sound, cumulative
         underruns: 0,
+        catchUps: 0,
+        catchUpSeconds: 0.0,
+        lateDropped: 0,
         layers: 0,
         regions: 0,
         playing: false,
@@ -363,6 +366,12 @@
                             Math.round(
                                 data.activeVoices));
 
+                if (Number.isFinite(data.catchUpSeconds))
+                    state.catchUpSeconds = Math.max(0, Number(data.catchUpSeconds));
+                if (Number.isFinite(data.catchUps))
+                    state.catchUps = Math.max(0, Math.round(data.catchUps));
+                if (Number.isFinite(data.lateDropped))
+                    state.lateDropped = Math.max(0, Math.round(data.lateDropped));
                 if (Number.isFinite(data.freeVoices))
                     state.freeVoices = Math.max(0, Math.round(data.freeVoices));
                 if (Number.isFinite(data.steals))

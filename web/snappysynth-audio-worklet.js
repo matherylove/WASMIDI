@@ -20,6 +20,7 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         // delivered the first complete source block. This is startup priming,
         // not audio pre-rendering: the ring still holds only NumBuffers.
         this.primed = false;
+        this.ringGeneration = -1;
 
         this.blockFrames = 512;
         this.numBuffers = 16;
@@ -46,6 +47,7 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         this.RING_CAPACITY = 4;
         this.RING_CHANNELS = 5;
         this.RING_BLOCK_FRAMES = 6;
+        this.RING_STARVED = 7;
         this.RING_WORDS = 8;
 
         this.sharedMemory = null;
@@ -207,6 +209,7 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
     flushRing() {
         if (this.ringHeader) {
             // Invalidate any block currently being rendered by the Worker.
+            Atomics.store(this.ringHeader, this.RING_STARVED, 0);
             Atomics.add(this.ringHeader, this.RING_GENERATION, 1);
             Atomics.store(this.ringHeader, this.RING_READ, 0);
             Atomics.store(this.ringHeader, this.RING_WRITE, 0);
@@ -415,6 +418,14 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                     this.ringHeader,
                     this.RING_AVAILABLE));
 
+        // A ring reset by the Worker (seek, reconfigure) starts a new timeline:
+        // its silence is not an underrun to catch up on.
+        const generation = Atomics.load(this.ringHeader, this.RING_GENERATION);
+        if (generation !== this.ringGeneration) {
+            this.ringGeneration = generation;
+            this.primed = false;
+        }
+
         if (!this.primed) {
             // Wait for one complete synth source block before starting the
             // audible clock. The producer is already demand-driven, so this is
@@ -464,12 +475,14 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                 right.fill(0.0, written);
         }
 
-        if (starvedNow)
+        if (starvedNow) {
             ++this.underruns;
+            Atomics.add(this.ringHeader, this.RING_STARVED, frames - written);
+        }
 
-        // The audio clock advances only for PCM actually delivered to the
-        // device. It is intentionally independent from the GUI renderer clock.
-        this.playedFrames += written;
+        // Silence counts as played time: the Worker skips the same frames
+        // (RING_STARVED), so the audio stays on the roll's clock.
+        this.playedFrames += frames;
 
         const starvationChanged =
             starvedNow !== this.starved;
