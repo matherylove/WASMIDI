@@ -5520,3 +5520,91 @@ flujo): a 830 s son ~1,2 GB/s de palabras.
   menos, sin medir), y el teclado tampoco (~1,4 s/s en host).
 - El salto lejano que decodifica la ventana de densidades desde los checkpoints (§82) sigue
   igual; ahora corre en el Worker del parser cuando el teclado pide `RebuildDensity`.
+
+## 84. Revisión 88 — Los tiles culleados del roll se arman de a pedazos por cuadro
+
+**Pedido:** el usuario probó la rev. 87 con The Nuker 3 (Chrome 155, 16 núcleos, 5 helpers).
+En WASMIDI se siguen perdiendo cuadros en la zona densa antes de 2:13 y en otras partes, y
+WasmiSynth volvió a cerrarse un momento mientras estaba en pausa. En visual-bench, con el mismo
+archivo y la misma PC, los cuadros quedan en 58-61 por segundo durante todo el tema. El roll se
+atrasa solo en 128-129 s (0,5 s), 435-454 s (hasta -5,6 s), 711 s y 828-841 s. En la rev. 86 se
+atrasaba en 122-135, 420-561, 710-717 y 817-866 s.
+
+**Causa:** visual-bench no arma tiles culleados; WASMIDI los arma en el hilo de la página
+(`updateCullTiles`). Cada tile junta las notas del ring desde `sharpTail_` hasta su final y las
+pasa por `CullViewport` de una vez. Con The Nuker 3 eso son 0,3-1 M notas.
+
+- En host (nativo), 375 k notas cuestan 2-6 ms juntarlas y 22 ms cullearlas. Con 1 M notas son
+  5-14 ms y 52-71 ms.
+- El bucle de fondo armaba hasta 2 tiles por cuadro y solo miraba el tiempo después del primero.
+  Un tile denso era, entonces, un cuadro de decenas de milisegundos, y llega uno nuevo cada ancho
+  de pantalla de canción.
+- El tile del borde derecho, mientras no estaba completo, se rearmaba en el mismo cuadro cada vez
+  que el borde de la pantalla pasaba su cobertura.
+- En el Chromium del contenedor, con `?tileslice=0` (el mismo armado, de una vez), hasta 140 s:
+  54 segundos tuvieron algún tile de más de 16 ms, con un máximo de 102 ms.
+
+**Cambios:**
+
+- `note_raster_compositor`: `CullViewport` se parte en `CullBegin` / `CullStep` / `CullFinish`.
+  `CullStep` visita a lo sumo N notas. `CullViewport` es las tres seguidas, así que el resultado
+  no cambia.
+- `gl_renderer.cpp`, `CullJob`: un tile por vez se arma de a pedazos, con 3 ms por cuadro (6 ms si
+  el tile está en pantalla). Tiene su propia copia de las notas y su propio scratch.
+  - Junta las notas en tramos de 16384 ids y cullea en tramos de 4096 notas, mirando el reloj
+    entre tramos.
+  - Retoma la juntada en `max(nextId, sharpTail_)`. Las notas antes de la cobertura ya no cambian:
+    sus cierres llegaron antes que `sharpRemoteSafeThrough_`. Las que el tail deja atrás
+    terminaron a la izquierda de la pantalla.
+  - Un cambio de época del ring o de ancho descarta el trabajo, igual que los tiles.
+- Qué tile se arma: el primero desde la izquierda que no cubre hasta `min(fin del tile,
+  sharpRemoteSafeThrough_)`. Un tile incompleto se arma solo si es visible o el siguiente
+  (`k ≤ lastTile + 1`), y se rehace cuando ganó 1/16 de tile de cobertura.
+- Los tiles visibles siguen garantizados en el mismo cuadro, como en la rev. 85. Si el trabajo en
+  curso es ese tile y ya cubre lo necesario, se termina; si no, se arma entero como antes. Esto
+  pasa casi solo tras un salto o un alcance del roll.
+- `?tileslice=0` arma cada tile en un cuadro (comparación y vuelta atrás).
+- `?visualdebug=1`: la línea `[WASMIDI app]` agrega `tiles N (visible V, X ms, max Y ms)`. N son
+  los tiles terminados, V los armados de una vez por estar en pantalla, X el tiempo del hilo de
+  la página en tiles por segundo, e Y el pedazo más largo.
+- `browser_bench.py app --pause=S:D`: pausa en el segundo S y reanuda D segundos después.
+
+**Medición (Chromium del contenedor, 4 hilos, SwiftShader, The Nuker 3 desde 0 s hasta 140 s,
+`?helpers=3&visualdebug=1&rolldraw=0`):**
+
+| | `?tileslice=0` | rev. 88 |
+|---|---|---|
+| tiles terminados (armados de una vez por estar en pantalla) | 236 (4) | 93 (20) |
+| tiempo de la página en tiles | 4164 ms | 1589 ms |
+| pedazo más largo | 102 ms | 23 ms (un tile visible) |
+| segundos con un pedazo > 16 ms | 54 | 4 (todos de tiles visibles) |
+
+- Con `?tileslice=0` se terminan más tiles. Cada trabajo acaba en el cuadro, así que el tile
+  incompleto del borde se rehace más seguido.
+- Hay más tiles visibles armados de una vez (4 → 20): con poco adelanto, el tile del borde a veces
+  no termina sus pedazos antes de entrar en pantalla. Cuestan ~7-24 ms cada uno en el contenedor.
+  Una versión que armaba de a pedazos también los tiles incompletos lejanos dio 10 visibles, con
+  un máximo de 36 ms.
+- Los cuadros por segundo del contenedor (2-6) no sirven para medir esto. Con SwiftShader el
+  hilo de la página está 92% en código nativo (`(program)` en el perfil) aun con
+  `?rolldraw=0`; la parte wasm es ~1%.
+
+**Pausa:** WASMIDI en pausa 80 s en 125 s de The Nuker 3 (`--pause=125:80`), con 4 workers y
+16384 voces. No se cerró nada, la memoria de la app no cambió y al reanudar siguió sonando.
+Mientras está en pausa, WasmiSynth no renderiza (`pump` sale con `!playing`), el worklet da
+silencio sin contar underruns y el feed del parser no pide más. Hace falta el log de consola del
+momento del cierre para saber qué fue.
+
+**Verificación:** `tools/note_raster_compositor_check.cpp` compara el cull de a pedazos (de 7919
+notas) contra el entero en todos los casos: mismas notas. `cull_tile_sim`: 0 píxeles distintos.
+`tools/local_build.sh` completo.
+
+**No verificado / pendiente:**
+
+- Cuadros en las PCs del usuario. Con 60 cuadros por segundo hay 180 ms por segundo para tiles,
+  ~10× lo que usaron hasta 140 s en el contenedor. Pero hay otras causas posibles de cuadros
+  perdidos en WASMIDI que visual-bench no tiene: el teclado y los gráficos de Qt, las subidas al
+  VBO y la GPU con 0,2-0,5 M instancias. La línea `[WASMIDI app]` con los tiles dirá si queda algo.
+- El cierre de WasmiSynth en pausa no se reprodujo.
+- Los tiles visibles que no llegaron a terminarse de a pedazos (tras un alcance, o con poco
+  adelanto) se siguen armando en un cuadro (hasta 23 ms en el contenedor).

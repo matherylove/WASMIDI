@@ -24,22 +24,26 @@ inline int PopCount64(std::uint64_t value) {
 
 }  // namespace
 
-void CullViewport(
+void CullBegin(
     const CompositorNote* notes,
     std::size_t noteCount,
     const CompositorSettings& settings,
     CompositorScratch& scratch,
-    CompositorResult& out) {
+    CompositorProgress& progress) {
 
-    out.notes.clear();
-    out.visitedNotes = noteCount;
-    out.culledNotes = 0;
-    out.rejectedByFullRow = 0;
+    progress.notes = notes;
+    progress.noteCount = noteCount;
+    progress.done = 0;
+    progress.settings = settings;
+    progress.rejectedByFullRow = 0;
+    progress.keep.assign(noteCount, 0u);
 
     const int width = (std::max)(1, settings.rasterWidth);
     const int keyCount = (std::max)(0, settings.keyCount);
-    if (keyCount == 0 || notes == nullptr || noteCount == 0)
+    if (keyCount == 0 || notes == nullptr || noteCount == 0) {
+        progress.done = noteCount;
         return;
+    }
 
     // One occupancy bit per cell. For 128 keys at 1920 columns this is 30 KB
     // and stays in cache, where the previous owner-per-cell array was 3.9 MB.
@@ -52,6 +56,17 @@ void CullViewport(
     // Only read where `partial` has the bit, so it is never cleared.
     scratch.partialRange.resize(
         static_cast<std::size_t>(width) * static_cast<std::size_t>(keyCount) * 2u);
+}
+
+bool CullStep(CompositorScratch& scratch, CompositorProgress& progress, std::size_t maxNotes) {
+    const CompositorSettings& settings = progress.settings;
+    const CompositorNote* notes = progress.notes;
+    const std::size_t noteCount = progress.noteCount;
+    if (progress.done >= noteCount)
+        return true;
+    const int width = (std::max)(1, settings.rasterWidth);
+    const int keyCount = (std::max)(0, settings.keyCount);
+    const std::size_t wordsPerRow = (static_cast<std::size_t>(width) + 63u) / 64u;
 
     const std::int64_t viewStart = static_cast<std::int64_t>(settings.startTick);
     const std::int64_t viewEnd = settings.viewEndTick != 0
@@ -60,12 +75,15 @@ void CullViewport(
     const double span =
         static_cast<double>((std::max<std::uint32_t>)(1u, settings.spanTicks));
 
-    std::vector<std::uint8_t> keep(noteCount, 0u);
+    std::uint8_t* keep = progress.keep.data();
+    const std::size_t stepEnd = noteCount - progress.done > maxNotes
+        ? progress.done + maxNotes
+        : noteCount;
 
     // Reverse index order is front-to-back under BPFA's layering, since the
     // array is sorted by startTick. No sort, and the first writer of a cell is
     // final.
-    for (std::size_t step = 0; step < noteCount; ++step) {
+    for (std::size_t step = progress.done; step < stepEnd; ++step) {
         const std::size_t index = noteCount - 1u - step;
         const CompositorNote& note = notes[index];
 
@@ -77,7 +95,7 @@ void CullViewport(
         // Whole row already covered: reject without touching a cell.
         std::uint32_t& uncovered = scratch.uncovered[static_cast<std::size_t>(row)];
         if (uncovered == 0u) {
-            ++out.rejectedByFullRow;
+            ++progress.rejectedByFullRow;
             continue;
         }
 
@@ -185,12 +203,31 @@ void CullViewport(
         keep[index] = 1u;
         uncovered -= static_cast<std::uint32_t>(claimed);
     }
+    progress.done = stepEnd;
+    return progress.done >= noteCount;
+}
 
-    out.notes.reserve(noteCount / 4u + 16u);
-    for (std::size_t index = 0; index < noteCount; ++index)
-        if (keep[index])
-            out.notes.push_back(notes[index]);
-    out.culledNotes = noteCount - out.notes.size();
+void CullFinish(CompositorProgress& progress, CompositorResult& out) {
+    out.notes.clear();
+    out.visitedNotes = progress.noteCount;
+    out.rejectedByFullRow = progress.rejectedByFullRow;
+    out.notes.reserve(progress.noteCount / 4u + 16u);
+    for (std::size_t index = 0; index < progress.noteCount; ++index)
+        if (progress.keep[index])
+            out.notes.push_back(progress.notes[index]);
+    out.culledNotes = progress.noteCount - out.notes.size();
+}
+
+void CullViewport(
+    const CompositorNote* notes,
+    std::size_t noteCount,
+    const CompositorSettings& settings,
+    CompositorScratch& scratch,
+    CompositorResult& out) {
+    CompositorProgress progress;
+    CullBegin(notes, noteCount, settings, scratch, progress);
+    CullStep(scratch, progress, noteCount);
+    CullFinish(progress, out);
 }
 
 }  // namespace wasmidi

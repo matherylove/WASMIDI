@@ -131,6 +131,23 @@ private:
     };
     void updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady);
     void buildCullTile(uint32_t index, uint32_t windowTicks);
+    // One tile built a slice per frame (HANDOFF sec. 84).
+    struct CullJob {
+        bool active = false;
+        bool collecting = false;
+        uint32_t index = 0;
+        uint32_t coverage = 0;
+        uint32_t windowTicks = 0;
+        uint32_t nextId = 0;
+        std::vector<CompositorNote> input;
+        CompositorScratch scratch;
+        CompositorProgress progress;
+        CompositorResult result;
+    };
+    void startCullJob(uint32_t index, uint32_t windowTicks, uint32_t coverage);
+    bool stepCullJob(double budgetMs);
+    void uploadCullTile(uint32_t index, uint32_t coverage, const CompositorNote* notes, std::size_t count);
+    CullJob cullJob_;
     CullTile* findCullTileMutable(uint32_t index);
     void releaseCullTiles();
     const CullTile* findCullTile(uint32_t index) const;
