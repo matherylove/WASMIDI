@@ -61,4 +61,37 @@ int main() {
     }
     printf("tiles kept %zu of %zu tile-inputs (%.1f%%); frames %ld, differing pixels %ld of %ld (%.4f%%)\n",
            kept, total, 100.0 * kept / total, frames, diffs, pixels, 100.0 * diffs / pixels);
+
+    // Partial tiles (HANDOFF sec. 81): the notes are known only through tick C >= viewEnd
+    // (later starts missing, later closes still open) and the visible tiles are culled
+    // with that coverage, as GLRenderer::buildCullTile does when the roll's lead is short.
+    long pdiffs = 0, ppixels = 0, pframes = 0;
+    for (uint32_t vs = 1000; vs + span < 38000; vs += 89) {
+        const uint32_t ve = vs + span, cover = ve + rng() % (span + 1);
+        std::vector<uint32_t> a(128 * W, 0), b(128 * W, 0);
+        std::vector<CompositorNote> vis;
+        for (auto& n : all) { if (n.startTick > ve) break; if (n.endTick && n.endTick <= vs) continue; vis.push_back(n); }
+        draw(a, W, vs, span, vis, 0, W);
+        for (uint32_t k = vs / span; k <= ve / span; ++k) {
+            const uint32_t tileEnd = (k + 1) * span, coverage = std::min(tileEnd, cover);
+            const uint32_t collectEnd = coverage == tileEnd ? tileEnd : coverage + 1;
+            std::vector<CompositorNote> in;
+            for (auto n : all) {
+                if (n.startTick >= collectEnd) break;
+                if (n.endTick > coverage) n.endTick = 0;
+                if (n.endTick && n.endTick <= k * span) continue;
+                in.push_back(n);
+            }
+            CompositorSettings s; s.startTick = k * span; s.spanTicks = span; s.rasterWidth = W; s.viewEndTick = coverage;
+            CullViewport(in.data(), in.size(), s, scratch, res);
+            int p0 = std::clamp((int)std::ceil((double(k * span) - vs) * W / span - 0.5), 0, W);
+            int p1 = std::clamp((int)std::ceil((double(tileEnd) - vs) * W / span - 0.5), 0, W);
+            if (p1 > p0) draw(b, W, vs, span, res.notes, p0, p1);
+        }
+        for (int i = 0; i < 128 * W; ++i) { ppixels++; if ((a[i] & 0xffu) != (b[i] & 0xffu)) ++pdiffs; }
+        ++pframes;
+    }
+    printf("partial tiles: frames %ld, differing pixels %ld of %ld (%.4f%%)\n",
+           pframes, pdiffs, ppixels, 100.0 * pdiffs / ppixels);
+    return diffs || pdiffs ? 1 : 0;
 }

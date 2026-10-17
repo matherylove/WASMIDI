@@ -37,6 +37,7 @@ struct Run {
     std::vector<VisualNote> appends;
     std::vector<std::tuple<uint32_t, uint32_t>> closes;
     std::vector<LiveSnapshot> live;
+    std::vector<std::size_t> frameLive;  // index in live of each frame's snapshot
     double sweepSeconds = 0, liveSeconds = 0, resetSeconds = 0;
     double helperDecodeSeconds = 0;
 };
@@ -94,6 +95,7 @@ static Run play(BpfaMidiStore& store, bool stream, double start, double duration
                   md.secondsToTick(std::max(0.0, t - 1.0)), snap, first)) { fprintf(stderr, "live failed: %s\n", store.error()); exit(1); }
         (first ? run.resetSeconds : run.liveSeconds) += sec(t0);
         first = false;
+        run.frameLive.push_back(run.live.size());
         run.live.push_back(snap);
         // An exact tick now and then (deferred note-offs).
         if (run.live.size() % 7 == 0) {
@@ -103,6 +105,45 @@ static Run play(BpfaMidiStore& store, bool stream, double start, double duration
         }
     }
     std::sort(run.closes.begin(), run.closes.end());
+    return run;
+}
+
+// A roll catch-up (HANDOFF sec. 81): a third of the way in, the sweep restarts `jump`
+// seconds ahead of the playhead, as the renderer does when it falls behind. The keyboard
+// holds its last keys meanwhile; once the stream covers its density window it must match
+// the merge reference again. Returns the live snapshots and the longest request.
+static Run playJump(BpfaMidiStore& store, double start, double duration, double lookahead, std::size_t budget,
+                    double jump, double& longest) {
+    Run run;
+    store.setVisualStreamEnabled(true);
+    store.setVisualAutoDecode(true);
+    const MidiDocument& md = store.metadata();
+    store.resetRenderCursor(uint32_t(md.secondsToTick(start)), false);
+    std::vector<VisualNote> app; std::vector<RenderClose> cl;
+    bool first = true, jumped = false;
+    double sweepFrom = start;
+    longest = 0.0;
+    for (double t = start; t < start + duration; t += 1.0 / 60.0) {
+        if (!jumped && t >= start + duration / 3.0) {
+            jumped = true;
+            sweepFrom = t + jump;
+            store.resetRenderCursor(uint32_t(md.secondsToTick(sweepFrom)), false);
+        }
+        const uint32_t target = uint32_t(std::min<double>(md.maxTick, md.secondsToTick(std::max(t, sweepFrom) + lookahead)));
+        for (;;) {
+            uint32_t base = 0, next = 0; bool complete = false, hasNext = false;
+            if (!store.buildRenderSweep(target, budget, app, cl, base, complete, next, hasNext)) { fprintf(stderr, "sweep failed\n"); exit(1); }
+            if (complete) break;
+        }
+        const double tick = md.secondsToTick(t);
+        LiveSnapshot snap;
+        const auto t0 = Clock::now();
+        if (!store.buildLiveSnapshot(tick, md.secondsToTick(std::max(0.0, t - 0.25)),
+                                     md.secondsToTick(std::max(0.0, t - 1.0)), snap, first)) { fprintf(stderr, "live failed\n"); exit(1); }
+        longest = std::max(longest, sec(t0));
+        first = false;
+        run.live.push_back(snap);
+    }
     return run;
 }
 
@@ -148,5 +189,21 @@ int main(int argc, char** argv) {
     compare("stream", local);
     if (haveHelper) compare("helper", spans);
     else printf("helper  skipped (no compressed source)\n");
+    {
+        const double jump = 1.0;
+        double longest = 0.0;
+        Run jumped = playJump(store, start, duration, lookahead, budget, jump, longest);
+        // Frames from the jump until the stream covers the keyboard's density window may hold.
+        const double resume = start + duration / 3.0 + jump + 1.0 + 1.0 / 30.0;
+        std::size_t compared = 0, differ = 0, frame = 0;
+        for (double t = start; frame < jumped.live.size() && frame < merge.frameLive.size(); t += 1.0 / 60.0, ++frame) {
+            if (t < resume) continue;
+            ++compared;
+            differ += !sameLive(jumped.live[frame], merge.live[merge.frameLive[frame]]);
+        }
+        printf("jump    live after a %.1f s roll jump: %zu compared, %s | longest live request %.3f s\n", jump, compared,
+               differ ? "DIFFER" : "IDENTICAL", longest);
+        failures += differ != 0 || compared == 0;
+    }
     return failures ? 1 : 0;
 }

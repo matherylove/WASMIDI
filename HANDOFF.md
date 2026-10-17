@@ -5266,3 +5266,94 @@ del usuario (en el contenedor el roll nunca se quedó atrás en el tramo liviano
 congela la página por WebGL por software). Una nota larga que empezó más de 25 ms antes del
 destino de un salto no suena: se eligió así para no disparar de golpe todas las notas del tramo
 perdido.
+
+## 81. Revisión 85 — The Nuker 3 en WASMIDI: el roll ya no dibuja millones de notas sin cullear y el teclado no bloquea el Worker del parser
+
+**Pedido:** el usuario probó la rev. 83 en el Ryzen 7 7435HS + RTX 2050 (16 hilos). WasmiSynth no
+alcanzó a 12288 voces y con The Nuker 3 Ultimate F4 (15,9 GB, 9679 pistas, 2.080 M notas) el roll
+perdía cuadros sin nada pesado en pantalla y WASMIDI terminó cerrándose ("application exit").
+
+**Causa (Chromium del contenedor, 4 hilos, SwiftShader, The Nuker 3 completo):**
+
+1. **Roll.** Los tiles culleados (§73) solo se armaban cuando `sharpRemoteSafeThrough_` pasaba el
+   final del tile. Con poco adelanto del Worker (lo normal en The Nuker 3, donde cada tramo toca
+   miles de pistas) los tiles visibles quedaban crudos y el roll dibujaba 0,3-1,7 M instancias por
+   cuadro. El trace mostró el hilo de la página bloqueado en Commit → `GLES2::ReadPixels`
+   esperando a la GPU hasta 7,5 s; con eso la página se congelaba 10-20 s aun con 1024 voces. En
+   una GPU real el costo por instancia es mucho menor, pero 1,7 M instancias con mezcla por
+   cuadro siguen siendo varias veces lo que dibuja un tile culleado.
+2. **Reconstrucción del roll.** La regla de la rev. 84 (reconstruir si todo lo preparado quedó a
+   la izquierda) podía no salir nunca de un roll mantenido: si el Worker preparaba más lento que
+   la canción, cada reconstrucción en la posición actual volvía a quedar atrás.
+3. **Teclado.** Después de que el roll reiniciaba el flujo visual más adelante, el teclado quedaba
+   detrás del comienzo del flujo y caía en la ruta de fusión fuera del flujo: decodificaba las
+   9679 pistas en todo el hueco, hasta 34 s por petición (18 s sin helpers). Mientras tanto el
+   Worker del parser no atendía barridos del roll ni el feed del synth: el synth se quedaba sin
+   eventos (también cuenta para los underruns a 12288 voces).
+4. **Sin helpers** (Brave puede reportar pocos núcleos: helpers = ⌊núcleos/3⌋, máx. 8) el flujo
+   visual se decodifica en el Worker del parser y una petición del teclado podía decodificar de
+   una vez todo lo que faltaba hasta su tick.
+
+**Cambios:**
+
+- `gl_renderer.cpp`, tiles parciales: cada tile guarda `coverage` = min(fin del tile,
+  `sharpRemoteSafeThrough_`). Se juntan las notas hasta `coverage + 1` y las notas abiertas se
+  recortan en `coverage` al cullear (`CullViewport` con `viewEndTick = coverage`). Un tile sirve si
+  su cobertura llega a min(borde derecho de la pantalla, fin del tile). Con `notesReady` los
+  tiles visibles se arman (o se rehacen con más cobertura) en el mismo cuadro; el prefetch solo
+  da por hecho un tile completo. Se reusa el slot y el VBO. Con menos de 50 k notas el tile sube
+  las notas sin cullear. El piso del culling (§73: válido en cualquier desplazamiento sub-píxel)
+  deja ~2,5 notas por celda (tecla, columna): ≤ ~750 k instancias por cuadro con dos tiles.
+- Reconstrucción por atraso: se dispara si todo lo preparado quedó a la izquierda o si pasó ≥ 1 s
+  de reproducción sin un cuadro completo (y el cursor avanzó ≥ W/4). La reconstrucción salta
+  adelante 1, 2, 4, 8 ventanas (crece en cada intento seguido y vuelve a 0 tras 5 s de cuadros
+  completos). `notesReady` exige además `sharpRemoteStartTick_ <= viewStart`; mientras el cursor
+  no llega al salto el temporizador de "mantenido" se renueva (si no, se reconstruía cada segundo
+  sin dibujar). El barrido queda pedido hasta el destino del salto (`sharpCatchUpFloor_`) para que
+  no se lea como un seek hacia atrás.
+- `bpfa_midi_store.cpp`, teclado detrás del flujo: si el flujo visual empieza después del próximo
+  tick del teclado, `buildLiveSnapshotStream` devuelve la última instantánea (`liveHeld_`) hasta
+  que el flujo cubra la ventana de densidades y haya decodificado el tick pedido; entonces fuerza
+  un reset sobre el flujo (0,30-0,34 s en host). El teclado se queda quieto un momento en vez de
+  bloquear el Worker.
+- Sin helpers, cada petición del teclado decodifica como mucho 0,25 s de canción del flujo; si no
+  alcanza, el teclado va un poco atrás.
+- La tabla de teclas del teclado en vivo pasó de `std::unordered_map` a direccionamiento abierto
+  (`liveTable_`, sondeo lineal, borrado con corrimiento). No era el cuello de botella (la parte en
+  vivo cuesta 0,018 s por segundo de canción en The Nuker 3); se dejó porque da resultados
+  idénticos y no reserva por nodo.
+- Diagnóstico:
+  - `?rolldraw=0`: el roll hace todo menos las llamadas de dibujo de notas (separa CPU de GPU).
+  - `?visualdebug=1`: la línea `[WASMIDI app]` agrega "drawn max N notes (raw R, resident X)" y
+    "app memory N MiB" (tamaño del heap del wasm de la app); la línea del Worker del parser agrega
+    los mensajes que tardaron ≥ 20 ms ("tipo X ms/N (max M)"), incluidos `feed-reset`/`feed-fill`.
+  - `browser_bench.py app --profile=S:D:OUT` (CPU profile por CDP, top 30 por tiempo propio) y
+    `--trace=S:D:OUT` (trace de Chromium, eventos del hilo de la página; `WASMIDI_TRACE` agrega
+    categorías).
+  - `-DWASMIDI_PROFILE_FUNCS=ON` deja los nombres de funciones en `wasmidi.wasm` para el profiler
+    (apagado por defecto y en el CI).
+
+**Medición (Chromium del contenedor, The Nuker 3 completo, `?visualdebug=1`):**
+
+- Dibujo: antes hasta 1,7 M instancias crudas por cuadro; ahora como mucho ~750 k culleadas.
+  SwiftShader cuesta ~10 µs por instancia y ~66 ms por cuadro aun vacío, así que los cuadros/s del
+  contenedor no dicen nada sobre una GPU real.
+- Lado CPU con `rolldraw=0`, `helpers=3`: roll ~0,6 M ticks adelante, teclado 100-200 ms; en un
+  tramo denso se atrasó, hizo 4 reconstrucciones y se recuperó.
+- `rolldraw=0`, `helpers=0`: roll ~0,7 M ticks adelante, ninguna reconstrucción, teclado ~100 ms,
+  petición del teclado más larga 72 ms (antes 18 s).
+- Memoria de la app 130-182 MiB en todas las corridas; el cierre no se reprodujo.
+
+**Verificación:**
+
+- `tools/renderer_check/cull_tile_sim.cpp`: nueva pasada con tiles parciales, 0 píxeles distintos.
+- `tools/host_bench/visual_check.cpp`: nuevo `playJump` (el barrido salta 1 s adelante a un tercio
+  del recorrido; compara el teclado en vivo con la fusión de referencia desde 1 s después del
+  salto). IDENTICAL en many9679, nuker4_553, many30 y The Nuker 3 en 55-61 s; petición más larga
+  después del salto 0,304 s.
+- Pruebas de host del CI, `node --check web/*.js`, `tools/local_build.sh` completo.
+
+**No verificado:** con GPU real (cuánto mejoran los cuadros/s en la RTX 2050 y la RX 9070XT); el
+cierre "application exit" (no se reprodujo; la memoria de la app no crece); WasmiSynth a 12288
+voces en el 7435HS (16 hilos: probablemente limitado por CPU; el Worker del parser bloqueado por el
+teclado le quitaba eventos y eso ya no pasa, pero no se midió en esa PC).

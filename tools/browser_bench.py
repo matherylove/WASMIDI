@@ -16,11 +16,18 @@ Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
          --query=helpers=3 (appended to the page URL)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
          --seek=S (app: at second S click the position slider near the start)
+         --profile=S:D:OUT (app: CPU profile of the page's main thread from second S for D seconds,
+                   saved to OUT for DevTools; prints the functions with the most self time.
+                   Function names in wasmidi.wasm need cmake -DWASMIDI_PROFILE_FUNCS=ON)
+         --trace=S:D:OUT (app: Chromium trace from second S for D seconds, saved to OUT for
+                   chrome://tracing; prints the main thread's top-level tasks by total time)
          --hide=S (audio: from second S on, the page reports itself hidden, like a tab in
                    the background; the clock on the page must stop while the audio goes on)
 Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
 Chromium normally has no real GPU: WebGPU results there are not representative."""
 import asyncio
+import collections
+import json
 import os
 import sys
 
@@ -164,9 +171,54 @@ async def main():
             await page.wait_for_timeout(3000)
             await page.mouse.click(25, 175)  # play, after the file row appears
             seek_at = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--seek=")), None)
+            profile = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--profile=")), None)
+            trace = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--trace=")), None)
+            cdp = await page.context.new_cdp_session(page) if profile or trace else None
             for second in range(int(seconds)):
                 if seek_at is not None and second == seek_at:
                     await page.mouse.click(110, 170)  # position slider, about 18% of the song
+                if trace and second == int(trace[0]):
+                    await browser.start_tracing(page=page, path=trace[2], categories=[
+                        "toplevel", "blink", "v8", "gpu", "devtools.timeline", "disabled-by-default-devtools.timeline",
+                        "cc", "viz", "ipc", "mojom", "scheduler"] + [c for c in os.environ.get("WASMIDI_TRACE", "").split(",") if c])
+                if trace and second == int(trace[0]) + int(trace[1]):
+                    await browser.stop_tracing()
+                    with open(trace[2]) as f:
+                        events = json.load(f)
+                    events = events["traceEvents"] if isinstance(events, dict) else events
+                    names = {(e["pid"], e["tid"]): e["args"]["name"] for e in events
+                             if e.get("ph") == "M" and e.get("name") == "thread_name"}
+                    main = {k for k, v in names.items() if v == "CrRendererMain"}
+                    by_name = collections.Counter()
+                    count = collections.Counter()
+                    longest = collections.Counter()
+                    for e in events:
+                        if (e.get("pid"), e.get("tid")) in main and e.get("ph") == "X" and "dur" in e:
+                            key = e["name"]
+                            by_name[key] += e["dur"]
+                            count[key] += 1
+                            longest[key] = max(longest[key], e["dur"])
+                    print("trace: main-thread events by total time (nested events counted again):")
+                    for name, us in by_name.most_common(40):
+                        print("  %9.0f ms  %6d x  max %8.0f ms  %s" % (us / 1000.0, count[name], longest[name] / 1000.0, name[:120]))
+                if profile and second == int(profile[0]):
+                    await cdp.send("Profiler.enable")
+                    await cdp.send("Profiler.setSamplingInterval", {"interval": 1000})
+                    await cdp.send("Profiler.start")
+                if profile and second == int(profile[0]) + int(profile[1]):
+                    result = (await cdp.send("Profiler.stop"))["profile"]
+                    with open(profile[2], "w") as out:
+                        json.dump(result, out)
+                    nodes = {n["id"]: n for n in result["nodes"]}
+                    self_us = collections.Counter()
+                    deltas = result.get("timeDeltas", [])
+                    for sample, dt in zip(result.get("samples", []), deltas[1:] + [0]):
+                        frame = nodes[sample]["callFrame"]
+                        self_us[frame["functionName"] or "(anonymous) " + frame["url"].rsplit("/", 1)[-1]] += dt
+                    total = sum(self_us.values()) or 1
+                    print("profile: %.1f s sampled, top self time:" % (total / 1e6))
+                    for name, us in self_us.most_common(30):
+                        print("  %6.1f%% %8.0f ms  %s" % (100.0 * us / total, us / 1000.0, name[:140]))
                 await page.wait_for_timeout(1000)
                 st = await page.evaluate("""() => { const s = window.__wb, lat = s.lat.splice(0);
                     const r = { req: s.req, rep: s.rep, n: lat.length, avg: lat.length ? lat.reduce((a, b) => a + b) / lat.length : 0,

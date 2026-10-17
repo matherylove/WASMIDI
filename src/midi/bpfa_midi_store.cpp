@@ -313,7 +313,8 @@ void BpfaMidiStore::clear()
     liveCc_.clear();
     liveNpsCount_ = liveCcCount_ = 0;
     liveFlat_.clear();
-    liveMap_.clear();
+    liveTable_.clear();
+    liveTableUsed_ = 0;
     liveActive_.clear();
     liveDeferred_.clear();
     liveNextTick_ = 0;
@@ -2451,14 +2452,52 @@ bool BpfaMidiStore::buildLiveSnapshotMerge(double tick, double npsStartTick, dou
     return true;
 }
 
+// Linear probing; the slot holding key, or the empty slot that ends its probe run.
+std::size_t BpfaMidiStore::liveSlotOf(uint32_t key) const
+{
+    const std::size_t mask = liveTable_.size() - 1u;
+    std::size_t slot = std::size_t(key * 0x9e3779b1u) & mask;
+    while (liveTable_[slot].key != key && liveTable_[slot].key != ~0u) slot = (slot + 1u) & mask;
+    return slot;
+}
+
+// Backward-shift deletion: no tombstones, so lookups never slow down as keys come and go.
+void BpfaMidiStore::liveTableErase(std::size_t slot)
+{
+    const std::size_t mask = liveTable_.size() - 1u;
+    std::size_t hole = slot;
+    for (std::size_t next = (hole + 1u) & mask; liveTable_[next].key != ~0u; next = (next + 1u) & mask) {
+        const std::size_t home = std::size_t(liveTable_[next].key * 0x9e3779b1u) & mask;
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            liveTable_[hole] = liveTable_[next];
+            hole = next;
+        }
+    }
+    liveTable_[hole] = LiveSlot{};
+    --liveTableUsed_;
+}
+
 BpfaMidiStore::LiveKey* BpfaMidiStore::liveKey(uint32_t key, bool create)
 {
     if (liveUseFlat_) return key < liveFlat_.size() ? &liveFlat_[key] : nullptr;
-    if (!create) {
-        auto it = liveMap_.find(key);
-        return it == liveMap_.end() ? nullptr : &it->second;
+    if (liveTable_.empty()) {
+        if (!create) return nullptr;
+        liveTable_.assign(4096u, LiveSlot{});
     }
-    return &liveMap_[key];
+    std::size_t slot = liveSlotOf(key);
+    if (liveTable_[slot].key == key) return &liveTable_[slot].value;
+    if (!create) return nullptr;
+    if ((liveTableUsed_ + 1u) * 2u > liveTable_.size()) {
+        std::vector<LiveSlot> old(liveTable_.size() * 2u);
+        old.swap(liveTable_);
+        for (const LiveSlot& entry : old)
+            if (entry.key != ~0u) liveTable_[liveSlotOf(entry.key)] = entry;
+        slot = liveSlotOf(key);
+    }
+    liveTable_[slot].key = key;
+    liveTable_[slot].value = LiveKey{};
+    ++liveTableUsed_;
+    return &liveTable_[slot].value;
 }
 
 void BpfaMidiStore::liveClearKey(uint32_t key, LiveKey& k)
@@ -2474,7 +2513,10 @@ void BpfaMidiStore::liveClearKey(uint32_t key, LiveKey& k)
         }
         k.activeAt = ~0u;
     }
-    if (!liveUseFlat_) liveMap_.erase(key);
+    if (!liveUseFlat_ && !liveTable_.empty()) {
+        const std::size_t slot = liveSlotOf(key);
+        if (liveTable_[slot].key == key) liveTableErase(slot);
+    }
 }
 
 void BpfaMidiStore::liveReset()
@@ -2488,7 +2530,8 @@ void BpfaMidiStore::liveReset()
     } else {
         liveFlat_.clear();
     }
-    liveMap_.clear();
+    if (liveTableUsed_) std::fill(liveTable_.begin(), liveTable_.end(), LiveSlot{});
+    liveTableUsed_ = 0;
     liveActive_.clear();
 }
 
@@ -2615,6 +2658,18 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
             applyLiveEvent(evTick, evMessage, evTrack, n);
     };
 
+    // The stream restarted ahead of the keyboard (a roll catch-up): the keys hold until the
+    // stream covers the density window, then reset onto it. Decoding every track from the
+    // keyboard's position meanwhile took seconds per request (HANDOFF sec. 81).
+    if (!forceReset && liveCursorValid_ && liveTick_ >= 0.0 && tick + 1.0e-9 >= liveTick_ && visValid_ &&
+        visStart_ > liveNextTick_) {
+        const double densityStart = std::min(npsStartTick, ccStartTick);
+        if (double(visStart_) > densityStart || visHead_ <= wholeTick) {
+            output = liveHeld_;
+            return true;
+        }
+        forceReset = true;
+    }
     const double resetDistance = double(std::max<uint32_t>(4096u, visualCheckpointSpan_ * 2u));
     const bool reset = forceReset || !liveCursorValid_ || liveTick_ < 0.0 || tick + 1.0e-9 < liveTick_ ||
         tick - liveTick_ > resetDistance;
@@ -2686,8 +2741,13 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
         // words), or, while helper spans are late, read up to its head (the keyboard lags).
         uint32_t through = wholeTick;
         const bool covered = visValid_ && visStart_ <= liveNextTick_;
-        if (covered && visHead_ <= wholeTick && !visDone_ && visualAutoDecode_) decodeVisualLocal(wholeTick + 1u);
-        if (covered && visHead_ <= wholeTick && !visDone_ && !visualAutoDecode_) through = visHead_ - 1u;
+        if (covered && visHead_ <= wholeTick && !visDone_ && visualAutoDecode_) {
+            // At most a quarter second of song per request: decoding a long gap at once kept the
+            // Worker (and the synth feed) waiting for seconds (HANDOFF sec. 81).
+            const double capTick = std::ceil(metadata_.secondsToTick(metadata_.tickToSeconds(visHead_) + 0.25));
+            decodeVisualLocal(std::max(visHead_ + 1u, uint32_t(std::min(double(wholeTick) + 1.0, capTick))));
+        }
+        if (covered && visHead_ <= wholeTick && !visDone_) through = visHead_ - 1u;
         if (through >= liveNextTick_) {
             const bool onStream = covered && visHead_ > through;
             if (onStream) {
@@ -2763,6 +2823,7 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
     output.nps = static_cast<uint32_t>(std::min<uint64_t>(std::numeric_limits<uint32_t>::max(), liveNpsCount_ * 4u));
     output.ccPerSecond = static_cast<uint32_t>(std::min<uint64_t>(std::numeric_limits<uint32_t>::max(), liveCcCount_));
     liveSinceVisualReset_ = true;
+    liveHeld_ = output;
     if (liveOnStream_) visualTrim();
     return true;
 }

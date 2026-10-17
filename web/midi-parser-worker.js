@@ -1358,7 +1358,12 @@ let visualPoolActive = false;
 let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
 // ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
 const visualStats = { at: 0, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0,
-    starved: 0, local: 0 };
+    starved: 0, local: 0, handlers: {} };
+function visualStatsHandler(type, ms) {
+    const h = visualStats.handlers;
+    const e = h[type] || (h[type] = { ms: 0, n: 0, max: 0 });
+    e.ms += ms; ++e.n; e.max = Math.max(e.max, ms);
+}
 function visualStatsTick() {
     if (pageOverride("visualdebug") !== 1) return;
     const now = performance.now();
@@ -1368,8 +1373,10 @@ function visualStatsTick() {
     console.info("[WASMIDI visual] " + Math.round(now - v.at) + " ms: sweep " + v.sweepMs.toFixed(0) + " ms/" + v.sweeps +
         ", live " + v.liveMs.toFixed(0) + " ms/" + v.lives + ", append " + v.appendMs.toFixed(0) + " ms/" + v.spans +
         " spans " + (v.bytes / 1048576).toFixed(1) + " MiB, starved " + v.starved + ", pool " + (visualPoolActive ? "on" : "off") +
-        ", queue " + visualQueue.length + ", feed pending " + (feedPool ? feedPool.pending.length : 0));
-    Object.assign(v, { at: now, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0, starved: 0 });
+        ", queue " + visualQueue.length + ", feed pending " + (feedPool ? feedPool.pending.length : 0) +
+        Object.entries(v.handlers).filter(([, e]) => e.ms >= 20)
+            .map(([type, e]) => ", " + type + " " + e.ms.toFixed(0) + " ms/" + e.n + " (max " + e.max.toFixed(0) + ")").join(""));
+    Object.assign(v, { at: now, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0, starved: 0, handlers: {} });
 }
 let visualQueue = [];
 let visualSequence = 0;
@@ -1619,8 +1626,10 @@ function feedAttachPort(port) {
     feedPort.onmessage = event => {
         const d = event.data || {};
         const run = async () => {
+            const started = performance.now();
             if (d.type === "reset") await feedReset(d);
             else if (d.type === "fill") await feedOnFill(d);
+            visualStatsHandler("feed-" + d.type, performance.now() - started);
         };
         run().catch(error => {
             console.error("[WASMIDI synth feed]", error);
@@ -1633,6 +1642,12 @@ function feedAttachPort(port) {
 }
 
 self.onmessage = async event => {
+    const started = performance.now();
+    await handleMessage(event);
+    visualStatsHandler(String((event.data || {}).type), performance.now() - started);
+};
+
+async function handleMessage(event) {
     const message = event.data || {};
     if (message.type === "feeder-port") {
         feedAttachPort(message.port);
@@ -1866,4 +1881,4 @@ self.onmessage = async event => {
             try { Module._wmp_release_result(); } catch (_) {}
         }
     }
-};
+}

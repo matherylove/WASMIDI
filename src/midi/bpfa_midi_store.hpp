@@ -492,7 +492,8 @@ private:
 
     // Live snapshot on the stream: per (track, channel, key) the number of open notes and
     // the newest one still open (offs close the oldest first, so it only changes on a note-on
-    // or when the key empties). A flat key table up to LiveFlatKeys keys.
+    // or when the key empties). A flat key table up to LiveFlatKeys keys, above that an
+    // open-addressing table of the keys with notes (HANDOFF sec. 81).
     struct LiveKey { uint64_t total = 0; uint32_t tailStart = 0; uint32_t activeAt = ~0u; uint8_t tailColor = 0; };
     struct LiveDeferred { uint32_t tick; uint32_t message; uint16_t track; uint32_t count; };
     bool buildLiveSnapshotMerge(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
@@ -506,7 +507,11 @@ private:
     void liveClearKey(uint32_t key, LiveKey& k);
     void liveReset();
     std::vector<LiveKey> liveFlat_;
-    std::unordered_map<uint32_t, LiveKey> liveMap_;
+    struct LiveSlot { uint32_t key = ~0u; LiveKey value; };
+    std::vector<LiveSlot> liveTable_;
+    std::size_t liveTableUsed_ = 0;
+    std::size_t liveSlotOf(uint32_t key) const;
+    void liveTableErase(std::size_t slot);
     bool liveUseFlat_ = false;
     std::vector<uint32_t> liveActive_;     // keys with notes, in no particular order
     std::vector<LiveDeferred> liveDeferred_;
@@ -514,6 +519,7 @@ private:
     bool liveOnStream_ = false;
     bool liveCursorSynced_ = false;
     bool liveSinceVisualReset_ = false;  // a live snapshot ran since the stream restarted
+    LiveSnapshot liveHeld_{};             // the last keys, shown while the stream is ahead
     uint64_t livePos_ = 0;
 
     MergeCursor renderCursor_;
