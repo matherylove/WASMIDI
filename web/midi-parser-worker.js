@@ -1354,6 +1354,10 @@ function feedFillSequential(Module) {
 // is decoded in spans by the same helpers (feed spans go first) and appended here in order;
 // the sweep waits for the next span.
 const VISUAL_SPAN_WORDS = 1 << 19;
+// Each span resumes every track, so with thousands of tracks the spans are longer
+// (HANDOFF sec. 82); after a restart they grow from VISUAL_SPAN_WORDS so the first comes soon.
+let visualSpanMax = VISUAL_SPAN_WORDS;
+let visualSpanWords = VISUAL_SPAN_WORDS;
 let visualPoolActive = false;
 let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
 // ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
@@ -1387,6 +1391,7 @@ function visualRestart(Module) {
     visualQueue = [];
     if (feedPool) feedPool.visualPending = [];
     visualPlanned = sizeToNumber(Module._wmp_visual_head_js(), "visual head");
+    visualSpanWords = VISUAL_SPAN_WORDS;
 }
 
 function visualPump(Module) {
@@ -1413,8 +1418,10 @@ function visualPump(Module) {
         appended = true;
     }
     visualStats.appendMs += performance.now() - appendStart;
-    while (visualQueue.length < pool.helpers.length * 2 && visualPlanned <= sharpRenderTarget) {
-        const end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, VISUAL_SPAN_WORDS), "visual span end");
+    const queueLimit = pool.helpers.length + (visualSpanMax > VISUAL_SPAN_WORDS ? 1 : pool.helpers.length);
+    while (visualQueue.length < queueLimit && visualPlanned <= sharpRenderTarget) {
+        const end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
+        visualSpanWords = Math.min(visualSpanMax, visualSpanWords * 2);
         if (end <= visualPlanned) break;
         if (!Module._wmp_visual_request_js(visualPlanned, end))
             throw new Error(parserErrorText(Module, "Could not plan the visual span"));
@@ -1476,6 +1483,7 @@ async function feedStartPool() {
     // Longer spans with many tracks: each span resumes every track from a checkpoint.
     const trackCount = new Uint32Array(image.buffer, 0, 2)[1];
     feedSpanChunks = trackCount < 256 ? 2 : trackCount < 2048 ? 4 : 8;
+    visualSpanMax = Math.min(1 << 23, Math.max(VISUAL_SPAN_WORDS, trackCount * 1024));
     const slabBytes = sizeToNumber(Module._wmp_source_slab_bytes_js(), "slab size");
     const slabCount = sizeToNumber(Module._wmp_source_slab_count_js(), "slab count");
     const slabs = [];
