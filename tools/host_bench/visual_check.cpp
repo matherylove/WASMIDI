@@ -50,8 +50,6 @@ static bool sameLive(const LiveSnapshot& a, const LiveSnapshot& b) {
 
 // Plays [start, start + duration): every frame (1/60 s) the sweep is extended to
 // now + lookahead and the live snapshot is taken at now (the app's pattern).
-// With liveHelper the live snapshots run on a second store fed by exportLiveState, as the
-// live helper Worker does; the coordinator only takes the resets.
 static Run play(BpfaMidiStore& store, bool stream, double start, double duration, double lookahead, std::size_t budget,
                 BpfaMidiStore* helper) {
     Run run;
@@ -147,6 +145,86 @@ static Run playJump(BpfaMidiStore& store, double start, double duration, double 
     return run;
 }
 
+// The keyboard Worker (HANDOFF sec. 83): helper spans are appended to the coordinator and to a
+// keyboard store made from exportLiveImage; the live snapshots run there and the coordinator
+// only rebuilds the keys on a reset. With jump > 0 the sweep restarts as in playJump.
+static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start, double duration, double lookahead,
+                      std::size_t budget, double jump, double& longest, std::size_t& rebuilds) {
+    Run run;
+    store.setVisualStreamEnabled(true);
+    store.setVisualAutoDecode(false);
+    std::vector<uint8_t> image, request, result, rebuild;
+    static BpfaMidiStore keys;
+    if (!store.exportLiveImage(image) || !keys.importLiveImage(image.data(), image.size())) {
+        fprintf(stderr, "keyboard image failed: %s %s\n", store.error(), keys.error());
+        exit(1);
+    }
+    store.setLiveExternal(true);
+    const MidiDocument& md = store.metadata();
+    store.resetRenderCursor(uint32_t(md.secondsToTick(start)), false);
+    keys.restartVisualStream(uint32_t(md.secondsToTick(start)));
+    std::vector<VisualNote> app; std::vector<RenderClose> cl;
+    bool first = true, jumped = jump <= 0.0;
+    double sweepFrom = start;
+    longest = 0.0;
+    rebuilds = 0;
+    auto live = [&](double tick, double nps, double cc, LiveSnapshot& snap, bool reset) {
+        const auto t0 = Clock::now();
+        BpfaMidiStore::LiveStep step = keys.liveWorkerStep(tick, nps, cc, reset, snap);
+        if (step == BpfaMidiStore::LiveStep::Rebuild || step == BpfaMidiStore::LiveStep::RebuildDensity) {
+            ++rebuilds;
+            if (!store.exportLiveRebuild(tick, nps, cc, step == BpfaMidiStore::LiveStep::RebuildDensity, rebuild) ||
+                !keys.liveWorkerResume(rebuild.data(), rebuild.size(), tick, nps, cc, snap)) {
+                fprintf(stderr, "keyboard rebuild failed: %s %s\n", store.error(), keys.error());
+                exit(1);
+            }
+        } else if (step != BpfaMidiStore::LiveStep::Done) {
+            fprintf(stderr, "keyboard step failed: %s\n", keys.error());
+            exit(1);
+        }
+        store.setLiveExternalPosition(keys.liveStreamPosition());
+        return sec(t0);
+    };
+    for (double t = start; t < start + duration; t += 1.0 / 60.0) {
+        if (!jumped && t >= start + duration / 3.0) {
+            jumped = true;
+            sweepFrom = t + jump;
+            store.resetRenderCursor(uint32_t(md.secondsToTick(sweepFrom)), false);
+            keys.restartVisualStream(uint32_t(md.secondsToTick(sweepFrom)));
+        }
+        const uint32_t target = uint32_t(std::min<double>(md.maxTick, md.secondsToTick(std::max(t, sweepFrom) + lookahead)));
+        for (;;) {
+            if (!store.visualStreamDone() && store.visualStreamHead() <= target && store.visualRoomAhead()) {
+                const uint32_t a = store.visualStreamHead(), b = store.visualSpanEnd(a, budget * 4);
+                if (!store.buildVisualRequest(a, b, request) ||
+                    !helper.decodeVisualRequest(request.data(), request.size(), result) ||
+                    !store.appendVisualResult(result.data(), result.size()) ||
+                    !keys.appendVisualResult(result.data(), result.size())) {
+                    fprintf(stderr, "helper span failed: %s %s %s\n", store.error(), helper.error(), keys.error());
+                    exit(1);
+                }
+            }
+            uint32_t base = 0, next = 0; bool complete = false, hasNext = false;
+            if (!store.buildRenderSweep(target, budget, app, cl, base, complete, next, hasNext)) { fprintf(stderr, "sweep failed\n"); exit(1); }
+            if (complete || (!store.visualStreamDone() && store.visualStreamHead() <= next && !store.visualRoomAhead())) break;
+        }
+        const double tick = md.secondsToTick(t);
+        LiveSnapshot snap;
+        const double took = live(tick, md.secondsToTick(std::max(0.0, t - 0.25)), md.secondsToTick(std::max(0.0, t - 1.0)), snap, first);
+        longest = std::max(longest, took);
+        (first ? run.resetSeconds : run.liveSeconds) += took;
+        first = false;
+        run.frameLive.push_back(run.live.size());
+        run.live.push_back(snap);
+        if (jump <= 0.0 && run.live.size() % 7 == 0) {
+            live(std::ceil(tick), md.secondsToTick(std::max(0.0, t - 0.25)), md.secondsToTick(std::max(0.0, t - 1.0)), snap, false);
+            run.live.push_back(snap);
+        }
+    }
+    store.setLiveExternal(false);
+    return run;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "usage: visual_check FILE START DURATION [LOOKAHEAD] [BUDGET]\n"); return 2; }
     const double start = atof(argv[2]), duration = atof(argv[3]);
@@ -189,6 +267,33 @@ int main(int argc, char** argv) {
     compare("stream", local);
     if (haveHelper) compare("helper", spans);
     else printf("helper  skipped (no compressed source)\n");
+    if (haveHelper) {
+        double longest = 0.0;
+        std::size_t rebuilds = 0;
+        Run worker = playWorker(store, helper, start, duration, lookahead, budget, 0.0, longest, rebuilds);
+        std::size_t liveDiff = 0;
+        while (liveDiff < std::min(worker.live.size(), merge.live.size()) && sameLive(worker.live[liveDiff], merge.live[liveDiff])) ++liveDiff;
+        const bool same = liveDiff == merge.live.size() && worker.live.size() == merge.live.size();
+        printf("keys    live in the keyboard Worker %zu %s, %zu rebuilds | live %.3f s per song second, reset %.3f s\n",
+               worker.live.size(), same ? "IDENTICAL" : "DIFFER", rebuilds, worker.liveSeconds / duration, worker.resetSeconds);
+        if (!same && liveDiff < worker.live.size() && liveDiff < merge.live.size())
+            printf("        first live difference at %zu: voices %u/%u nps %u/%u cc %u/%u\n", liveDiff,
+                   worker.live[liveDiff].activeVoices, merge.live[liveDiff].activeVoices, worker.live[liveDiff].nps,
+                   merge.live[liveDiff].nps, worker.live[liveDiff].ccPerSecond, merge.live[liveDiff].ccPerSecond);
+        failures += !same;
+        const double jump = 1.0;
+        Run jumped = playWorker(store, helper, start, duration, lookahead, budget, jump, longest, rebuilds);
+        const double resume = start + duration / 3.0 + jump + 1.0 + 1.0 / 30.0;
+        std::size_t compared = 0, differ = 0, frame = 0;
+        for (double t = start; frame < jumped.live.size() && frame < merge.frameLive.size(); t += 1.0 / 60.0, ++frame) {
+            if (t < resume) continue;
+            ++compared;
+            differ += !sameLive(jumped.live[frame], merge.live[merge.frameLive[frame]]);
+        }
+        printf("keyjump live in the keyboard Worker after a %.1f s roll jump: %zu compared, %s, %zu rebuilds | longest request %.3f s\n",
+               jump, compared, differ ? "DIFFER" : "IDENTICAL", rebuilds, longest);
+        failures += differ != 0 || compared == 0;
+    }
     {
         const double jump = 1.0;
         double longest = 0.0;

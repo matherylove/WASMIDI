@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§82). Este archivo resume el estado al cierre de la rev. 86 y dice
+`HANDOFF.md` (§1-§83). Este archivo resume el estado al cierre de la rev. 87 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 86)
+## Estado actual (rev. 87)
 
 Rendimiento medido por el usuario:
 
@@ -218,6 +218,12 @@ Rendimiento medido por el usuario:
   (35,9 → 7,5 ns por palabra) y snapshots por tecla cada 4096 eventos (reset a 430 s: Chromium
   17,8 → ~1,4 s). En Chromium de 4 hilos 429-455 s sigue atrasándose ~0,6 s/s: el teclado satura
   el Worker del parser. Sin medir en las PCs.
+- Rev. 87 (HANDOFF §83): con helpers, el teclado corre en su propio Worker (`midi-parser-helper.js`,
+  mensajes `live-*`) con una copia del flujo visual; el Worker del parser solo le reconstruye las
+  teclas en un reset (`exportLiveRebuild`). Bucle del teclado sin llamadas (25 → 11 ns por palabra) y
+  anexar con una copia menos. Chromium de 4 hilos, 415-455 s: el Worker del parser baja a ~45% de
+  uso; el roll va adelantado hasta 433 s y desde ahí lo limitan los 3 helpers (-9,5 s a 454 s, antes
+  -14,8 s). Sin medir en las PCs; la ráfaga de 830 s sigue sin alcanzar.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -242,6 +248,7 @@ Mecanismos activos y cómo desactivarlos:
 | Teclado mantiene su imagen si el flujo visual empieza más adelante (rev. 85) | sin interruptor (`liveHeld_`) |
 | Tramos visuales que crecen hasta pistas × 1024 palabras (rev. 86) | sin interruptor (`visualSpanMax`) |
 | Teclado en casillas planas por (pista, canal), snapshots cada 4096 eventos (rev. 86) | sin interruptor (`LiveSnapshotEventInterval`) |
+| Teclado en su propio Worker con helpers (rev. 87) | `?keyworker=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
@@ -251,7 +258,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§82)
+## Pendientes abiertos (ver HANDOFF §67-§83)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -263,8 +270,8 @@ Mecanismos activos y cómo desactivarlos:
    = 1024 × 24 workers) y el roll se atrasaba en 830-858 s con 8 helpers (arreglado en la
    rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
-   Falta: The Nuker 3 en WASMIDI en el 7435HS con la rev. 86 (cuadros, cierre, 12288 voces) y
-   el teclado en su propio Worker (en 429-455 s satura el Worker del parser, rev. 86);
+   Falta: The Nuker 3 en WASMIDI en el 7435HS con la rev. 87 (cuadros, cierre, 12288 voces);
+   la ráfaga de 830 s de The Nuker 3 (~121 M palabras/s: anexar + barrer no alcanzan, rev. 87);
    medir el modo GPU en GPU real y Auto (Hash) contra Single en las PCs; helpers
    con fuente cruda; saltos justo después del pico (las densidades del reset decodifican
    ese segundo en el Worker del parser).

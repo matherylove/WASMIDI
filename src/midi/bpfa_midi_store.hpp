@@ -156,6 +156,28 @@ public:
                            bool forceReset = false);
     bool buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::vector<VisualNote>& output);
 
+    // Keyboard Worker (HANDOFF sec. 83): with the decode helpers the live snapshot runs on a
+    // second instance that holds a copy of the stream, the colors and the track ends; on a
+    // reset it takes the keys rebuilt by this store (exportLiveRebuild).
+    enum class LiveStep { Done, Rebuild, RebuildDensity, Failed };
+    bool exportLiveImage(std::vector<uint8_t>& blob) const;
+    bool importLiveImage(const uint8_t* blob, std::size_t size);
+    bool exportVisualStream(std::vector<uint8_t>& blob) const;
+    bool importVisualStream(const uint8_t* blob, std::size_t size);
+    void restartVisualStream(uint32_t startTick);
+    // density: also the density window decoded from the checkpoints (RebuildDensity).
+    bool exportLiveRebuild(double tick, double npsStartTick, double ccStartTick, bool density,
+                           std::vector<uint8_t>& blob);
+    LiveStep liveWorkerStep(double tick, double npsStartTick, double ccStartTick, bool forceReset,
+                            LiveSnapshot& output);
+    bool liveWorkerResume(const uint8_t* rebuild, std::size_t size, double tick, double npsStartTick,
+                          double ccStartTick, LiveSnapshot& output);
+    // Coordinator: the keyboard Worker reads the stream; its position (-1: off the stream)
+    // bounds how far ahead spans are planned.
+    void setLiveExternal(bool external);
+    void setLiveExternalPosition(int64_t position) { liveExternalPos_ = position; }
+    int64_t liveStreamPosition() const { return liveOnStream_ ? int64_t(livePos_) : -1; }
+
     // BPFA compressed source: 64 KiB zstd blocks, deduplicated, LRU-decoded.
     // own: a cursor's private block buffer (sourceBlockSize() bytes); null uses the shared
     // LRU cache. With thousands of tracks the shared cache thrashes (HANDOFF sec. 56).
@@ -519,6 +541,24 @@ private:
     bool liveSinceVisualReset_ = false;  // a live snapshot ran since the stream restarted
     LiveSnapshot liveHeld_{};             // the last keys, shown while the stream is ahead
     uint64_t livePos_ = 0;
+    bool liveOnly_ = false;               // keyboard Worker instance
+    bool liveExternal_ = false;           // coordinator with a keyboard Worker
+    int64_t liveExternalPos_ = -1;
+    struct LiveRequest { double tick = 0, npsStartTick = 0, ccStartTick = 0; uint32_t wholeTick = 0; bool exactTick = false; };
+    enum class LiveAction { Hold, Reset, Advance, Stay };
+    bool liveRequest(double tick, double npsStartTick, double ccStartTick, LiveRequest& r) const;
+    LiveAction liveDecide(const LiveRequest& r, bool forceReset) const;
+    void liveAddDensity(uint32_t tick, uint32_t message, uint32_t count);
+    void liveConsume(const LiveRequest& r, uint32_t tick, uint32_t message, uint16_t track, uint32_t count,
+                     bool density);
+    void liveBeginReset();
+    bool liveDensityOnStream(const LiveRequest& r) const;
+    void liveDensityFromStream(const LiveRequest& r);
+    void liveDensityDecode(const LiveRequest& r);
+    void liveEndReset(const LiveRequest& r);
+    void liveAdvance(const LiveRequest& r);
+    void liveStreamRun(uint32_t endTick);
+    void liveFinish(const LiveRequest& r, LiveSnapshot& output);
 
     MergeCursor renderCursor_;
     bool renderPerTrackColors_ = false;

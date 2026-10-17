@@ -788,6 +788,7 @@ async function requestSharpRenderer(message) {
         sharpRenderSafeThrough = sharpRenderCompletedTarget;
         sharpRenderReady = true;
         Module._wmp_reset_render_cursor_js(startTick, perTrack ? 1 : 0);
+        liveRestartStream(startTick);
         visualRestart(Module);
         postMessage({
             type: "sharp-render-reset",
@@ -1362,7 +1363,7 @@ let visualPoolActive = false;
 let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
 // ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
 const visualStats = { at: 0, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0,
-    starved: 0, local: 0, handlers: {} };
+    starved: 0, local: 0, keyMs: 0, keys: 0, handlers: {} };
 function visualStatsHandler(type, ms) {
     const h = visualStats.handlers;
     const e = h[type] || (h[type] = { ms: 0, n: 0, max: 0 });
@@ -1377,10 +1378,12 @@ function visualStatsTick() {
     console.info("[WASMIDI visual] " + Math.round(now - v.at) + " ms: sweep " + v.sweepMs.toFixed(0) + " ms/" + v.sweeps +
         ", live " + v.liveMs.toFixed(0) + " ms/" + v.lives + ", append " + v.appendMs.toFixed(0) + " ms/" + v.spans +
         " spans " + (v.bytes / 1048576).toFixed(1) + " MiB, starved " + v.starved + ", pool " + (visualPoolActive ? "on" : "off") +
+        (liveKeys ? ", keyboard Worker " + v.keyMs.toFixed(0) + " ms/" + v.keys : "") +
         ", queue " + visualQueue.length + ", feed pending " + (feedPool ? feedPool.pending.length : 0) +
         Object.entries(v.handlers).filter(([, e]) => e.ms >= 20)
             .map(([type, e]) => ", " + type + " " + e.ms.toFixed(0) + " ms/" + e.n + " (max " + e.max.toFixed(0) + ")").join(""));
-    Object.assign(v, { at: now, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0, starved: 0, handlers: {} });
+    Object.assign(v, { at: now, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0, starved: 0,
+        keyMs: 0, keys: 0, handlers: {} });
 }
 let visualQueue = [];
 let visualSequence = 0;
@@ -1402,6 +1405,7 @@ function visualPump(Module) {
         Module._wmp_visual_config_js(1, 0);
         visualPoolActive = true;
         visualRestart(Module);
+        liveStart(Module);
     }
     if (!pool || !pool.ready) return;
     let appended = false;
@@ -1415,6 +1419,8 @@ function visualPump(Module) {
         Module.HEAPU8.set(entry.result, ptr);
         if (!Module._wmp_visual_append_js(entry.result.length))
             throw new Error(parserErrorText(Module, "Could not append the visual span"));
+        if (liveKeys)
+            liveKeys.worker.postMessage({ type: "live-append", result: entry.result.buffer }, [entry.result.buffer]);
         appended = true;
     }
     visualStats.appendMs += performance.now() - appendStart;
@@ -1453,6 +1459,7 @@ function visualOnResult(entry, m) {
 function visualPoolStopped(Module) {
     if (!visualPoolActive) return;
     visualPoolActive = false;
+    liveStop(Module);
     visualQueue = [];
     ++visualSequence;
     // Local decoding resumes where the appended spans end.
@@ -1461,6 +1468,113 @@ function visualPoolStopped(Module) {
         sharpRenderStarved = false;
         void drainSharpRenderer();
     }
+}
+
+// ---- Keyboard Worker (HANDOFF sec. 83) ----
+// With the helper pool the keyboard/counter snapshot runs on its own parser instance: it gets
+// every appended span and restart, answers the key-state requests and asks this Worker only
+// for the keys rebuilt on a reset. ?keyworker=0 keeps the keyboard here.
+let liveKeys = null;
+let liveStreamGen = 0;
+
+function liveStart(Module) {
+    if (liveKeys || pageOverride("keyworker") === 0) return;
+    if (!Module._wmp_live_image_js()) return;
+    const image = copyWasmBytes(Module, Module._wmp_live_buffer_ptr_js(),
+        sizeToNumber(Module._wmp_live_buffer_size_js(), "keyboard image size"));
+    if (!Module._wmp_live_stream_export_js()) return;
+    const stream = copyWasmBytes(Module, Module._wmp_live_buffer_ptr_js(),
+        sizeToNumber(Module._wmp_live_buffer_size_js(), "visual stream size"));
+    const url = new URL("midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
+        WASMIDI_MIDI_PARSER_BASE_URL).href;
+    const worker = new Worker(url);
+    const keys = { worker, ready: false, inFlight: null };
+    liveKeys = keys;
+    worker.onmessage = event => {
+        if (liveKeys !== keys) return;
+        liveOnMessage(keys, event.data || {}).catch(error => liveFailed(keys, error));
+    };
+    worker.onerror = event => liveFailed(keys, new Error((event && event.message) || "Keyboard Worker crashed"));
+    worker.postMessage({
+        type: "live-init", baseUrl: WASMIDI_MIDI_PARSER_BASE_URL, version: WASMIDI_MIDI_PARSER_BOOTSTRAP,
+        image: image.buffer, stream: stream.buffer, gen: liveStreamGen
+    }, [image.buffer, stream.buffer]);
+}
+
+function liveRestartStream(startTick) {
+    if (!liveKeys) return;
+    ++liveStreamGen;
+    liveKeys.worker.postMessage({ type: "live-restart", startTick, gen: liveStreamGen });
+}
+
+function liveForward(message) {
+    liveKeys.inFlight = message;
+    liveKeys.worker.postMessage({
+        type: "live-request",
+        tick: Number(message.tick) || 0,
+        npsStartTick: Number(message.npsStartTick) || 0,
+        ccStartTick: Number(message.ccStartTick) || 0,
+        reset: !!message.reset,
+        requestId: Number(message.requestId) >>> 0,
+        generation: Number(message.generation) >>> 0
+    });
+}
+
+async function liveOnMessage(keys, m) {
+    const Module = await getModule();
+    if (m.type === "live-ready") {
+        keys.ready = true;
+        Module._wmp_live_external_js(1);
+        return;
+    }
+    if (m.type === "live-rebuild") {
+        const started = performance.now();
+        if (!Module._wmp_live_rebuild_js(Number(m.tick) || 0, Number(m.npsStartTick) || 0,
+                                         Number(m.ccStartTick) || 0, m.density ? 1 : 0))
+            throw new Error(parserErrorText(Module, "Could not rebuild the keyboard"));
+        visualStats.liveMs += performance.now() - started;
+        ++visualStats.lives;
+        const data = copyWasmBytes(Module, Module._wmp_live_buffer_ptr_js(),
+            sizeToNumber(Module._wmp_live_buffer_size_js(), "keyboard rebuild size"));
+        keys.worker.postMessage({ type: "live-rebuilt", data: data.buffer }, [data.buffer]);
+        return;
+    }
+    if (m.type === "live-state") {
+        keys.inFlight = null;
+        visualStats.keyMs += Number(m.ms) || 0;
+        ++visualStats.keys;
+        Module._wmp_live_external_position_js((m.gen >>> 0) === liveStreamGen ? Number(m.position) : -1);
+        postMessage({
+            type: "live-state",
+            tick: m.tick,
+            requestId: m.requestId >>> 0,
+            generation: m.generation >>> 0,
+            data: m.data
+        }, [m.data]);
+        visualPump(Module);
+        return;
+    }
+    if (m.type === "live-error")
+        throw new Error(m.message || "Keyboard Worker failed");
+}
+
+// Back to the keyboard on this Worker; a request the keyboard Worker still owed is answered here.
+function liveStop(Module) {
+    const keys = liveKeys;
+    if (!keys) return;
+    liveKeys = null;
+    try { keys.worker.terminate(); } catch (_) {}
+    Module._wmp_live_external_js(0);
+    if (keys.inFlight) {
+        buildKeyState(keys.inFlight).catch(error => postMessage({ type: "runtime-error", requestType: "key-state",
+            message: error && error.message ? error.message : String(error) }));
+    }
+}
+
+function liveFailed(keys, error) {
+    if (liveKeys !== keys) return;
+    console.warn("[WASMIDI keyboard] keyboard Worker stopped; the keyboard runs on the parser Worker:", error);
+    getModule().then(Module => liveStop(Module));
 }
 
 // ---- Helper pool ----
@@ -1671,7 +1785,8 @@ async function handleMessage(event) {
             return;
         }
         if (message.type === "key-state") {
-            await buildKeyState(message);
+            if (liveKeys && liveKeys.ready) liveForward(message);
+            else await buildKeyState(message);
             return;
         }
         // WASMIDI Audio (HANDOFF sec. 64): timeline queries and seconds-based requests.

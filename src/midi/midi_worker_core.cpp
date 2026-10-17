@@ -521,6 +521,22 @@ int wmp_build_key_snapshot_js(double tick)
     return 1;
 }
 
+static void packLiveSnapshot(const wasmidi::MidiMappedStore::LiveSnapshot& snapshot, double tick)
+{
+    constexpr std::size_t HeaderWords = 4u;
+    g_keySnapshotWords.resize(HeaderWords + 128u * 3u);
+    g_keySnapshotWords[0] = snapshot.activeVoices;
+    g_keySnapshotWords[1] = snapshot.nps;
+    g_keySnapshotWords[2] = snapshot.ccPerSecond;
+    g_keySnapshotWords[3] = static_cast<uint32_t>(std::clamp<double>(
+        std::floor(tick), 0.0, double(std::numeric_limits<uint32_t>::max())));
+    for (std::size_t p = 0; p < 128; ++p) {
+        g_keySnapshotWords[HeaderWords + p] = snapshot.keys.counts[p];
+        g_keySnapshotWords[HeaderWords + 128u + p] = snapshot.keys.globalColors[p];
+        g_keySnapshotWords[HeaderWords + 256u + p] = snapshot.keys.trackColors[p];
+    }
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif
@@ -538,18 +554,7 @@ int wmp_build_live_snapshot_js(
         return 0;
     }
 
-    constexpr std::size_t HeaderWords = 4u;
-    g_keySnapshotWords.resize(HeaderWords + 128u * 3u);
-    g_keySnapshotWords[0] = snapshot.activeVoices;
-    g_keySnapshotWords[1] = snapshot.nps;
-    g_keySnapshotWords[2] = snapshot.ccPerSecond;
-    g_keySnapshotWords[3] = static_cast<uint32_t>(std::clamp<double>(
-        std::floor(tick), 0.0, double(std::numeric_limits<uint32_t>::max())));
-    for (std::size_t p = 0; p < 128; ++p) {
-        g_keySnapshotWords[HeaderWords + p] = snapshot.keys.counts[p];
-        g_keySnapshotWords[HeaderWords + 128u + p] = snapshot.keys.globalColors[p];
-        g_keySnapshotWords[HeaderWords + 256u + p] = snapshot.keys.trackColors[p];
-    }
+    packLiveSnapshot(snapshot, tick);
     return 1;
 }
 
@@ -1735,6 +1740,276 @@ int wmp_visual_append_js(double byteCount)
 #else
     (void)byteCount;
     return 0;
+#endif
+}
+
+// ---- Keyboard Worker (HANDOFF sec. 83): the live snapshot on its own parser instance ----
+
+#if WASMIDI_PARSER_BPFA
+static std::vector<uint8_t> g_liveBuffer;
+
+static int liveBufferCall(const char* what, bool (*call)(std::vector<uint8_t>&))
+{
+    try {
+        if (!call(g_liveBuffer)) {
+            g_error = g_mappedStore.error();
+            if (g_error.empty()) g_error = what;
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = what;
+        return 0;
+    }
+}
+#endif
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_live_buffer_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size)) return 0.0;
+    try {
+        g_liveBuffer.resize(std::max<std::size_t>(size, 1u));
+        return pointerToJsAddress(g_liveBuffer.data());
+    } catch (...) {
+        return 0.0;
+    }
+#else
+    (void)byteCount;
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_live_buffer_ptr_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_liveBuffer.empty() ? 0.0 : pointerToJsAddress(g_liveBuffer.data());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_live_buffer_size_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_liveBuffer.size());
+#else
+    return 0.0;
+#endif
+}
+
+// Coordinator: the keyboard Worker's image (track ends and colors) into the live buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_image_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return liveBufferCall("Could not export the keyboard image",
+        [](std::vector<uint8_t>& out) { return g_mappedStore.exportLiveImage(out); });
+#else
+    return 0;
+#endif
+}
+
+// Coordinator: the stream as it stands, for the keyboard Worker to join.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_stream_export_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return liveBufferCall("Could not export the visual stream",
+        [](std::vector<uint8_t>& out) { return g_mappedStore.exportVisualStream(out); });
+#else
+    return 0;
+#endif
+}
+
+// Coordinator: the keys rebuilt at tick (and the density window when density != 0).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_rebuild_js(double tick, double npsStartTick, double ccStartTick, int density)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        if (!g_mappedStore.exportLiveRebuild(tick, npsStartTick, ccStartTick, density != 0, g_liveBuffer)) {
+            g_error = g_mappedStore.error();
+            if (g_error.empty()) g_error = "Could not rebuild the keyboard";
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Keyboard rebuild ran out of memory";
+        return 0;
+    }
+#else
+    (void)tick; (void)npsStartTick; (void)ccStartTick; (void)density;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_live_external_js(int external)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.setLiveExternal(external != 0);
+#else
+    (void)external;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_live_external_position_js(double position)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.setLiveExternalPosition(position >= 0.0 && std::isfinite(position) ? int64_t(position) : -1);
+#else
+    (void)position;
+#endif
+}
+
+// Keyboard Worker: imports the image from the live buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_init_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_liveBuffer.size()) { g_error = "Invalid keyboard image"; return 0; }
+    try {
+        if (!g_mappedStore.importLiveImage(g_liveBuffer.data(), size)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Keyboard image ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_stream_import_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_liveBuffer.size()) { g_error = "Invalid visual stream"; return 0; }
+    try {
+        if (!g_mappedStore.importVisualStream(g_liveBuffer.data(), size)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Visual stream ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_live_restart_js(double startTick)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.restartVisualStream(static_cast<uint32_t>(std::clamp(startTick, 0.0, 4294967295.0)));
+#else
+    (void)startTick;
+#endif
+}
+
+// Keyboard Worker: 1 = snapshot ready, 2 = needs wmp_live_rebuild_js, 3 = the same with
+// the density window, 0 = error.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_step_js(double tick, double npsStartTick, double ccStartTick, int forceReset)
+{
+#if WASMIDI_PARSER_BPFA
+    using Step = wasmidi::BpfaMidiStore::LiveStep;
+    try {
+        wasmidi::MidiMappedStore::LiveSnapshot snapshot;
+        const Step step = g_mappedStore.liveWorkerStep(tick, npsStartTick, ccStartTick, forceReset != 0, snapshot);
+        if (step == Step::Rebuild) return 2;
+        if (step == Step::RebuildDensity) return 3;
+        if (step != Step::Done) {
+            g_error = "Could not build the keyboard state";
+            return 0;
+        }
+        packLiveSnapshot(snapshot, tick);
+        return 1;
+    } catch (...) {
+        g_error = "Keyboard state ran out of memory";
+        return 0;
+    }
+#else
+    (void)tick; (void)npsStartTick; (void)ccStartTick; (void)forceReset;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_resume_js(double byteCount, double tick, double npsStartTick, double ccStartTick)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_liveBuffer.size()) { g_error = "Invalid keyboard rebuild"; return 0; }
+    try {
+        wasmidi::MidiMappedStore::LiveSnapshot snapshot;
+        if (!g_mappedStore.liveWorkerResume(g_liveBuffer.data(), size, tick, npsStartTick, ccStartTick, snapshot)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        packLiveSnapshot(snapshot, tick);
+        return 1;
+    } catch (...) {
+        g_error = "Keyboard rebuild ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount; (void)tick; (void)npsStartTick; (void)ccStartTick;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_live_position_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.liveStreamPosition());
+#else
+    return -1.0;
 #endif
 }
 

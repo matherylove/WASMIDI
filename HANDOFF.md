@@ -5430,3 +5430,93 @@ parser que el contenedor); en 429-455 s el teclado sigue siendo lo más caro del
 parser (siguiente paso: sacarlo a su propio Worker); un salto lejano todavía decodifica la
 ventana de densidades desde los checkpoints (3,6 s en host a 830 s); la ráfaga de 830 s
 (~121 M palabras/s) no se midió con estos cambios.
+
+## 83. Revisión 87 — El teclado en su propio Worker
+
+**Pedido:** lo que quedó pendiente de la rev. 86 (§82). En 429-455 s de The Nuker 3 el teclado
+saturaba el Worker del parser, el mismo que anexa los tramos y barre el roll, y el roll se
+atrasaba aunque los helpers alcanzaran.
+
+**Causa (medida en host con las palabras reales de 440-442 s, 86,2 M palabras):** por segundo de
+canción el Worker del parser hacía anexar + barrer + teclado, y el teclado era lo más caro.
+Con las casillas planas de la rev. 86 seguía en 25 ns por palabra. Callgrind mostró que el
+costo eran las llamadas por palabra (`liveConsume` → `liveAddDensity` → `applyLiveEvent` →
+`liveSlot`) más que la tabla. El microbenchmark de §82 (7,5 ns) no tenía esas llamadas.
+Anexar copiaba cada tramo dos veces dentro del wasm (al vector del resultado y después al
+flujo): a 830 s son ~1,2 GB/s de palabras.
+
+**Cambios:**
+
+- **Worker del teclado.** Con los helpers activos, `midi-parser-worker.js` crea un Worker más
+  con `midi-parser-helper.js` (mensajes `live-*`), que corre su propia instancia del parser.
+  - `exportLiveImage` / `importLiveImage` le pasan solo lo que necesita: el fin de cada pista,
+    los colores y `visualCheckpointSpan_`.
+  - Al arrancar recibe el flujo tal como está (`exportVisualStream`). Después recibe cada tramo
+    anexado (el mismo buffer del helper, transferido) y cada reinicio del flujo
+    (`restartVisualStream`).
+  - Responde los `key-state`. El Worker del parser los reenvía y devuelve las respuestas a la
+    página sin cambiar el formato, así que WASMIDI y visual-bench no cambian.
+  - Un reset (salto, primera petición, alcance del roll) necesita los snapshots y la fuente,
+    que solo tiene el Worker del parser. El Worker del teclado pide `live-rebuild`. El parser
+    arma las teclas con `liveRebuildAt` (`exportLiveRebuild`) y, si el flujo del teclado no
+    cubre la ventana de densidades, también las densidades desde los checkpoints. El teclado
+    las importa (`liveWorkerResume`) y sigue igual que antes.
+  - Mientras espera la reconstrucción no procesa otros mensajes, así que los tramos no cambian
+    el flujo a mitad de un reset.
+- `buildLiveSnapshotStream` queda partido en `liveDecide`, `liveDensityFromStream`,
+  `liveDensityDecode`, `liveAdvance` y `liveFinish`. El Worker del parser usa los mismos pasos
+  que antes. El Worker del teclado usa `liveWorkerStep`, que devuelve `Rebuild` o
+  `RebuildDensity` en vez de reconstruir, y fuera del flujo no avanza: espera a que llegue.
+- Con el teclado afuera, el flujo del Worker del parser se recorta solo por el barrido
+  (`liveExternal_`). La planificación de tramos sigue limitada por la posición del teclado,
+  que llega con cada respuesta (`setLiveExternalPosition`), para que su copia no crezca sin
+  límite. Si el Worker del teclado falla o los helpers se detienen, el teclado vuelve al Worker
+  del parser y responde la petición pendiente. `?keyworker=0` lo deja en el Worker del parser.
+- `liveStreamRun`: el recorrido del flujo del teclado hace densidad y teclas en un solo bucle
+  sin llamadas. Solo las palabras del tick exacto de la petición (note-offs diferidos) siguen
+  por `liveConsume`.
+- `appendVisualResult` anexa desde el blob sin el vector intermedio (`PodReader::view`).
+- `[WASMIDI visual]` con `?visualdebug=1` muestra "keyboard Worker X ms/N" (tiempo del teclado
+  en su Worker). "live" pasa a contar solo las reconstrucciones.
+
+**Medición:**
+
+- Host, palabras de 440-442 s a 60 peticiones/s: teclado 25,1 → 11,2 ns por palabra (2,17 → 0,97 s
+  para 2 s de canción). El barrido del roll sobre las mismas palabras cuesta 9,8 ns por palabra.
+- Chromium del contenedor (4 hilos, SwiftShader), visual-bench, The Nuker 3 desde 415 s con
+  `?helpers=3`:
+
+| | rev. 86 (§82) | rev. 87 |
+|---|---|---|
+| Worker del parser por segundo en 435-454 s | teclado 550-700 ms + barrido + anexar (saturado) | barrido 200-400 ms + anexar 100-200 ms |
+| Worker del teclado por segundo | — | 330-620 ms |
+| roll atrasado a 454 s | -14,8 s | -9,5 s |
+| roll en 417-433 s | atrasado desde 429 s | adelantado 0,8-1,3 s, 0 cuadros atrasados |
+
+  Desde 434 s lo que limita en el contenedor son los 3 helpers: llegan ~180-240 MiB/s de
+  tramos, y la canción necesita ~410 MiB/s (43 M palabras/s). Con 4 hilos compiten con el synth,
+  el teclado y la página. El Worker del parser ya no está saturado.
+- WASMIDI con `many9679.mid`, `?helpers=3&rawlimit=0`: el Worker del teclado responde. Los
+  cuadros (~4/s) y la latencia del teclado (~250 ms) son iguales con `?keyworker=0`: los limita
+  el hilo de la página con SwiftShader.
+
+**Verificación:**
+
+- `visual_check` (host) tiene dos casos nuevos: "keys" (todas las peticiones en una instancia
+  de teclado con los tramos de un helper y las reconstrucciones del coordinador) y "keyjump" (lo
+  mismo con un alcance del roll de 1 s). Dan IDENTICAL contra el camino de fusión en many30,
+  many9679 y nuker4_553.
+- `tools/midi_parser_bootstrap_smoke.cjs` (CI) prueba el contrato `wmp_live_*` con tres
+  instancias wasm contra el camino de fusión.
+- `feeder_check`: 24 IDENTICAL.
+- `tools/local_build.sh` completo.
+
+**No verificado / pendiente:**
+
+- En las PCs del usuario: con 5-8 helpers y 16-24 hilos los helpers deberían alcanzar en
+  420-450 s, pero no se midió.
+- La ráfaga de 830 s (~121 M palabras/s): en host anexar 1,0 + barrer 1,2 s por segundo de
+  canción. El Worker del parser no alcanza ahí ni sin el teclado (anexar ya tiene una copia
+  menos, sin medir), y el teclado tampoco (~1,4 s/s en host).
+- El salto lejano que decodifica la ventana de densidades desde los checkpoints (§82) sigue
+  igual; ahora corre en el Worker del parser cuando el teclado pide `RebuildDensity`.
