@@ -483,6 +483,74 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
         if (!same(streamLive[i], mergeLive[i]))
             throw new Error("Live state from the visual stream differs from the merge path at tick " + ticks[i]);
     }
+
+    // Keyboard Worker (HANDOFF sec. 83): the same snapshots on a third instance that gets the
+    // spans and the keys rebuilt by the coordinator on a reset.
+    for (const name of ["_wmp_live_buffer_js", "_wmp_live_buffer_ptr_js", "_wmp_live_buffer_size_js",
+        "_wmp_live_image_js", "_wmp_live_stream_export_js", "_wmp_live_rebuild_js", "_wmp_live_external_js",
+        "_wmp_live_external_position_js", "_wmp_live_init_js", "_wmp_live_stream_import_js", "_wmp_live_restart_js",
+        "_wmp_live_step_js", "_wmp_live_resume_js", "_wmp_live_position_js"]) {
+        if (typeof Module[name] !== "function")
+            throw new Error("Missing generated export " + name);
+    }
+    const liveBytes = M => {
+        const ptr = sizeNumber(M._wmp_live_buffer_ptr_js());
+        return M.HEAPU8.slice(ptr, ptr + sizeNumber(M._wmp_live_buffer_size_js()));
+    };
+    const putLive = (M, bytes) => M.HEAPU8.set(bytes, sizeNumber(M._wmp_live_buffer_js(bytes.length)));
+    const Keys = await createParser({ noInitialRun: true, noExitRuntime: true, print() {}, printErr() {} });
+    Module._wmp_visual_config_js(1, 0);
+    Module._wmp_reset_render_cursor_js(0, 0);
+    if (!Module._wmp_live_image_js())
+        throw new Error("Keyboard image failed: " + parserErrorText(Module, "?"));
+    const keysImage = liveBytes(Module);
+    putLive(Keys, keysImage);
+    if (!Keys._wmp_live_init_js(keysImage.length))
+        throw new Error("Keyboard init failed: " + parserErrorText(Keys, "?"));
+    if (!Module._wmp_live_stream_export_js())
+        throw new Error("Visual stream export failed: " + parserErrorText(Module, "?"));
+    const keysStream = liveBytes(Module);
+    putLive(Keys, keysStream);
+    if (!Keys._wmp_live_stream_import_js(keysStream.length))
+        throw new Error("Visual stream import failed: " + parserErrorText(Keys, "?"));
+    Module._wmp_live_external_js(1);
+    let rebuilds = 0;
+    const keysLive = ticks.map((t, i) => {
+        while (!Module._wmp_visual_done_js() && Number(Module._wmp_visual_head_js()) <= t + 500) {
+            const head = Number(Module._wmp_visual_head_js());
+            if (!Module._wmp_visual_request_js(head, Number(Module._wmp_visual_span_end_js(head, 3000))))
+                throw new Error("Visual request failed: " + parserErrorText(Module, "?"));
+            putBuffer(Spans, bufferBytes(Module));
+            if (!Spans._wmp_visual_decode_js(sizeNumber(Module._wmp_feed_buffer_size_js())))
+                throw new Error("Visual decode failed: " + parserErrorText(Spans, "?"));
+            const result = bufferBytes(Spans);
+            putBuffer(Module, result);
+            putBuffer(Keys, result);
+            if (!Module._wmp_visual_append_js(result.length) || !Keys._wmp_visual_append_js(result.length))
+                throw new Error("Visual append failed: " + parserErrorText(Module, "?") + " " + parserErrorText(Keys, "?"));
+        }
+        const nps = Math.max(0, t - 120), cc = Math.max(0, t - 480);
+        let step = Keys._wmp_live_step_js(t, nps, cc, i === 0 ? 1 : 0);
+        if (step === 2 || step === 3) {
+            ++rebuilds;
+            if (!Module._wmp_live_rebuild_js(t, nps, cc, step === 3 ? 1 : 0))
+                throw new Error("Keyboard rebuild failed: " + parserErrorText(Module, "?"));
+            const rebuilt = liveBytes(Module);
+            putLive(Keys, rebuilt);
+            step = Keys._wmp_live_resume_js(rebuilt.length, t, nps, cc) ? 1 : 0;
+        }
+        if (step !== 1)
+            throw new Error("Keyboard step failed: " + parserErrorText(Keys, "?"));
+        Module._wmp_live_external_position_js(Number(Keys._wmp_live_position_js()));
+        return liveWords(Keys);
+    });
+    Module._wmp_live_external_js(0);
+    if (!rebuilds)
+        throw new Error("Keyboard Worker smoke never rebuilt the keys");
+    for (let i = 0; i < ticks.length; ++i) {
+        if (!same(keysLive[i], mergeLive[i]))
+            throw new Error("Keyboard Worker state differs from the merge path at tick " + ticks[i]);
+    }
     Module._wmp_visual_config_js(1, 1);
     Module._wmp_set_raw_source_limit_js(512 * 1024 * 1024);
     // The checks after this one use the dense file.

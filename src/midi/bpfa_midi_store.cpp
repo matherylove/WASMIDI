@@ -323,6 +323,9 @@ void BpfaMidiStore::clear()
     liveOnStream_ = false;
     liveCursorSynced_ = false;
     livePos_ = 0;
+    liveOnly_ = false;
+    liveExternal_ = false;
+    liveExternalPos_ = -1;
     visValid_ = false;
     visDone_ = false;
     std::vector<EventWord>().swap(visEvents_);
@@ -1524,6 +1527,14 @@ struct PodReader {
         at += sizeof(T);
         return value;
     }
+    // count Ts in place (8-byte aligned in the blob), or null when the blob is short.
+    template <typename T> const T* view(std::size_t count)
+    {
+        if (!ok || count > (size - at) / sizeof(T)) { ok = false; return nullptr; }
+        const T* first = reinterpret_cast<const T*>(data + at);
+        at = std::min(size, (at + count * sizeof(T) + 7u) & ~std::size_t(7));
+        return first;
+    }
     template <typename T> void array(std::vector<T>& out, std::size_t count)
     {
         if (!ok || count > (size - at) / sizeof(T)) { ok = false; return; }
@@ -1980,7 +1991,8 @@ constexpr std::size_t VisualRetainWords = std::size_t(48) << 20;
 
 bool BpfaMidiStore::visualRoomAhead() const
 {
-    const uint64_t from = liveOnStream_ ? std::min(livePos_, renderPos_) : renderPos_;
+    uint64_t from = liveOnStream_ ? std::min(livePos_, renderPos_) : renderPos_;
+    if (liveExternal_) from = liveExternalPos_ >= 0 ? std::min(uint64_t(liveExternalPos_), renderPos_) : renderPos_;
     const uint64_t head = visBase_ + visEvents_.size();
     return from >= head || head - from < VisualPlanWords;
 }
@@ -1990,8 +2002,10 @@ bool BpfaMidiStore::visualRoomAhead() const
 // stream grows past VisualRetainWords.
 void BpfaMidiStore::visualTrim()
 {
-    uint64_t keep = renderPos_;
-    if (liveOnStream_) {
+    uint64_t keep = liveOnly_ ? visBase_ + visEvents_.size() : renderPos_;
+    if (liveExternal_) {
+        // the keyboard Worker keeps its own copy of the stream
+    } else if (liveOnStream_) {
         keep = std::min(keep, livePos_);
     } else if (!liveCursorValid_ || !liveSinceVisualReset_ || liveNextTick_ < visStart_) {
         keep = visBase_;  // the live snapshot has yet to join the stream
@@ -2001,7 +2015,7 @@ void BpfaMidiStore::visualTrim()
         keep = std::min(keep, visBase_ + uint64_t(first - visEvents_.begin()));
     }
     if (visEvents_.size() > VisualRetainWords) keep = std::max(keep, visBase_ + (visEvents_.size() - VisualRetainWords));
-    keep = std::min(keep, renderPos_);
+    if (!liveOnly_) keep = std::min(keep, renderPos_);
     const uint64_t drop = keep > visBase_ ? keep - visBase_ : 0;
     if (drop < 65536u || drop * 2u < visEvents_.size()) return;
     visStart_ = std::max(visStart_, visEvents_[std::size_t(drop - 1u)].tick + 1u);
@@ -2164,11 +2178,12 @@ bool BpfaMidiStore::appendVisualResult(const uint8_t* data, std::size_t size)
     const uint32_t startTick = in.get<uint32_t>(), endTick = in.get<uint32_t>();
     const bool anyLeft = in.get<uint32_t>() != 0;
     const uint64_t count = in.get<uint64_t>();
-    in.array(visSpanEvents_, std::size_t(count));
-    in.array(visSpanTracks_, std::size_t(count));
+    // Appended straight from the blob: ~1.2 GB/s of words at 830 s of The Nuker 3 (HANDOFF sec. 83).
+    const EventWord* events = in.view<EventWord>(std::size_t(count));
+    const uint16_t* tracks = in.view<uint16_t>(std::size_t(count));
     if (!in.ok) { error_ = "Truncated visual result"; return false; }
     if (visDone_ || startTick != visHead_) { error_ = "Visual result out of order"; return false; }
-    visualAppend(visSpanEvents_.data(), visSpanTracks_.data(), visSpanEvents_.size(), endTick, anyLeft);
+    visualAppend(events, tracks, std::size_t(count), endTick, anyLeft);
     return true;
 }
 
@@ -2587,190 +2602,282 @@ void BpfaMidiStore::liveRebuildAt(uint32_t targetTick)
     std::vector<FeedWord>().swap(liveWords_);
 }
 
-bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
-                                            bool forceReset)
+bool BpfaMidiStore::liveRequest(double tick, double npsStartTick, double ccStartTick, LiveRequest& r) const
 {
-    output = LiveSnapshot{};
     if (!valid_ || tracks_.empty() || !std::isfinite(tick) || !std::isfinite(npsStartTick) ||
         !std::isfinite(ccStartTick))
         return false;
-    const double maxTick = double(metadata_.maxTick);
-    tick = std::clamp(tick, 0.0, maxTick);
-    npsStartTick = std::clamp(npsStartTick, 0.0, tick);
-    ccStartTick = std::clamp(ccStartTick, 0.0, tick);
-    const uint32_t wholeTick = static_cast<uint32_t>(std::floor(tick));
-    const bool exactTick = std::abs(tick - double(wholeTick)) < 1.0e-9;
+    r.tick = std::clamp(tick, 0.0, double(metadata_.maxTick));
+    r.npsStartTick = std::clamp(npsStartTick, 0.0, r.tick);
+    r.ccStartTick = std::clamp(ccStartTick, 0.0, r.tick);
+    r.wholeTick = static_cast<uint32_t>(std::floor(r.tick));
+    r.exactTick = std::abs(r.tick - double(r.wholeTick)) < 1.0e-9;
+    return true;
+}
 
-    auto isNoteOff = [](uint32_t m) { return (m & 0xf0u) == 0x80u; };
-    auto isNoteOn = [](uint32_t m) { return (m & 0xf0u) == 0x90u && ((m >> 16) & 0x7fu) != 0; };
-    auto isControl = [](uint32_t m) {
-        const uint32_t c = m & 0xf0u;
-        return c == 0xb0u || c == 0xc0u || c == 0xd0u || c == 0xe0u;
-    };
-    auto addPoint = [](std::deque<DensityPoint>& points, uint64_t& total, uint32_t eventTick, uint32_t n) {
-        if (!points.empty() && points.back().tick == eventTick) {
-            const uint64_t sum = uint64_t(points.back().count) + n;
-            points.back().count = uint32_t(std::min<uint64_t>(sum, std::numeric_limits<uint32_t>::max()));
-        } else {
-            points.push_back({eventTick, n});
-        }
-        total = total > std::numeric_limits<uint64_t>::max() - n ? std::numeric_limits<uint64_t>::max() : total + n;
-    };
-    auto addDensity = [&](uint32_t eventTick, uint32_t m, uint32_t n) {
-        if (isNoteOn(m)) addPoint(liveNps_, liveNpsCount_, eventTick, n);
-        if (isControl(m)) addPoint(liveCc_, liveCcCount_, eventTick, 1u);
-    };
-    auto expire = [](std::deque<DensityPoint>& points, uint64_t& total, double lowerTick) {
-        while (!points.empty() && double(points.front().tick) < lowerTick) {
-            total = total >= points.front().count ? total - points.front().count : 0u;
-            points.pop_front();
-        }
-    };
-    auto consume = [&](uint32_t evTick, uint32_t evMessage, uint16_t evTrack, uint32_t n, bool density) {
-        if (density) addDensity(evTick, evMessage, n);
-        if (exactTick && evTick == wholeTick && isNoteOff(evMessage))
-            liveDeferred_.push_back({evTick, evMessage, evTrack, n});
-        else
-            applyLiveEvent(evTick, evMessage, evTrack, n);
-    };
+namespace {
+bool liveIsNoteOff(uint32_t m) { return (m & 0xf0u) == 0x80u; }
+bool liveIsNoteOn(uint32_t m) { return (m & 0xf0u) == 0x90u && ((m >> 16) & 0x7fu) != 0; }
+bool liveIsControl(uint32_t m)
+{
+    const uint32_t c = m & 0xf0u;
+    return c == 0xb0u || c == 0xc0u || c == 0xd0u || c == 0xe0u;
+}
+uint32_t liveWordCount(uint32_t packed)
+{
+    return ((packed & 0xe0u) == 0x80u) ? (packed >> 24) + 1u : 1u;
+}
+template <typename Points> void liveAddPoint(Points& points, uint64_t& total, uint32_t eventTick, uint32_t n)
+{
+    if (!points.empty() && points.back().tick == eventTick) {
+        const uint64_t sum = uint64_t(points.back().count) + n;
+        points.back().count = uint32_t(std::min<uint64_t>(sum, std::numeric_limits<uint32_t>::max()));
+    } else {
+        points.push_back({eventTick, n});
+    }
+    total = total > std::numeric_limits<uint64_t>::max() - n ? std::numeric_limits<uint64_t>::max() : total + n;
+}
+template <typename Points> void liveExpire(Points& points, uint64_t& total, double lowerTick)
+{
+    while (!points.empty() && double(points.front().tick) < lowerTick) {
+        total = total >= points.front().count ? total - points.front().count : 0u;
+        points.pop_front();
+    }
+}
+} // namespace
 
+void BpfaMidiStore::liveAddDensity(uint32_t eventTick, uint32_t m, uint32_t n)
+{
+    if (liveIsNoteOn(m)) liveAddPoint(liveNps_, liveNpsCount_, eventTick, n);
+    if (liveIsControl(m)) liveAddPoint(liveCc_, liveCcCount_, eventTick, 1u);
+}
+
+void BpfaMidiStore::liveConsume(const LiveRequest& r, uint32_t evTick, uint32_t evMessage, uint16_t evTrack,
+                                uint32_t n, bool density)
+{
+    if (density) liveAddDensity(evTick, evMessage, n);
+    if (r.exactTick && evTick == r.wholeTick && liveIsNoteOff(evMessage))
+        liveDeferred_.push_back({evTick, evMessage, evTrack, n});
+    else
+        applyLiveEvent(evTick, evMessage, evTrack, n);
+}
+
+BpfaMidiStore::LiveAction BpfaMidiStore::liveDecide(const LiveRequest& r, bool forceReset) const
+{
     // The stream restarted ahead of the keyboard (a roll catch-up): the keys hold until the
     // stream covers the density window, then reset onto it. Decoding every track from the
     // keyboard's position meanwhile took seconds per request (HANDOFF sec. 81).
-    if (!forceReset && liveCursorValid_ && liveTick_ >= 0.0 && tick + 1.0e-9 >= liveTick_ && visValid_ &&
+    if (!forceReset && liveCursorValid_ && liveTick_ >= 0.0 && r.tick + 1.0e-9 >= liveTick_ && visValid_ &&
         visStart_ > liveNextTick_) {
-        const double densityStart = std::min(npsStartTick, ccStartTick);
-        if (double(visStart_) > densityStart || visHead_ <= wholeTick) {
-            output = liveHeld_;
-            return true;
-        }
-        forceReset = true;
+        const double densityStart = std::min(r.npsStartTick, r.ccStartTick);
+        if (double(visStart_) > densityStart || visHead_ <= r.wholeTick) return LiveAction::Hold;
+        return LiveAction::Reset;
     }
     const double resetDistance = double(std::max<uint32_t>(4096u, visualCheckpointSpan_ * 2u));
-    const bool reset = forceReset || !liveCursorValid_ || liveTick_ < 0.0 || tick + 1.0e-9 < liveTick_ ||
-        tick - liveTick_ > resetDistance;
-    uint32_t evTick = 0, evMessage = 0;
-    uint16_t evTrack = 0;
-    if (reset) {
-        liveReset();
-        liveDeferred_.clear();
-        liveNps_.clear();
-        liveCc_.clear();
-        liveNpsCount_ = liveCcCount_ = 0;
-        liveRebuildAt(wholeTick);
-        liveCursorValid_ = true;
-        const double densityStart = std::min(npsStartTick, ccStartTick);
-        const uint32_t densityTick = static_cast<uint32_t>(std::floor(densityStart));
-        if (visValid_ && visStart_ <= densityTick && visHead_ > wholeTick) {
-            // The densities and the events of this tick from the stream: no merge decode.
-            auto it = std::lower_bound(visEvents_.begin(), visEvents_.end(), densityTick,
-                [](const EventWord& e, uint32_t t) { return e.tick < t; });
-            for (; it != visEvents_.end() && it->tick <= wholeTick; ++it) {
-                const uint32_t m = it->packed & 0x00ffffffu;
-                const uint32_t n = ((m & 0xe0u) == 0x80u) ? (it->packed >> 24) + 1u : 1u;
-                if (double(it->tick) + 1.0e-9 >= densityStart) addDensity(it->tick, m, n);
-                if (it->tick == wholeTick)
-                    consume(it->tick, m, visTracks_[std::size_t(it - visEvents_.begin())], n, false);
-            }
-            liveCursorSynced_ = false;
-        } else {
-            // Each track decoded folded from its checkpoint; the density points sorted by tick.
-            std::vector<FeedWord> points;
-            for (uint16_t t = 0; t < tracks_.size(); ++t) {
-                const auto& cps = tracks_[t].checkpoints;
-                auto it = std::lower_bound(cps.begin(), cps.end(), densityTick,
-                    [](const TrackCheckpoint& cp, uint32_t at) { return cp.tick < at; });
-                const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
-                Cursor c;
-                c.position = cp.byteOffset;
-                c.end = cursorEnd(tracks_[t]);
-                c.tick = cp.tick;
-                c.runningStatus = cp.runningStatus;
-                c.nextIndex = cp.eventIndex;
-                bool ok = decodeNext(c, false);
-                while (ok && c.eventTick < densityTick) ok = decodeNext(c, false);
-                if (!ok || c.eventTick > wholeTick) continue;
-                liveWords_.clear();
-                decodeTrackUntil(c, wholeTick + 1u, liveWords_);
-                for (const FeedWord& w : liveWords_) {
-                    const uint32_t m = w.packed & 0x00ffffffu;
-                    const uint32_t n = ((m & 0xe0u) == 0x80u) ? (w.packed >> 24) + 1u : 1u;
-                    if (double(w.tick) + 1.0e-9 >= densityStart && (isNoteOn(m) || isControl(m))) points.push_back(w);
-                    if (w.tick == wholeTick) consume(w.tick, m, t, n, false);
-                }
-            }
-            std::vector<FeedWord>().swap(liveWords_);
-            std::stable_sort(points.begin(), points.end(), [](const FeedWord& x, const FeedWord& y) { return x.tick < y.tick; });
-            for (const FeedWord& w : points) {
-                const uint32_t m = w.packed & 0x00ffffffu;
-                addDensity(w.tick, m, ((m & 0xe0u) == 0x80u) ? (w.packed >> 24) + 1u : 1u);
-            }
-            liveCursorSynced_ = false;
-        }
-        liveNextTick_ = wholeTick + 1u;
-        liveOnStream_ = false;
-        liveTick_ = tick;
-    } else if (tick > liveTick_ + 1.0e-9) {
-        for (const LiveDeferred& off : liveDeferred_) applyLiveEvent(off.tick, off.message, off.track, off.count);
-        liveDeferred_.clear();
-        // The stream covers the live position: it is extended locally (the sweep reuses those
-        // words), or, while helper spans are late, read up to its head (the keyboard lags).
-        uint32_t through = wholeTick;
-        const bool covered = visValid_ && visStart_ <= liveNextTick_;
-        if (covered && visHead_ <= wholeTick && !visDone_ && visualAutoDecode_) {
-            // At most a quarter second of song per request: decoding a long gap at once kept the
-            // Worker (and the synth feed) waiting for seconds (HANDOFF sec. 81).
-            const double capTick = std::ceil(metadata_.secondsToTick(metadata_.tickToSeconds(visHead_) + 0.25));
-            decodeVisualLocal(std::max(visHead_ + 1u, uint32_t(std::min(double(wholeTick) + 1.0, capTick))));
-        }
-        if (covered && visHead_ <= wholeTick && !visDone_) through = visHead_ - 1u;
-        if (through >= liveNextTick_) {
-            const bool onStream = covered && visHead_ > through;
-            if (onStream) {
-                if (!liveOnStream_) {
-                    const auto first = std::lower_bound(visEvents_.begin(), visEvents_.end(), liveNextTick_,
-                        [](const EventWord& e, uint32_t t) { return e.tick < t; });
-                    livePos_ = visBase_ + uint64_t(first - visEvents_.begin());
-                    liveOnStream_ = true;
-                    liveCursorSynced_ = false;
-                }
-                for (;;) {
-                    const uint64_t local = livePos_ - visBase_;
-                    if (local >= visEvents_.size()) break;
-                    const EventWord& e = visEvents_[std::size_t(local)];
-                    if (e.tick > through) break;
-                    const uint32_t m = e.packed & 0x00ffffffu;
-                    const uint32_t n = ((m & 0xe0u) == 0x80u) ? (e.packed >> 24) + 1u : 1u;
-                    consume(e.tick, m, visTracks_[std::size_t(local)], n, true);
-                    ++livePos_;
-                }
-            } else {
-                if (!liveCursorSynced_) {
-                    mergeReset(liveCursor_, liveNextTick_, false);
-                    liveCursorSynced_ = true;
-                }
-                liveOnStream_ = false;
-                while (mergePeek(liveCursor_, evTick, evMessage, evTrack)) {
-                    if (evTick > wholeTick) break;
-                    mergePop(liveCursor_);
-                    consume(evTick, evMessage, evTrack, 1u, true);
-                }
-            }
-            liveNextTick_ = through + 1u;
-        }
-        liveTick_ = tick;
-    }
+    if (forceReset || !liveCursorValid_ || liveTick_ < 0.0 || r.tick + 1.0e-9 < liveTick_ ||
+        r.tick - liveTick_ > resetDistance)
+        return LiveAction::Reset;
+    return r.tick > liveTick_ + 1.0e-9 ? LiveAction::Advance : LiveAction::Stay;
+}
 
+void BpfaMidiStore::liveBeginReset()
+{
+    liveReset();
+    liveDeferred_.clear();
+    liveNps_.clear();
+    liveCc_.clear();
+    liveNpsCount_ = liveCcCount_ = 0;
+}
+
+bool BpfaMidiStore::liveDensityOnStream(const LiveRequest& r) const
+{
+    const uint32_t densityTick = static_cast<uint32_t>(std::floor(std::min(r.npsStartTick, r.ccStartTick)));
+    return visValid_ && visStart_ <= densityTick && visHead_ > r.wholeTick;
+}
+
+// The densities and the events of this tick from the stream: no merge decode.
+void BpfaMidiStore::liveDensityFromStream(const LiveRequest& r)
+{
+    const double densityStart = std::min(r.npsStartTick, r.ccStartTick);
+    const uint32_t densityTick = static_cast<uint32_t>(std::floor(densityStart));
+    auto it = std::lower_bound(visEvents_.begin(), visEvents_.end(), densityTick,
+        [](const EventWord& e, uint32_t t) { return e.tick < t; });
+    for (; it != visEvents_.end() && it->tick <= r.wholeTick; ++it) {
+        const uint32_t m = it->packed & 0x00ffffffu;
+        const uint32_t n = liveWordCount(it->packed);
+        if (double(it->tick) + 1.0e-9 >= densityStart) liveAddDensity(it->tick, m, n);
+        if (it->tick == r.wholeTick)
+            liveConsume(r, it->tick, m, visTracks_[std::size_t(it - visEvents_.begin())], n, false);
+    }
+}
+
+// Each track decoded folded from its checkpoint; the density points sorted by tick.
+void BpfaMidiStore::liveDensityDecode(const LiveRequest& r)
+{
+    const double densityStart = std::min(r.npsStartTick, r.ccStartTick);
+    const uint32_t densityTick = static_cast<uint32_t>(std::floor(densityStart));
+    std::vector<FeedWord> points;
+    for (uint16_t t = 0; t < tracks_.size(); ++t) {
+        const auto& cps = tracks_[t].checkpoints;
+        auto it = std::lower_bound(cps.begin(), cps.end(), densityTick,
+            [](const TrackCheckpoint& cp, uint32_t at) { return cp.tick < at; });
+        const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+        Cursor c;
+        c.position = cp.byteOffset;
+        c.end = cursorEnd(tracks_[t]);
+        c.tick = cp.tick;
+        c.runningStatus = cp.runningStatus;
+        c.nextIndex = cp.eventIndex;
+        bool ok = decodeNext(c, false);
+        while (ok && c.eventTick < densityTick) ok = decodeNext(c, false);
+        if (!ok || c.eventTick > r.wholeTick) continue;
+        liveWords_.clear();
+        decodeTrackUntil(c, r.wholeTick + 1u, liveWords_);
+        for (const FeedWord& w : liveWords_) {
+            const uint32_t m = w.packed & 0x00ffffffu;
+            const uint32_t n = liveWordCount(w.packed);
+            if (double(w.tick) + 1.0e-9 >= densityStart && (liveIsNoteOn(m) || liveIsControl(m))) points.push_back(w);
+            if (w.tick == r.wholeTick) liveConsume(r, w.tick, m, t, n, false);
+        }
+    }
+    std::vector<FeedWord>().swap(liveWords_);
+    std::stable_sort(points.begin(), points.end(), [](const FeedWord& x, const FeedWord& y) { return x.tick < y.tick; });
+    for (const FeedWord& w : points) liveAddDensity(w.tick, w.packed & 0x00ffffffu, liveWordCount(w.packed));
+}
+
+void BpfaMidiStore::liveEndReset(const LiveRequest& r)
+{
+    liveCursorValid_ = true;
+    liveCursorSynced_ = false;
+    liveNextTick_ = r.wholeTick + 1u;
+    liveOnStream_ = false;
+    liveTick_ = r.tick;
+}
+
+// liveConsume (density, then applyLiveEvent) for the stream words before endTick, without
+// the calls: ~25 ns per word through them at 440 s of The Nuker 3 (HANDOFF sec. 83).
+void BpfaMidiStore::liveStreamRun(uint32_t endTick)
+{
+    const EventWord* events = visEvents_.data();
+    const uint16_t* tracks = visTracks_.data();
+    const std::size_t size = visEvents_.size();
+    std::size_t local = std::size_t(livePos_ - visBase_);
+    const std::size_t first = local;
+    const uint32_t* pairOf = livePairOf_.data();
+    std::size_t pairs = livePairOf_.size();
+    for (; local < size; ++local) {
+        const uint32_t tick = events[local].tick;
+        if (tick >= endTick) break;
+        const uint32_t packed = events[local].packed, type = packed & 0xf0u;
+        if (type != 0x80u && type != 0x90u) {
+            if (type >= 0xb0u && type <= 0xe0u) liveAddPoint(liveCc_, liveCcCount_, tick, 1u);
+            continue;
+        }
+        const uint32_t n = (packed >> 24) + 1u, track = tracks[local], channel = packed & 0x0fu;
+        const uint32_t pitch = (packed >> 8) & 0x7fu;
+        const std::size_t at = std::size_t(track) * 16u + channel;
+        uint32_t pair = at < pairs ? pairOf[at] : ~0u;
+        if (type == 0x90u && (packed & 0x7f0000u)) {
+            liveAddPoint(liveNps_, liveNpsCount_, tick, n);
+            uint32_t slot;
+            if (pair == ~0u) {
+                slot = liveSlot(uint16_t(track), uint8_t(channel), uint8_t(pitch), true);
+                pairOf = livePairOf_.data();
+                pairs = livePairOf_.size();
+            } else {
+                slot = pair * 128u + pitch;
+            }
+            LiveKey& k = liveSlots_[slot];
+            k.total = uint32_t(std::min<uint64_t>(uint64_t(k.total) + n, std::numeric_limits<uint32_t>::max()));
+            k.tailStart = tick;
+            k.tailColor = uint32_t(globalColors_[channel] & 0x0fu) | (uint32_t(trackColors_[track][channel] & 0x0fu) << 4);
+            if (k.activeAt == ~0u) {
+                k.activeAt = uint32_t(liveActive_.size());
+                liveActive_.push_back(slot);
+            }
+            continue;
+        }
+        if (pair == ~0u) continue;
+        const uint32_t slot = pair * 128u + pitch;
+        LiveKey& k = liveSlots_[slot];
+        if (k.total == 0) continue;
+        if (k.total > n) k.total -= n;
+        else liveClearSlot(slot);
+    }
+    livePos_ += local - first;
+}
+
+void BpfaMidiStore::liveAdvance(const LiveRequest& r)
+{
+    for (const LiveDeferred& off : liveDeferred_) applyLiveEvent(off.tick, off.message, off.track, off.count);
+    liveDeferred_.clear();
+    // The stream covers the live position: it is extended locally (the sweep reuses those
+    // words), or, while helper spans are late, read up to its head (the keyboard lags).
+    const uint32_t wholeTick = r.wholeTick;
+    uint32_t through = wholeTick;
+    const bool covered = visValid_ && visStart_ <= liveNextTick_;
+    if (covered && visHead_ <= wholeTick && !visDone_ && visualAutoDecode_) {
+        // At most a quarter second of song per request: decoding a long gap at once kept the
+        // Worker (and the synth feed) waiting for seconds (HANDOFF sec. 81).
+        const double capTick = std::ceil(metadata_.secondsToTick(metadata_.tickToSeconds(visHead_) + 0.25));
+        decodeVisualLocal(std::max(visHead_ + 1u, uint32_t(std::min(double(wholeTick) + 1.0, capTick))));
+    }
+    if (covered && visHead_ <= wholeTick && !visDone_) through = visHead_ - 1u;
+    // The keyboard Worker only has the stream: off it, the keys wait for a stream to join.
+    if (through >= liveNextTick_ && (covered || !liveOnly_)) {
+        const bool onStream = covered && visHead_ > through;
+        if (onStream) {
+            if (!liveOnStream_) {
+                const auto first = std::lower_bound(visEvents_.begin(), visEvents_.end(), liveNextTick_,
+                    [](const EventWord& e, uint32_t t) { return e.tick < t; });
+                livePos_ = visBase_ + uint64_t(first - visEvents_.begin());
+                liveOnStream_ = true;
+                liveCursorSynced_ = false;
+            }
+            // Only the note-offs of an exact request tick are deferred: the words before it
+            // take the inlined path.
+            liveStreamRun(r.exactTick && through == wholeTick ? wholeTick : through + 1u);
+            for (;;) {
+                const uint64_t local = livePos_ - visBase_;
+                if (local >= visEvents_.size()) break;
+                const EventWord& e = visEvents_[std::size_t(local)];
+                if (e.tick > through) break;
+                const uint32_t m = e.packed & 0x00ffffffu;
+                liveConsume(r, e.tick, m, visTracks_[std::size_t(local)], liveWordCount(e.packed), true);
+                ++livePos_;
+            }
+        } else {
+            uint32_t evTick = 0, evMessage = 0;
+            uint16_t evTrack = 0;
+            if (!liveCursorSynced_) {
+                mergeReset(liveCursor_, liveNextTick_, false);
+                liveCursorSynced_ = true;
+            }
+            liveOnStream_ = false;
+            while (mergePeek(liveCursor_, evTick, evMessage, evTrack)) {
+                if (evTick > wholeTick) break;
+                mergePop(liveCursor_);
+                liveConsume(r, evTick, evMessage, evTrack, 1u, true);
+            }
+        }
+        liveNextTick_ = through + 1u;
+    }
+    liveTick_ = r.tick;
+}
+
+void BpfaMidiStore::liveFinish(const LiveRequest& r, LiveSnapshot& output)
+{
+    output = LiveSnapshot{};
     for (std::size_t i = 0; i < liveActive_.size();) {
         const uint32_t slot = liveActive_[i], track = liveSlotKey(slot) >> 11;
-        if (track < tracks_.size() && tracks_[track].maxTick < wholeTick) {
+        if (track < tracks_.size() && tracks_[track].maxTick < r.wholeTick) {
             liveClearSlot(slot);
             continue;
         }
         ++i;
     }
-    expire(liveNps_, liveNpsCount_, npsStartTick);
-    expire(liveCc_, liveCcCount_, ccStartTick);
+    liveExpire(liveNps_, liveNpsCount_, r.npsStartTick);
+    liveExpire(liveCc_, liveCcCount_, r.ccStartTick);
 
     std::array<uint64_t, 128> ownerRank{};
     std::array<uint32_t, 128> ownerKey{};
@@ -2801,7 +2908,243 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
     liveSinceVisualReset_ = true;
     liveHeld_ = output;
     if (liveOnStream_) visualTrim();
+}
+
+bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
+                                            bool forceReset)
+{
+    output = LiveSnapshot{};
+    LiveRequest r;
+    if (!liveRequest(tick, npsStartTick, ccStartTick, r)) return false;
+    switch (liveDecide(r, forceReset)) {
+    case LiveAction::Hold:
+        output = liveHeld_;
+        return true;
+    case LiveAction::Reset:
+        liveBeginReset();
+        liveRebuildAt(r.wholeTick);
+        if (liveDensityOnStream(r)) liveDensityFromStream(r);
+        else liveDensityDecode(r);
+        liveEndReset(r);
+        break;
+    case LiveAction::Advance:
+        liveAdvance(r);
+        break;
+    case LiveAction::Stay:
+        break;
+    }
+    liveFinish(r, output);
     return true;
+}
+
+// ---- Keyboard Worker (HANDOFF sec. 83) ----
+
+namespace {
+constexpr uint32_t LiveImageMagic = 0x31494c57u;    // "WLI1"
+constexpr uint32_t LiveRebuildMagic = 0x31524c57u;  // "WLR1"
+constexpr uint32_t VisualStreamMagic = 0x31545657u; // "WVT1"
+} // namespace
+
+bool BpfaMidiStore::exportLiveImage(std::vector<uint8_t>& blob) const
+{
+    blob.clear();
+    if (!valid_ || tracks_.empty() || trackColors_.size() != tracks_.size()) return false;
+    putPod(blob, LiveImageMagic);
+    putPod(blob, uint32_t(tracks_.size()));
+    putPod(blob, uint32_t(metadata_.maxTick));
+    putPod(blob, visualCheckpointSpan_);
+    std::vector<uint32_t> ends(tracks_.size());
+    for (std::size_t t = 0; t < tracks_.size(); ++t) ends[t] = tracks_[t].maxTick;
+    putArray(blob, ends.data(), ends.size());
+    putArray(blob, globalColors_.data(), globalColors_.size());
+    putArray(blob, trackColors_.data(), trackColors_.size());
+    return true;
+}
+
+bool BpfaMidiStore::importLiveImage(const uint8_t* data, std::size_t size)
+{
+    clear();
+    PodReader in{data, size};
+    if (in.get<uint32_t>() != LiveImageMagic) { error_ = "Invalid keyboard image"; return false; }
+    const uint32_t trackCount = in.get<uint32_t>();
+    metadata_.maxTick = in.get<uint32_t>();
+    visualCheckpointSpan_ = in.get<uint32_t>();
+    if (!in.ok || trackCount == 0 || trackCount > 65535u) { error_ = "Invalid keyboard image"; return false; }
+    std::vector<uint32_t> ends;
+    in.array(ends, trackCount);
+    std::vector<uint8_t> global;
+    in.array(global, globalColors_.size());
+    in.array(trackColors_, trackCount);
+    if (!in.ok) { error_ = "Truncated keyboard image"; return false; }
+    tracks_.assign(trackCount, TrackStorage{});
+    for (uint32_t t = 0; t < trackCount; ++t) tracks_[t].maxTick = ends[t];
+    std::copy(global.begin(), global.end(), globalColors_.begin());
+    metadata_.trackCount = trackCount;
+    visualEnabled_ = true;
+    visualAutoDecode_ = false;
+    liveOnly_ = true;
+    valid_ = true;
+    return true;
+}
+
+bool BpfaMidiStore::exportVisualStream(std::vector<uint8_t>& blob) const
+{
+    blob.clear();
+    if (!valid_ || !visValid_) return false;
+    putPod(blob, VisualStreamMagic);
+    putPod(blob, visStart_);
+    putPod(blob, visHead_);
+    putPod(blob, uint32_t(visDone_ ? 1 : 0));
+    putPod(blob, visBase_);
+    putPod(blob, uint64_t(visEvents_.size()));
+    putArray(blob, visEvents_.data(), visEvents_.size());
+    putArray(blob, visTracks_.data(), visTracks_.size());
+    return true;
+}
+
+bool BpfaMidiStore::importVisualStream(const uint8_t* data, std::size_t size)
+{
+    PodReader in{data, size};
+    if (!valid_ || in.get<uint32_t>() != VisualStreamMagic) { error_ = "Invalid visual stream"; return false; }
+    const uint32_t start = in.get<uint32_t>(), head = in.get<uint32_t>();
+    const bool done = in.get<uint32_t>() != 0;
+    const uint64_t base = in.get<uint64_t>(), count = in.get<uint64_t>();
+    std::vector<EventWord> events;
+    std::vector<uint16_t> tracks;
+    in.array(events, std::size_t(count));
+    in.array(tracks, std::size_t(count));
+    if (!in.ok) { error_ = "Truncated visual stream"; return false; }
+    visualReset(start);
+    visEvents_ = std::move(events);
+    visTracks_ = std::move(tracks);
+    visBase_ = base;
+    visHead_ = head;
+    visDone_ = done;
+    return true;
+}
+
+void BpfaMidiStore::restartVisualStream(uint32_t startTick)
+{
+    if (valid_) visualReset(std::min(startTick, metadata_.maxTick));
+}
+
+bool BpfaMidiStore::exportLiveRebuild(double tick, double npsStartTick, double ccStartTick, bool density,
+                                      std::vector<uint8_t>& blob)
+{
+    blob.clear();
+    LiveRequest r;
+    if (!liveRequest(tick, npsStartTick, ccStartTick, r)) { error_ = "Invalid keyboard rebuild"; return false; }
+    liveBeginReset();
+    liveRebuildAt(r.wholeTick);
+    if (density) liveDensityDecode(r);
+    putPod(blob, LiveRebuildMagic);
+    putPod(blob, r.wholeTick);
+    putPod(blob, uint32_t(density ? 1 : 0));
+    putPod(blob, uint32_t(liveActive_.size()));
+    putPod(blob, uint32_t(liveDeferred_.size()));
+    putPod(blob, uint32_t(liveNps_.size()));
+    putPod(blob, uint32_t(liveCc_.size()));
+    putPod(blob, uint32_t(0));
+    putPod(blob, liveNpsCount_);
+    putPod(blob, liveCcCount_);
+    std::vector<uint32_t> words;
+    words.reserve(liveActive_.size() * 4u);
+    for (const uint32_t slot : liveActive_) {
+        const LiveKey& k = liveSlots_[slot];
+        words.insert(words.end(), {liveSlotKey(slot), k.total, k.tailStart, k.tailColor});
+    }
+    putArray(blob, words.data(), words.size());
+    words.clear();
+    for (const LiveDeferred& d : liveDeferred_) words.insert(words.end(), {d.tick, d.message, uint32_t(d.track), d.count});
+    putArray(blob, words.data(), words.size());
+    words.clear();
+    for (const DensityPoint& p : liveNps_) words.insert(words.end(), {p.tick, p.count});
+    for (const DensityPoint& p : liveCc_) words.insert(words.end(), {p.tick, p.count});
+    putArray(blob, words.data(), words.size());
+    // This store no longer follows the keyboard: its next own request resets.
+    liveBeginReset();
+    liveCursorValid_ = false;
+    liveOnStream_ = false;
+    return true;
+}
+
+BpfaMidiStore::LiveStep BpfaMidiStore::liveWorkerStep(double tick, double npsStartTick, double ccStartTick,
+                                                      bool forceReset, LiveSnapshot& output)
+{
+    output = LiveSnapshot{};
+    LiveRequest r;
+    if (!liveRequest(tick, npsStartTick, ccStartTick, r)) return LiveStep::Failed;
+    switch (liveDecide(r, forceReset)) {
+    case LiveAction::Hold:
+        output = liveHeld_;
+        return LiveStep::Done;
+    case LiveAction::Reset:
+        return liveDensityOnStream(r) ? LiveStep::Rebuild : LiveStep::RebuildDensity;
+    case LiveAction::Advance:
+        liveAdvance(r);
+        break;
+    case LiveAction::Stay:
+        break;
+    }
+    liveFinish(r, output);
+    return LiveStep::Done;
+}
+
+bool BpfaMidiStore::liveWorkerResume(const uint8_t* data, std::size_t size, double tick, double npsStartTick,
+                                     double ccStartTick, LiveSnapshot& output)
+{
+    output = LiveSnapshot{};
+    LiveRequest r;
+    PodReader in{data, size};
+    if (!liveRequest(tick, npsStartTick, ccStartTick, r) || in.get<uint32_t>() != LiveRebuildMagic ||
+        in.get<uint32_t>() != r.wholeTick) {
+        error_ = "Invalid keyboard rebuild";
+        return false;
+    }
+    const bool density = in.get<uint32_t>() != 0;
+    const uint32_t active = in.get<uint32_t>(), deferred = in.get<uint32_t>();
+    const uint32_t nps = in.get<uint32_t>(), cc = in.get<uint32_t>();
+    in.get<uint32_t>();
+    const uint64_t npsCount = in.get<uint64_t>(), ccCount = in.get<uint64_t>();
+    std::vector<uint32_t> keys, offs, points;
+    in.array(keys, std::size_t(active) * 4u);
+    in.array(offs, std::size_t(deferred) * 4u);
+    in.array(points, (std::size_t(nps) + cc) * 2u);
+    if (!in.ok) { error_ = "Truncated keyboard rebuild"; return false; }
+    liveBeginReset();
+    for (std::size_t i = 0; i < keys.size(); i += 4) {
+        const uint32_t key = keys[i];
+        const uint16_t track = uint16_t(key >> 11);
+        if (track >= tracks_.size()) { error_ = "Invalid keyboard rebuild"; return false; }
+        const uint32_t slot = liveSlot(track, uint8_t((key >> 7) & 15u), uint8_t(key & 127u), true);
+        LiveKey& k = liveSlots_[slot];
+        k.total = keys[i + 1];
+        k.tailStart = keys[i + 2];
+        k.tailColor = keys[i + 3];
+        if (k.activeAt == ~0u) {
+            k.activeAt = uint32_t(liveActive_.size());
+            liveActive_.push_back(slot);
+        }
+    }
+    for (std::size_t i = 0; i < offs.size(); i += 4)
+        liveDeferred_.push_back({offs[i], offs[i + 1], uint16_t(offs[i + 2]), offs[i + 3]});
+    for (std::size_t i = 0; i < points.size(); i += 2)
+        (i / 2 < nps ? liveNps_ : liveCc_).push_back({points[i], points[i + 1]});
+    liveNpsCount_ = npsCount;
+    liveCcCount_ = ccCount;
+    if (!density) liveDensityFromStream(r);
+    liveEndReset(r);
+    liveFinish(r, output);
+    return true;
+}
+
+void BpfaMidiStore::setLiveExternal(bool external)
+{
+    liveExternal_ = external;
+    liveExternalPos_ = -1;
+    liveBeginReset();
+    liveCursorValid_ = false;
+    liveOnStream_ = false;
 }
 
 bool BpfaMidiStore::buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::vector<VisualNote>& output)
