@@ -19,6 +19,8 @@ constexpr std::size_t SnapshotMaxNotes = 65536;
 constexpr uint64_t SnapshotBudgetNotes = 16ull * 1024ull * 1024ull;
 constexpr uint64_t SnapshotMinTrackNotes = 4096;
 constexpr uint64_t LiveSnapshotBudgetKeys = 4ull * 1024ull * 1024ull;
+// A keyboard reset replays each track from its last key snapshot (HANDOFF sec. 82).
+constexpr uint64_t LiveSnapshotEventInterval = 4096;
 #ifndef WASMIDI_BPFA_NOTE_STORE
 #define WASMIDI_BPFA_NOTE_STORE 0
 #endif
@@ -312,9 +314,9 @@ void BpfaMidiStore::clear()
     liveNps_.clear();
     liveCc_.clear();
     liveNpsCount_ = liveCcCount_ = 0;
-    liveFlat_.clear();
-    liveTable_.clear();
-    liveTableUsed_ = 0;
+    livePairOf_.clear();
+    livePairKey_.clear();
+    liveSlots_.clear();
     liveActive_.clear();
     liveDeferred_.clear();
     liveNextTick_ = 0;
@@ -458,7 +460,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                                                          snapshotBudget * uint64_t(length) / snapshotBytes);
             }
             uint64_t snapshotInterval = SnapshotEventInterval, snapshotNotesUsed = 0;
-            uint64_t liveInterval = SnapshotEventInterval, liveKeysUsed = 0;
+            uint64_t liveInterval = LiveSnapshotEventInterval, liveKeysUsed = 0;
             const uint64_t liveBudget = std::max<uint64_t>(
                 2048u, LiveSnapshotBudgetKeys * (tracks_[t].byteEnd - tracks_[t].byteBegin) / snapshotBytes);
             TrackStorage& storage = tracks_[t];
@@ -1906,17 +1908,39 @@ void BpfaMidiStore::visualDecodeSpan(std::vector<Cursor>& cursors, uint32_t endT
     }
     visOrder_.clear();
     visOrder_.reserve(visRaw_.size());
+    uint32_t low = ~0u, high = 0;
     for (uint32_t i = 0; i < visRaw_.size(); ++i) {
         const uint32_t type = visRaw_[i].packed & 0xf0u;
-        if (type == 0x80u || type == 0x90u || type >= 0xb0u) visOrder_.push_back(i);
+        if (type == 0x80u || type == 0x90u || type >= 0xb0u) {
+            visOrder_.push_back(i);
+            low = std::min(low, visRaw_[i].tick);
+            high = std::max(high, visRaw_[i].tick);
+        }
     }
-    std::stable_sort(visOrder_.begin(), visOrder_.end(),
-        [this](uint32_t a, uint32_t b) { return visRaw_[a].tick < visRaw_[b].tick; });
-    events.reserve(visOrder_.size());
-    tracks.reserve(visOrder_.size());
+    if (visOrder_.empty()) return;
+    // The words are in (track, tick) order: a counting sort by tick keeps that order within
+    // a tick, like the stable sort, without the n log n over 9679 runs (HANDOFF sec. 82).
+    const uint64_t range = uint64_t(high) - low + 1u;
+    if (range > uint64_t(visOrder_.size()) * 4u + 65536u) {
+        std::stable_sort(visOrder_.begin(), visOrder_.end(),
+            [this](uint32_t a, uint32_t b) { return visRaw_[a].tick < visRaw_[b].tick; });
+        events.reserve(visOrder_.size());
+        tracks.reserve(visOrder_.size());
+        for (uint32_t index : visOrder_) {
+            events.push_back(EventWord{visRaw_[index].tick, visRaw_[index].packed});
+            tracks.push_back(visRawTrack_[index]);
+        }
+        return;
+    }
+    visTickCount_.assign(std::size_t(range) + 1u, 0u);
+    for (uint32_t index : visOrder_) ++visTickCount_[visRaw_[index].tick - low + 1u];
+    for (std::size_t i = 1; i < visTickCount_.size(); ++i) visTickCount_[i] += visTickCount_[i - 1];
+    events.resize(visOrder_.size());
+    tracks.resize(visOrder_.size());
     for (uint32_t index : visOrder_) {
-        events.push_back(EventWord{visRaw_[index].tick, visRaw_[index].packed});
-        tracks.push_back(visRawTrack_[index]);
+        const uint32_t at = visTickCount_[visRaw_[index].tick - low]++;
+        events[at] = EventWord{visRaw_[index].tick, visRaw_[index].packed};
+        tracks[at] = visRawTrack_[index];
     }
 }
 
@@ -2452,86 +2476,39 @@ bool BpfaMidiStore::buildLiveSnapshotMerge(double tick, double npsStartTick, dou
     return true;
 }
 
-// Linear probing; the slot holding key, or the empty slot that ends its probe run.
-std::size_t BpfaMidiStore::liveSlotOf(uint32_t key) const
+uint32_t BpfaMidiStore::liveSlot(uint16_t track, uint8_t channel, uint8_t pitch, bool create)
 {
-    const std::size_t mask = liveTable_.size() - 1u;
-    std::size_t slot = std::size_t(key * 0x9e3779b1u) & mask;
-    while (liveTable_[slot].key != key && liveTable_[slot].key != ~0u) slot = (slot + 1u) & mask;
-    return slot;
+    const std::size_t at = std::size_t(track) * 16u + channel;
+    if (at >= livePairOf_.size()) {
+        if (!create) return ~0u;
+        livePairOf_.resize(std::max<std::size_t>(at + 1u, tracks_.size() * 16u), ~0u);
+    }
+    uint32_t& pair = livePairOf_[at];
+    if (pair == ~0u) {
+        if (!create) return ~0u;
+        pair = uint32_t(livePairKey_.size());
+        livePairKey_.push_back((uint32_t(track) << 11) | (uint32_t(channel) << 7));
+        liveSlots_.resize(liveSlots_.size() + 128u);
+    }
+    return pair * 128u + pitch;
 }
 
-// Backward-shift deletion: no tombstones, so lookups never slow down as keys come and go.
-void BpfaMidiStore::liveTableErase(std::size_t slot)
+void BpfaMidiStore::liveClearSlot(uint32_t slot)
 {
-    const std::size_t mask = liveTable_.size() - 1u;
-    std::size_t hole = slot;
-    for (std::size_t next = (hole + 1u) & mask; liveTable_[next].key != ~0u; next = (next + 1u) & mask) {
-        const std::size_t home = std::size_t(liveTable_[next].key * 0x9e3779b1u) & mask;
-        if (((next - home) & mask) >= ((next - hole) & mask)) {
-            liveTable_[hole] = liveTable_[next];
-            hole = next;
-        }
-    }
-    liveTable_[hole] = LiveSlot{};
-    --liveTableUsed_;
-}
-
-BpfaMidiStore::LiveKey* BpfaMidiStore::liveKey(uint32_t key, bool create)
-{
-    if (liveUseFlat_) return key < liveFlat_.size() ? &liveFlat_[key] : nullptr;
-    if (liveTable_.empty()) {
-        if (!create) return nullptr;
-        liveTable_.assign(4096u, LiveSlot{});
-    }
-    std::size_t slot = liveSlotOf(key);
-    if (liveTable_[slot].key == key) return &liveTable_[slot].value;
-    if (!create) return nullptr;
-    if ((liveTableUsed_ + 1u) * 2u > liveTable_.size()) {
-        std::vector<LiveSlot> old(liveTable_.size() * 2u);
-        old.swap(liveTable_);
-        for (const LiveSlot& entry : old)
-            if (entry.key != ~0u) liveTable_[liveSlotOf(entry.key)] = entry;
-        slot = liveSlotOf(key);
-    }
-    liveTable_[slot].key = key;
-    liveTable_[slot].value = LiveKey{};
-    ++liveTableUsed_;
-    return &liveTable_[slot].value;
-}
-
-void BpfaMidiStore::liveClearKey(uint32_t key, LiveKey& k)
-{
+    LiveKey& k = liveSlots_[slot];
     k.total = 0;
     if (k.activeAt != ~0u) {
         const uint32_t at = k.activeAt, last = liveActive_.back();
         liveActive_[at] = last;
         liveActive_.pop_back();
-        if (last != key) {
-            LiveKey* moved = liveKey(last, false);
-            if (moved) moved->activeAt = at;
-        }
+        liveSlots_[last].activeAt = at;
         k.activeAt = ~0u;
-    }
-    if (!liveUseFlat_ && !liveTable_.empty()) {
-        const std::size_t slot = liveSlotOf(key);
-        if (liveTable_[slot].key == key) liveTableErase(slot);
     }
 }
 
 void BpfaMidiStore::liveReset()
 {
-    constexpr std::size_t LiveFlatKeys = std::size_t(1) << 20;
-    const std::size_t keys = tracks_.size() * 2048u;
-    liveUseFlat_ = keys <= LiveFlatKeys;
-    if (liveUseFlat_) {
-        if (liveFlat_.size() != keys) liveFlat_.assign(keys, LiveKey{});
-        else for (uint32_t key : liveActive_) liveFlat_[key] = LiveKey{};
-    } else {
-        liveFlat_.clear();
-    }
-    if (liveTableUsed_) std::fill(liveTable_.begin(), liveTable_.end(), LiveSlot{});
-    liveTableUsed_ = 0;
+    for (uint32_t slot : liveActive_) liveSlots_[slot] = LiveKey{};
     liveActive_.clear();
 }
 
@@ -2542,23 +2519,22 @@ void BpfaMidiStore::applyLiveEvent(uint32_t tick, uint32_t message, uint16_t tra
     const uint8_t channel = status & 0x0f;
     const uint8_t pitch = uint8_t((message >> 8) & 0x7fu);
     const uint8_t velocity = uint8_t((message >> 16) & 0x7fu);
-    const uint32_t key = (uint32_t(track) << 11) | (uint32_t(channel) << 7) | uint32_t(pitch);
     if (command == 0x90 && velocity != 0) {
-        LiveKey* k = liveKey(key, true);
-        if (!k) return;
-        k->total += count;
-        k->tailStart = tick;
-        k->tailColor = colorByte(track, channel);
-        if (k->activeAt == ~0u) {
-            k->activeAt = uint32_t(liveActive_.size());
-            liveActive_.push_back(key);
+        const uint32_t slot = liveSlot(track, channel, pitch, true);
+        LiveKey& k = liveSlots_[slot];
+        k.total = uint32_t(std::min<uint64_t>(uint64_t(k.total) + count, std::numeric_limits<uint32_t>::max()));
+        k.tailStart = tick;
+        k.tailColor = colorByte(track, channel);
+        if (k.activeAt == ~0u) {
+            k.activeAt = uint32_t(liveActive_.size());
+            liveActive_.push_back(slot);
         }
         return;
     }
-    LiveKey* k = liveKey(key, false);
-    if (!k || k->total == 0) return;
-    if (k->total > count) k->total -= count;
-    else liveClearKey(key, *k);
+    const uint32_t slot = liveSlot(track, channel, pitch, false);
+    if (slot == ~0u || liveSlots_[slot].total == 0) return;
+    if (liveSlots_[slot].total > count) liveSlots_[slot].total -= count;
+    else liveClearSlot(slot);
 }
 
 // Same state and output as buildLiveSnapshotMerge; steady-state events come from the visual
@@ -2786,10 +2762,10 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
     }
 
     for (std::size_t i = 0; i < liveActive_.size();) {
-        const uint32_t key = liveActive_[i], track = key >> 11;
+        const uint32_t slot = liveActive_[i], track = liveSlotKey(slot) >> 11;
         if (track < tracks_.size() && tracks_[track].maxTick < wholeTick) {
-            LiveKey* k = liveKey(key, false);
-            if (k) { liveClearKey(key, *k); continue; }
+            liveClearSlot(slot);
+            continue;
         }
         ++i;
     }
@@ -2799,10 +2775,10 @@ bool BpfaMidiStore::buildLiveSnapshotStream(double tick, double npsStartTick, do
     std::array<uint64_t, 128> ownerRank{};
     std::array<uint32_t, 128> ownerKey{};
     uint64_t activeVoices = 0;
-    for (const uint32_t key : liveActive_) {
-        const LiveKey* k = liveKey(key, false);
-        if (!k || k->total == 0) continue;
-        const uint32_t track = key >> 11;
+    for (const uint32_t slot : liveActive_) {
+        const LiveKey* k = &liveSlots_[slot];
+        if (k->total == 0) continue;
+        const uint32_t key = liveSlotKey(slot), track = key >> 11;
         const uint8_t pitch = uint8_t(key & 0x7fu);
         const uint64_t count = k->total;
         activeVoices = std::min<uint64_t>(std::numeric_limits<uint32_t>::max(), activeVoices + count);

@@ -486,15 +486,16 @@ private:
     std::vector<FeedWord> visRaw_;
     std::vector<uint16_t> visRawTrack_;
     std::vector<uint32_t> visOrder_;
+    std::vector<uint32_t> visTickCount_;
     std::vector<EventWord> visSpanEvents_;
     std::vector<uint16_t> visSpanTracks_;
     uint64_t renderPos_ = 0;        // absolute index of the next word for the sweep
 
     // Live snapshot on the stream: per (track, channel, key) the number of open notes and
     // the newest one still open (offs close the oldest first, so it only changes on a note-on
-    // or when the key empties). A flat key table up to LiveFlatKeys keys, above that an
-    // open-addressing table of the keys with notes (HANDOFF sec. 81).
-    struct LiveKey { uint64_t total = 0; uint32_t tailStart = 0; uint32_t activeAt = ~0u; uint8_t tailColor = 0; };
+    // or when the key empties). Each (track, channel) gets 128 slots on its first note
+    // (HANDOFF sec. 82).
+    struct LiveKey { uint32_t total = 0; uint32_t tailStart = 0; uint32_t activeAt = ~0u; uint32_t tailColor = 0; };
     struct LiveDeferred { uint32_t tick; uint32_t message; uint16_t track; uint32_t count; };
     bool buildLiveSnapshotMerge(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
                                 bool forceReset);
@@ -503,17 +504,14 @@ private:
     void applyLiveEvent(uint32_t tick, uint32_t message, uint16_t track, uint32_t count);
     void liveRebuildAt(uint32_t targetTick);
     std::vector<FeedWord> liveWords_;
-    LiveKey* liveKey(uint32_t key, bool create);
-    void liveClearKey(uint32_t key, LiveKey& k);
+    uint32_t liveSlot(uint16_t track, uint8_t channel, uint8_t pitch, bool create);
+    void liveClearSlot(uint32_t slot);
+    uint32_t liveSlotKey(uint32_t slot) const { return livePairKey_[slot >> 7] | (slot & 127u); }
     void liveReset();
-    std::vector<LiveKey> liveFlat_;
-    struct LiveSlot { uint32_t key = ~0u; LiveKey value; };
-    std::vector<LiveSlot> liveTable_;
-    std::size_t liveTableUsed_ = 0;
-    std::size_t liveSlotOf(uint32_t key) const;
-    void liveTableErase(std::size_t slot);
-    bool liveUseFlat_ = false;
-    std::vector<uint32_t> liveActive_;     // keys with notes, in no particular order
+    std::vector<uint32_t> livePairOf_;     // track * 16 + channel -> pair, ~0u before its first note
+    std::vector<uint32_t> livePairKey_;    // pair -> (track << 11) | (channel << 7)
+    std::vector<LiveKey> liveSlots_;       // pair * 128 + pitch
+    std::vector<uint32_t> liveActive_;     // slots with notes, in no particular order
     std::vector<LiveDeferred> liveDeferred_;
     uint32_t liveNextTick_ = 0;     // every event before it was applied (or deferred)
     bool liveOnStream_ = false;

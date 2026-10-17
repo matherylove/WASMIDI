@@ -5357,3 +5357,76 @@ perdía cuadros sin nada pesado en pantalla y WASMIDI terminó cerrándose ("app
 cierre "application exit" (no se reprodujo; la memoria de la app no crece); WasmiSynth a 12288
 voces en el 7435HS (16 hilos: probablemente limitado por CPU; el Worker del parser bloqueado por el
 teclado le quitaba eventos y eso ya no pasa, pero no se midió en esa PC).
+
+## 82. Revisión 86 — The Nuker 3 en visual-bench: tramos visuales más largos y teclado más barato en el Worker del parser
+
+**Pedido:** el usuario mandó un log de `visual-bench.html?visualdebug=1` con The Nuker 3 Ultimate
+F4 entero (867,1 s; 16 núcleos, 5 helpers, carga 44,1 s): 52043 cuadros, 12762 con el roll
+atrasado (adelanto mínimo -73,8 s) en 122-135 s, 420-561 s, 710-717 s y 817-866 s; teclado
+53,8/s de media pero 3-30/s en esos tramos, con latencia de hasta 484 ms.
+
+**Causa (host y Chromium del contenedor, 4 hilos, `?helpers=3`):**
+
+1. **Costo fijo por tramo del flujo visual.** Cada tramo que decodifica un helper
+   (`decodeVisualRequest`) retoma cada pista desde su `checkpoint` (cada 256 eventos) con
+   `decodeNext` hasta el tick de inicio. Con 9679 pistas eso cuesta ~0,1 s por tramo aunque el
+   tramo tenga pocas palabras. En 420-440 s (14-31,7 M note-ons/s, ~43 M palabras/s casi sin
+   plegar) los tramos de 512 K palabras duraban unos milisegundos de canción: host, decodificar
+   un segundo de canción a 440 s costaba 7,3 s de helper.
+2. **Orden del tramo.** Las palabras salen en orden (pista, tick) y se ordenaban por tick con
+   `stable_sort`: n log n sobre 9679 tiras.
+3. **Teclado en el Worker del parser.** Por segundo de canción a 440 s (host): anexar 0,14 s,
+   barrido del roll 0,44 s, teclado 0,79 s. El teclado (`applyLiveEvent`) buscaba cada
+   (pista, canal, tecla) en una tabla hash. Además el reset del teclado reproducía cada pista
+   desde su último snapshot compacto por tecla, que se tomaba cada 131072 eventos de la pista:
+   110 M eventos reproducidos a 430 s (2,44 s en host, 17,8 s en Chromium).
+
+**Cambios:**
+
+- `midi-parser-worker.js`: el tamaño de tramo visual crece desde 512 K palabras y se duplica
+  con cada tramo pedido hasta `visualSpanMax` = mín(8 M, máx(512 K, pistas × 1024)), así el
+  primer tramo tras un reinicio llega pronto y los siguientes amortizan la retoma de las
+  pistas. `visualRestart` vuelve al tamaño inicial. Con tramos grandes la cola espera a lo sumo
+  helpers + 1 tramos (antes 2 × helpers) para no acumular memoria.
+- `bpfa_midi_store.cpp`, `visualDecodeSpan`: orden por conteo de ticks (estable dentro de cada
+  tick, igual que `stable_sort`) cuando el rango de ticks es ≤ 4 × palabras + 65536; si no,
+  queda el `stable_sort`.
+- Teclado: cada (pista, canal) recibe 128 casillas planas en su primera nota (`liveSlot`,
+  `livePairOf_` indexado por pista × 16 + canal) en vez de la tabla hash; `LiveKey` baja a
+  16 bytes y la lista de casillas activas se borra por intercambio. Snapshots compactos por
+  tecla cada 4096 eventos de pista (antes 131072); siguen limitados por
+  `LiveSnapshotBudgetKeys`.
+
+**Medición:**
+
+| Host, 440 s, por segundo de canción | Decodificación en helpers |
+|---|---|
+| tramos de 512 K palabras | 7,3 s |
+| 2 M | 3,6 s |
+| 4 M | 2,8 s |
+| 9,9 M | 2,2 s |
+| 9,9 M + orden por conteo | 1,5 s |
+
+| Snapshot por tecla cada | Reproducido a 430 s | Reset a 430 s (host) | Reproducido a 445 s | Memoria |
+|---|---|---|---|---|
+| 131072 eventos (antes) | 110 M | 2,44 s | 142 M | 12 MiB |
+| 16384 | 20,7 M | 0,48 s | — | 37 MiB |
+| 4096 (ahora) | 9,2 M | 0,26 s | 11 M | 59 MiB |
+
+Microbenchmark del teclado sobre las palabras reales de 440 s: 35,9 ns por palabra con la tabla
+hash, 7,5 ns con las casillas planas; 0 imágenes distintas.
+
+Chromium del contenedor, `?helpers=3`, empezando en 415 s: reset del teclado 1,2-1,6 s (antes
+17,8 s); 420-428 s casi en tiempo real; 429-455 s el roll se atrasa ~0,6 s por segundo. Ahí el
+Worker del parser está saturado: por segundo, teclado ~550-700 ms, barrido ~100-250 ms, anexar
+~100 ms (con 4 hilos los 3 helpers y el synth compiten por la CPU).
+
+**Verificación:** `visual_check` IDENTICAL en many9679, many30 y nuker4_553;
+`feeder_check` 24 IDENTICAL, 0 DIFFER; `tools/local_build.sh` completo; `browser_bench.py app`
+con `many9679.mid` (12 s, sin errores).
+
+**No verificado / pendiente:** en las PCs del usuario (16-24 hilos dejan más CPU al Worker del
+parser que el contenedor); en 429-455 s el teclado sigue siendo lo más caro del Worker del
+parser (siguiente paso: sacarlo a su propio Worker); un salto lejano todavía decodifica la
+ventana de densidades desde los checkpoints (3,6 s en host a 830 s); la ráfaga de 830 s
+(~121 M palabras/s) no se midió con estos cambios.
