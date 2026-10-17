@@ -15,6 +15,11 @@ EM_JS(int, wasmidi_tiles_disabled, (), {
     try { return new URL(globalThis.location.href).searchParams.get("tiles") === "0" ? 1 : 0; }
     catch (_) { return 0; }
 });
+// ?tileslice=0 builds each cull tile in one frame, as before rev. 88.
+EM_JS(int, wasmidi_tile_slice_disabled, (), {
+    try { return new URL(globalThis.location.href).searchParams.get("tileslice") === "0" ? 1 : 0; }
+    catch (_) { return 0; }
+});
 // ?rolldraw=0 skips the note draw calls (all CPU work stays): measures the roll's CPU
 // side where the GPU is software, as in headless Chromium (HANDOFF sec. 81).
 EM_JS(int, wasmidi_roll_draw_disabled, (), {
@@ -35,7 +40,18 @@ EM_JS(void, wasmidi_roll_debug_drawn, (double instances, double raw, double resi
     root.__wasmidiRollResident = resident;
     root.__wasmidiAppMemory = HEAP8.length;
 });
+// Cull tile work on the page thread, read by ?visualdebug=1: kind 0 is a slice of a
+// tile built over several frames, 1 finishes one, 2 is a visible tile built at once.
+EM_JS(void, wasmidi_roll_debug_tile, (double ms, int kind), {
+    const root = globalThis;
+    if (kind) root.__wasmidiRollTiles = (root.__wasmidiRollTiles | 0) + 1;
+    if (kind == 2) root.__wasmidiRollTilesVisible = (root.__wasmidiRollTilesVisible | 0) + 1;
+    root.__wasmidiRollTileMs = (root.__wasmidiRollTileMs || 0) + ms;
+    root.__wasmidiRollTileMax = Math.max(root.__wasmidiRollTileMax || 0, ms);
+});
 #else
+static void wasmidi_roll_debug_tile(double, int) {}
+static int wasmidi_tile_slice_disabled() { return 0; }
 static int wasmidi_tiles_disabled() { return 0; }
 static int wasmidi_roll_draw_disabled() { return 0; }
 static void wasmidi_roll_debug_count(int) {}
@@ -3704,6 +3720,7 @@ void GLRenderer::releaseCullTiles()
     for (CullTile& tile : cullTiles_)
         if (tile.vbo) glDeleteBuffers(1, &tile.vbo);
     cullTiles_.clear();
+    cullJob_.active = false;
 }
 
 void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady)
@@ -3730,6 +3747,7 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
     }
 
     const uint32_t firstTile = viewStart / windowTicks;
+    const uint32_t lastTile = viewEnd / windowTicks;
     for (std::size_t i = 0; i < cullTiles_.size();) {
         if (cullTiles_[i].index < firstTile || cullTiles_[i].index >= firstTile + 64u) {
             if (cullTiles_[i].vbo) glDeleteBuffers(1, &cullTiles_[i].vbo);
@@ -3739,41 +3757,65 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
             ++i;
         }
     }
+    if (cullJob_.active && (cullJob_.index < firstTile || cullJob_.index >= firstTile + 64u))
+        cullJob_.active = false;
 
-    // The visible tiles are built (or brought up to date) now, even before the notes
-    // for their whole span have arrived: drawing them raw costs far more (HANDOFF sec. 81).
+    // The visible tiles are brought up to date now, even before the notes for their
+    // whole span have arrived: drawing them raw costs far more (HANDOFF sec. 81). A
+    // slice-built tile that already covers enough is finished instead (sec. 84).
     if (notesReady) {
-        const uint32_t lastTile = viewEnd / windowTicks;
         for (uint32_t k = firstTile; k <= lastTile && k < firstTile + 64u; ++k) {
             const uint64_t tileEnd = (uint64_t(k) + 1u) * windowTicks;
             const uint64_t needed = std::min<uint64_t>(viewEnd, tileEnd);
             const CullTile* tile = findCullTile(k);
             if (tile && tile->coverage >= needed) continue;
             if (sharpRemoteSafeThrough_ < needed) continue;
+            if (cullJob_.active && cullJob_.index == k && cullJob_.coverage >= needed) {
+                const auto started = std::chrono::steady_clock::now();
+                stepCullJob(1.0e9);
+                wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count(), 2);
+                continue;
+            }
+            if (cullJob_.active && cullJob_.index == k)
+                cullJob_.active = false;
+            const auto started = std::chrono::steady_clock::now();
             buildCullTile(k, windowTicks);
+            wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count(), 2);
         }
     }
 
-    const auto started = std::chrono::steady_clock::now();
-    int built = 0;
-    for (uint32_t k = firstTile; k < firstTile + 64u; ++k) {
-        const uint64_t tileEnd = (uint64_t(k) + 1u) * windowTicks;
-        const CullTile* tile = findCullTile(k);
-        if (tile && tile->coverage >= tileEnd) continue;
-        if (tileEnd > sharpRemoteSafeThrough_) break;
-        buildCullTile(k, windowTicks);
-        ++built;
-        const double elapsedMs = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - started).count();
-        if (built >= 2 || elapsedMs > 4.0) break;
+    // Everything else is built a slice per frame: a dense tile is a million notes, tens
+    // of milliseconds in one piece.
+    if (!cullJob_.active) {
+        for (uint32_t k = firstTile; k < firstTile + 64u; ++k) {
+            const uint64_t tileStart = uint64_t(k) * windowTicks;
+            const uint64_t tileEnd = tileStart + windowTicks;
+            const uint64_t target = std::min<uint64_t>(tileEnd, sharpRemoteSafeThrough_);
+            if (target <= tileStart) break;
+            const CullTile* tile = findCullTile(k);
+            if (tile && tile->coverage >= target) continue;
+            // A tile still filling is built only if it may come on screen before it is
+            // complete, and redone once enough new notes arrived for it.
+            if (target < tileEnd && k > lastTile + 1u) break;
+            if (target < tileEnd && tile && target - tile->coverage < windowTicks / 16u) break;
+            startCullJob(k, windowTicks, static_cast<uint32_t>(target));
+            break;
+        }
+    }
+    if (cullJob_.active) {
+        const auto started = std::chrono::steady_clock::now();
+        static const bool sliceDisabled = wasmidi_tile_slice_disabled() != 0;
+        const bool visible = cullJob_.index <= lastTile;
+        const bool finished = stepCullJob(sliceDisabled ? 1.0e9 : (visible ? 6.0 : 3.0));
+        wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count(), finished ? 1 : 0);
     }
 }
 
-void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
+void GLRenderer::uploadCullTile(uint32_t index, uint32_t coverage, const CompositorNote* notes, std::size_t count)
 {
-    constexpr std::size_t kCullMinNotes = 50000;
-    const uint32_t tileStart = index * windowTicks;
-    const uint32_t tileEnd = tileStart + windowTicks;
     CullTile* existing = findCullTileMutable(index);
     if (!existing) {
         cullTiles_.push_back(CullTile{});
@@ -3781,20 +3823,26 @@ void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
         existing->index = index;
     }
     CullTile& tile = *existing;
+    tile.coverage = coverage;
+    tile.count = static_cast<uint32_t>(count);
+    if (count == 0) return;
+    if (!tile.vbo) glGenBuffers(1, &tile.vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, tile.vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(count * sizeof(CompositorNote)),
+        notes, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
+{
+    constexpr std::size_t kCullMinNotes = 50000;
+    const uint32_t tileStart = index * windowTicks;
+    const uint32_t tileEnd = tileStart + windowTicks;
     // Every note that starts, or closes, before the coverage tick is in the ring.
-    tile.coverage = std::min<uint32_t>(tileEnd, sharpRemoteSafeThrough_);
-    const auto upload = [&tile](const CompositorNote* notes, std::size_t count) {
-        tile.count = static_cast<uint32_t>(count);
-        if (count == 0) return;
-        if (!tile.vbo) glGenBuffers(1, &tile.vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, tile.vbo);
-        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(count * sizeof(CompositorNote)),
-            notes, GL_STATIC_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-    };
+    const uint32_t coverage = std::min<uint32_t>(tileEnd, sharpRemoteSafeThrough_);
 
     cullInput_.clear();
-    const uint64_t collectEnd = tile.coverage == tileEnd ? uint64_t(tileEnd) : uint64_t(tile.coverage) + 1u;
+    const uint64_t collectEnd = coverage == tileEnd ? uint64_t(tileEnd) : uint64_t(coverage) + 1u;
     const uint32_t head = std::max(sharpHead_, sharpRemotePreparedHead_);
     for (uint32_t id = sharpTail_; id < head; ++id) {
         const VisualNote& note = ring_[std::size_t(id) & ringMask_];
@@ -3803,7 +3851,7 @@ void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
         cullInput_.push_back({ note.startTick, note.endTick, note.packedData });
     }
     if (cullInput_.size() < kCullMinNotes) {
-        upload(cullInput_.data(), cullInput_.size());
+        uploadCullTile(index, coverage, cullInput_.data(), cullInput_.size());
         return;
     }
 
@@ -3813,9 +3861,82 @@ void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
     settings.rasterWidth = width_;
     settings.firstKey = 0;
     settings.keyCount = 128;
-    settings.viewEndTick = tile.coverage;
+    settings.viewEndTick = coverage;
     CullViewport(cullInput_.data(), cullInput_.size(), settings, cullScratch_, cullResult_);
-    upload(cullResult_.notes.data(), cullResult_.notes.size());
+    uploadCullTile(index, coverage, cullResult_.notes.data(), cullResult_.notes.size());
+}
+
+void GLRenderer::startCullJob(uint32_t index, uint32_t windowTicks, uint32_t coverage)
+{
+    cullJob_.active = true;
+    cullJob_.collecting = true;
+    cullJob_.index = index;
+    cullJob_.coverage = coverage;
+    cullJob_.windowTicks = windowTicks;
+    cullJob_.nextId = sharpTail_;
+    cullJob_.input.clear();
+}
+
+bool GLRenderer::stepCullJob(double budgetMs)
+{
+    constexpr std::size_t kCullMinNotes = 50000;
+    constexpr uint32_t kCollectSlice = 16384;
+    constexpr std::size_t kCullSlice = 4096;
+    CullJob& job = cullJob_;
+    const auto started = std::chrono::steady_clock::now();
+    const auto spent = [&started]() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+    };
+    const uint32_t tileStart = job.index * job.windowTicks;
+    const uint32_t tileEnd = tileStart + job.windowTicks;
+
+    if (job.collecting) {
+        // The notes before the coverage tick no longer change, but the tail may pass
+        // the ones that ended left of the screen (their slots can be reused).
+        const uint64_t collectEnd = job.coverage == tileEnd ? uint64_t(tileEnd) : uint64_t(job.coverage) + 1u;
+        for (;;) {
+            const uint32_t head = std::max(sharpHead_, sharpRemotePreparedHead_);
+            uint32_t id = std::max(job.nextId, sharpTail_);
+            const uint32_t sliceEnd = head - id > kCollectSlice ? id + kCollectSlice : head;
+            bool reached = sliceEnd == head;
+            for (; id < sliceEnd; ++id) {
+                const VisualNote& note = ring_[std::size_t(id) & ringMask_];
+                if (note.startTick >= collectEnd) { reached = true; break; }
+                if (note.endTick != 0 && note.endTick <= tileStart) continue;
+                job.input.push_back({ note.startTick, note.endTick, note.packedData });
+            }
+            job.nextId = id;
+            if (reached) break;
+            if (spent() >= budgetMs) return false;
+        }
+        job.collecting = false;
+        if (job.input.size() < kCullMinNotes) {
+            job.active = false;
+            const CullTile* tile = findCullTile(job.index);
+            if (!tile || tile->coverage < job.coverage)
+                uploadCullTile(job.index, job.coverage, job.input.data(), job.input.size());
+            return true;
+        }
+        CompositorSettings settings;
+        settings.startTick = tileStart;
+        settings.spanTicks = job.windowTicks;
+        settings.rasterWidth = width_;
+        settings.firstKey = 0;
+        settings.keyCount = 128;
+        settings.viewEndTick = job.coverage;
+        CullBegin(job.input.data(), job.input.size(), settings, job.scratch, job.progress);
+        if (spent() >= budgetMs) return false;
+    }
+
+    while (!CullStep(job.scratch, job.progress, kCullSlice))
+        if (spent() >= budgetMs) return false;
+    CullFinish(job.progress, job.result);
+    job.active = false;
+    const CullTile* tile = findCullTile(job.index);
+    if (!tile || tile->coverage < job.coverage)
+        uploadCullTile(job.index, job.coverage, job.result.notes.data(), job.result.notes.size());
+    return true;
 }
 
 

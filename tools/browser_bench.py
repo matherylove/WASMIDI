@@ -16,6 +16,7 @@ Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
          --query=helpers=3 (appended to the page URL)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
          --seek=S (app: at second S click the position slider near the start)
+         --pause=S:D (app: pause at second S and resume D seconds later)
          --profile=S:D:OUT (app: CPU profile of the page's main thread from second S for D seconds,
                    saved to OUT for DevTools; prints the functions with the most self time.
                    Function names in wasmidi.wasm need cmake -DWASMIDI_PROFILE_FUNCS=ON)
@@ -174,7 +175,10 @@ async def main():
             profile = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--profile=")), None)
             trace = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--trace=")), None)
             cdp = await page.context.new_cdp_session(page) if profile or trace else None
+            pause = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--pause=")), None)
             for second in range(int(seconds)):
+                if pause and second in (int(pause[0]), int(pause[0]) + int(pause[1])):
+                    await page.mouse.click(25, 175)  # the same button pauses and resumes
                 if seek_at is not None and second == seek_at:
                     await page.mouse.click(110, 170)  # position slider, about 18% of the song
                 if trace and second == int(trace[0]):

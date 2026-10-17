@@ -109,4 +109,24 @@ void CullViewport(
     CompositorScratch& scratch,
     CompositorResult& out);
 
+// The same cull split into slices, so a caller can spread one viewport over several
+// frames. `notes` and `scratch` must stay untouched until CullFinish.
+struct CompositorProgress {
+    const CompositorNote* notes = nullptr;
+    std::size_t noteCount = 0;
+    std::size_t done = 0;
+    CompositorSettings settings;
+    std::vector<std::uint8_t> keep;
+    std::uint64_t rejectedByFullRow = 0;
+};
+void CullBegin(
+    const CompositorNote* notes,
+    std::size_t noteCount,
+    const CompositorSettings& settings,
+    CompositorScratch& scratch,
+    CompositorProgress& progress);
+// Visits up to `maxNotes` more notes; true once every note was visited.
+bool CullStep(CompositorScratch& scratch, CompositorProgress& progress, std::size_t maxNotes);
+void CullFinish(CompositorProgress& progress, CompositorResult& out);
+
 }  // namespace wasmidi

@@ -121,6 +121,20 @@ static void PixelIdentical(const char* name,
         CHECK(r.notes[i - 1].startTick <= r.notes[i].startTick,
             "%s: survivors lost startTick order at %zu", name, i);
 
+    // Sliced over several calls (rev. 88) the survivors are the same notes.
+    CompositorScratch slicedScratch;
+    CompositorProgress progress;
+    CompositorResult sliced;
+    CullBegin(notes.data(), notes.size(), s, slicedScratch, progress);
+    while (!CullStep(slicedScratch, progress, 7919)) {}
+    CullFinish(progress, sliced);
+    bool same = sliced.notes.size() == r.notes.size();
+    for (std::size_t i = 0; same && i < r.notes.size(); ++i)
+        same = sliced.notes[i].startTick == r.notes[i].startTick &&
+            sliced.notes[i].endTick == r.notes[i].endTick &&
+            sliced.notes[i].packedData == r.notes[i].packedData;
+    CHECK(same, "%s: sliced cull kept different notes", name);
+
     std::printf("   %-26s %8zu -> %8zu inst (%5.1f%% menos)  %6.2f ms"
         "  fila-llena %llu\n",
         name, notes.size(), r.notes.size(),
