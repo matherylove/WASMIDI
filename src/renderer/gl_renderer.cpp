@@ -15,8 +15,16 @@ EM_JS(int, wasmidi_tiles_disabled, (), {
     try { return new URL(globalThis.location.href).searchParams.get("tiles") === "0" ? 1 : 0; }
     catch (_) { return 0; }
 });
+// Held roll frames (0) and roll catch-ups (1), read by ?visualdebug=1.
+EM_JS(void, wasmidi_roll_debug_count, (int catchUp), {
+    if (catchUp)
+        globalThis.__wasmidiRollCatchUps = (globalThis.__wasmidiRollCatchUps | 0) + 1;
+    else
+        globalThis.__wasmidiRollHeld = (globalThis.__wasmidiRollHeld | 0) + 1;
+});
 #else
 static int wasmidi_tiles_disabled() { return 0; }
+static void wasmidi_roll_debug_count(int) {}
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -1141,6 +1149,7 @@ void GLRenderer::setDocument(const MidiDocument* document)
     carryNotes_.clear();
     forceCacheReset_ = true;
     sharpForceReset_ = true;
+    rollFrameValid_ = false;
     ++sharpRemoteGeneration_;
     if (sharpRemoteGeneration_ == 0)
         ++sharpRemoteGeneration_;
@@ -3405,10 +3414,12 @@ bool GLRenderer::renderRoll()
         return false;
 
     glViewport(0, 0, width_, height_);
-    renderBackground();
 
-    if (!document_)
+    if (!document_) {
+        renderBackground();
+        rollFrameValid_ = false;
         return true;
+    }
 
     uint32_t currentTick = 0;
     uint32_t viewStart = 0;
@@ -3496,6 +3507,22 @@ bool GLRenderer::renderRoll()
             }
         }
 
+        // Catch up (HANDOFF sec. 80): when everything built so far is already
+        // left of the screen, restart at the playhead instead of finishing it.
+        if (!needRebuild && !sharpRemoteRebuilding_ && !sharpRemoteWaitingReset_) {
+            uint32_t builtThrough = sharpRemoteSafeThrough_;
+            for (const SharpRemoteBatch& batch : sharpRemoteBatches_)
+                if (batch.generation == sharpRemoteGeneration_)
+                    builtThrough = std::max(builtThrough, batch.safeThrough);
+            const auto now = std::chrono::steady_clock::now();
+            if (builtThrough < viewStart &&
+                now - sharpCatchUpAt_ >= std::chrono::seconds(1)) {
+                sharpCatchUpAt_ = now;
+                needRebuild = true;
+                wasmidi_roll_debug_count(1);
+            }
+        }
+
         if (needRebuild) {
             ++sharpRemoteGeneration_;
             if (sharpRemoteGeneration_ == 0)
@@ -3565,7 +3592,20 @@ bool GLRenderer::renderRoll()
     // path only; the primary strategy is the multi-screen prefetch above.
     const bool notesReady = !document_->remoteIndexed ||
         (!sharpRemoteWaitingReset_ && sharpRemoteSafeThrough_ >= viewEnd);
+
+    // Keep the last complete frame in the FBO until the notes for this one
+    // arrive (HANDOFF sec. 80).
+    if (!notesReady && rollFrameValid_ &&
+        rollFrameWidth_ == width_ && rollFrameHeight_ == height_) {
+        wasmidi_roll_debug_count(0);
+        return false;
+    }
+
+    renderBackground();
     drawSharpRing(currentTick, viewStart, viewEnd, windowTicks, notesReady);
+    rollFrameValid_ = notesReady;
+    rollFrameWidth_ = width_;
+    rollFrameHeight_ = height_;
 
     return true;
 }

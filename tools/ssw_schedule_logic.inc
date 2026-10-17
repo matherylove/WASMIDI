@@ -170,7 +170,8 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
             for (size_t i = b->index; i < b->count; ++i) {
                 const ssw_scheduled_event* ev = &b->events[i];
                 if (ev->sample_frame >= block_end_frame) { stop = 1; break; }
-                if ((ev->message & 0xf0u) == 0x90u && ((ev->message >> 16) & 0x7fu)) {
+                if ((ev->message & 0xf0u) == 0x90u && ((ev->message >> 16) & 0x7fu) &&
+                    ev->sample_frame >= g_drop_before_frame) {
                     ++histogram[(ev->message >> 16) & 0x7fu];
                     ++note_ons;
                 }
@@ -249,13 +250,19 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                     const int key = (ch << 7) | (int)((event->message >> 8) & 0x7fu);
                     const int velocity = (int)((event->message >> 16) & 0x7fu);
                     if (command == 0x90u && velocity) {
-                        int kept = 1;
-                        if (admit_threshold >= 0) {
+                        const int late = event->sample_frame < g_drop_before_frame;
+                        int kept = !late;
+                        if (kept && admit_threshold >= 0) {
                             if (velocity < admit_threshold) kept = 0;
                             else if (velocity == admit_threshold) kept = admit_quota-- > 0;
                         }
                         ssw_note_fifo_push(key, kept, ((event->message >> 24) & 0xffu) + 1u);
-                        if (!kept) { ++g_admission_dropped; ++block->index; continue; }
+                        if (!kept) {
+                            if (late) ++g_late_dropped;
+                            else ++g_admission_dropped;
+                            ++block->index;
+                            continue;
+                        }
                     } else {
                         const uint32_t stack = command == 0x80u ? ((event->message >> 24) & 0xffu) + 1u : 1u;
                         const uint32_t kept = ssw_note_fifo_pop(key, stack);

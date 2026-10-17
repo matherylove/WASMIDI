@@ -148,14 +148,15 @@ public:
         // acknowledge a background-only/stale recovery frame, otherwise the
         // master clock runs through the missing page and the roll jumps forward
         // as soon as the cache finally catches up.
-        if (controller_ && transportFrameReady) {
-            QMetaObject::invokeMethod(
-                controller_.data(),
-                "notifyVisualizerFramePresented",
-                Qt::QueuedConnection);
+        // A held frame (renderRoll() false) is not counted as a new one.
+        if (transportFrameReady) {
+            if (controller_)
+                QMetaObject::invokeMethod(
+                    controller_.data(),
+                    "notifyVisualizerFramePresented",
+                    Qt::QueuedConnection);
+            updateFps();
         }
-
-        updateFps();
 
         // GPU neural background animates even while paused, replacing the old
         // QML FrameAnimation/Canvas loop with this single scene-graph source.
