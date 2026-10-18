@@ -58,15 +58,25 @@ async function feedMessage(m) {
             return;
         }
         const visual = m.type === "visual-decode";
+        const joint = m.type === "joint-decode";
         const request = new Uint8Array(m.request);
         const ptr = Number(Module._wmp_feed_buffer_js(request.length));
         if (!ptr)
             throw new Error(errorText(Module, "No memory for the synth feed request"));
         Module.HEAPU8.set(request, ptr);
-        if (!(visual ? Module._wmp_visual_decode_js(request.length) : Module._wmp_feed_decode_js(request.length)))
-            throw new Error(errorText(Module, visual ? "Visual span decode failed" : "Synth feed decode failed"));
+        const decode = visual ? Module._wmp_visual_decode_js : joint ? Module._wmp_joint_decode_js : Module._wmp_feed_decode_js;
+        if (!decode(request.length))
+            throw new Error(errorText(Module, visual ? "Visual span decode failed" : joint ? "Joint span decode failed" : "Synth feed decode failed"));
         const out = Number(Module._wmp_feed_buffer_ptr_js());
         const size = Number(Module._wmp_feed_buffer_size_js());
+        if (joint) {
+            // [u64 feed size][feed result][visual result] (HANDOFF sec. 85)
+            const feedSize = Number(new DataView(Module.HEAPU8.buffer, out, 8).getBigUint64(0, true));
+            const feed = Module.HEAPU8.slice(out + 8, out + 8 + feedSize);
+            const spans = Module.HEAPU8.slice(out + 8 + feedSize, out + size);
+            postMessage({ type: "joint-result", id: m.id, feed: feed.buffer, visual: spans.buffer }, [feed.buffer, spans.buffer]);
+            return;
+        }
         const result = Module.HEAPU8.slice(out, out + size);
         postMessage({ type: visual ? "visual-result" : "feed-result", id: m.id, result: result.buffer }, [result.buffer]);
     } catch (error) {
@@ -154,7 +164,7 @@ async function liveHandle(m) {
 
 self.onmessage = async event => {
     const m = event.data || {};
-    if (m.type === "feed-init" || m.type === "feed-decode" || m.type === "visual-decode") {
+    if (m.type === "feed-init" || m.type === "feed-decode" || m.type === "visual-decode" || m.type === "joint-decode") {
         await feedMessage(m);
         return;
     }
