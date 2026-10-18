@@ -1193,6 +1193,7 @@ let feedPlanned = 0;
 let feedQueue = [];
 let feedSequence = 0;
 let feedSpanChunks = 2;
+let feedStarted = false;
 
 function feedApplyConfig(Module, d) {
     if (d) {
@@ -1292,8 +1293,10 @@ async function feedReset(d) {
     feedFill = null;
     feedComplete = false;
     feedQueue = [];
-    if (feedPool) feedPool.pending = [];
     ++feedSequence;
+    // Joint spans still carry the visual stream's part.
+    if (feedPool) feedPool.pending = feedPool.pending.filter(e => e.kind === "joint" && e.visual.sequence === visualSequence);
+    feedStarted = true;
     const time = Math.max(0, Number(d.time) || 0);
     const tick = Math.max(0, Math.floor(Number(Module._wmp_seconds_to_tick_js(time)) || 0));
     feedApplyConfig(Module, d);
@@ -1363,7 +1366,7 @@ let visualPoolActive = false;
 let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
 // ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
 const visualStats = { at: 0, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0,
-    starved: 0, local: 0, keyMs: 0, keys: 0, handlers: {} };
+    starved: 0, local: 0, keyMs: 0, keys: 0, joints: 0, helperMs: 0, handlers: {} };
 function visualStatsHandler(type, ms) {
     const h = visualStats.handlers;
     const e = h[type] || (h[type] = { ms: 0, n: 0, max: 0 });
@@ -1377,13 +1380,14 @@ function visualStatsTick() {
     const v = visualStats;
     console.info("[WASMIDI visual] " + Math.round(now - v.at) + " ms: sweep " + v.sweepMs.toFixed(0) + " ms/" + v.sweeps +
         ", live " + v.liveMs.toFixed(0) + " ms/" + v.lives + ", append " + v.appendMs.toFixed(0) + " ms/" + v.spans +
-        " spans " + (v.bytes / 1048576).toFixed(1) + " MiB, starved " + v.starved + ", pool " + (visualPoolActive ? "on" : "off") +
+        " spans (" + v.joints + " joint) " + (v.bytes / 1048576).toFixed(1) + " MiB, starved " + v.starved + ", pool " + (visualPoolActive ? "on" : "off") +
         (liveKeys ? ", keyboard Worker " + v.keyMs.toFixed(0) + " ms/" + v.keys : "") +
         ", queue " + visualQueue.length + ", feed pending " + (feedPool ? feedPool.pending.length : 0) +
+        (feedPool && feedPool.helpers.length ? ", helpers " + Math.round(100 * v.helperMs / ((now - v.at) * feedPool.helpers.length)) + "% busy" : "") +
         Object.entries(v.handlers).filter(([, e]) => e.ms >= 20)
             .map(([type, e]) => ", " + type + " " + e.ms.toFixed(0) + " ms/" + e.n + " (max " + e.max.toFixed(0) + ")").join(""));
     Object.assign(v, { at: now, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0, starved: 0,
-        keyMs: 0, keys: 0, handlers: {} });
+        keyMs: 0, keys: 0, joints: 0, helperMs: 0, handlers: {} });
 }
 let visualQueue = [];
 let visualSequence = 0;
@@ -1392,7 +1396,10 @@ let visualPlanned = 0;
 function visualRestart(Module) {
     ++visualSequence;
     visualQueue = [];
-    if (feedPool) feedPool.visualPending = [];
+    if (feedPool) {
+        feedPool.visualPending = [];
+        feedPool.pending = feedPool.pending.filter(e => e.kind !== "joint" || e.feed.sequence === feedSequence);
+    }
     visualPlanned = sizeToNumber(Module._wmp_visual_head_js(), "visual head");
     visualSpanWords = VISUAL_SPAN_WORDS;
 }
@@ -1424,11 +1431,16 @@ function visualPump(Module) {
         appended = true;
     }
     visualStats.appendMs += performance.now() - appendStart;
-    const queueLimit = pool.helpers.length + (visualSpanMax > VISUAL_SPAN_WORDS ? 1 : pool.helpers.length);
+    jointPlan(Module);
+    const queueLimit = visualQueueLimit(pool);
     while (visualQueue.length < queueLimit && visualPlanned <= sharpRenderTarget) {
-        const end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
-        visualSpanWords = Math.min(visualSpanMax, visualSpanWords * 2);
+        let end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
         if (end <= visualPlanned) break;
+        if (jointActive()) {
+            if (feedBlockTick(Module, feedPlanned) === visualPlanned) break;
+            end = visualJointEnd(Module, end);
+        }
+        visualSpanWords = Math.min(visualSpanMax, visualSpanWords * 2);
         if (!Module._wmp_visual_request_js(visualPlanned, end))
             throw new Error(parserErrorText(Module, "Could not plan the visual span"));
         const request = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(),
@@ -1443,6 +1455,84 @@ function visualPump(Module) {
     if (appended && sharpRenderStarved && !sharpRenderRunning) {
         sharpRenderStarved = false;
         void drainSharpRenderer();
+    }
+}
+
+function visualQueueLimit(pool) {
+    return pool.helpers.length + (visualSpanMax > VISUAL_SPAN_WORDS ? 1 : pool.helpers.length);
+}
+
+// ---- Joint spans (HANDOFF sec. 85) ----
+// Where the synth feed and the visual stream meet on a feed chunk edge (chunks of
+// FEED_SPAN_BLOCKS blocks counted from feedPlanned), one helper decodes the span once for
+// both. Visual-only spans end on chunk edges and feed-only spans run to the visual head, past
+// the synth's horizon if needed, so the two meet; from there joint spans go as far as either
+// one asks. ?jointdecode=0 keeps them apart.
+const JOINT_FEED_QUEUE_MAX = 256;
+const JOINT_SPAN_SECONDS = 0.75;
+let jointOn = true;
+
+function jointActive() {
+    return jointOn && feedStarted && !feedComplete && visualPoolActive && !!feedPool && feedPool.ready;
+}
+
+function feedBlockTick(Module, block) {
+    return Number(Module._wmp_feed_block_tick_js(block)) || 0;
+}
+
+function feedEdgeAtOrAfter(Module, tick) {
+    const block = Number(Module._wmp_feed_block_at_tick_js(tick, feedPlanned)) || feedPlanned;
+    return feedPlanned + Math.ceil(Math.max(0, block - feedPlanned) / FEED_SPAN_BLOCKS) * FEED_SPAN_BLOCKS;
+}
+
+function visualJointEnd(Module, end) {
+    const meet = feedBlockTick(Module, feedPlanned);
+    if (visualPlanned < meet) return Math.min(end, meet);
+    const up = feedEdgeAtOrAfter(Module, end);
+    const upTick = feedBlockTick(Module, up);
+    if (upTick === end) return end;
+    if (up - FEED_SPAN_BLOCKS >= feedPlanned) {
+        const downTick = feedBlockTick(Module, up - FEED_SPAN_BLOCKS);
+        if (downTick > visualPlanned) return downTick;
+    }
+    return upTick > visualPlanned ? upTick : end;
+}
+
+function jointMaxChunks(blockSeconds) {
+    return Math.max(feedSpanChunks, Math.floor(JOINT_SPAN_SECONDS / (FEED_SPAN_BLOCKS * blockSeconds)));
+}
+
+function jointPlan(Module) {
+    const pool = feedPool;
+    if (!jointActive()) return;
+    const blockSeconds = Number(Module._wmp_feed_block_seconds_js()) || (512 / 48000);
+    const horizon = (feedFill ? feedFill.target : 0) + FEED_PREFETCH_SECONDS;
+    const maxChunks = jointMaxChunks(blockSeconds);
+    while (feedBlockTick(Module, feedPlanned) === visualPlanned) {
+        const natural = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
+        if (natural <= visualPlanned) return;
+        const feedWants = feedQueue.length < pool.helpers.length * 2 && feedPlanned * blockSeconds < horizon;
+        const visualWants = visualQueue.length < visualQueueLimit(pool) && visualPlanned <= sharpRenderTarget &&
+            feedQueue.length < JOINT_FEED_QUEUE_MAX;
+        if (!feedWants && !visualWants) return;
+        let chunks = visualWants
+            ? Math.max(1, Math.min(maxChunks, (feedEdgeAtOrAfter(Module, natural) - feedPlanned) / FEED_SPAN_BLOCKS))
+            : feedSpanChunks;
+        if (feedWants) chunks = Math.min(chunks, feedSpanChunks);
+        visualSpanWords = Math.min(visualSpanMax, visualSpanWords * 2);
+        if (!Module._wmp_feed_request_js(feedPlanned, FEED_SPAN_BLOCKS, chunks))
+            throw new Error(parserErrorText(Module, "Could not plan the joint span"));
+        const request = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(),
+            sizeToNumber(Module._wmp_feed_buffer_size_js(), "joint request size"));
+        pool.lastId = (pool.lastId || 0) + 1;
+        const feed = { id: pool.lastId, sequence: feedSequence, request: null, result: null };
+        const visual = { id: pool.lastId, kind: "visual", sequence: visualSequence, request: null, result: null };
+        feedQueue.push(feed);
+        visualQueue.push(visual);
+        pool.pending.push({ id: pool.lastId, kind: "joint", request, feed, visual });
+        ++visualStats.joints;
+        feedPlanned += chunks * FEED_SPAN_BLOCKS;
+        visualPlanned = feedBlockTick(Module, feedPlanned);
     }
 }
 
@@ -1625,7 +1715,8 @@ async function feedStartPool() {
             worker.onmessage = event => {
                 const m = event.data || {};
                 if (m.type === "feed-ready") resolve();
-                else if (m.type === "feed-result" || m.type === "visual-result") feedOnResult(helper, m);
+                else if (m.type === "feed-result" || m.type === "visual-result" || m.type === "joint-result")
+                    feedOnResult(helper, m);
                 else if (m.type === "feed-error") {
                     reject(new Error(m.message || "Synth feed helper failed"));
                     feedPoolFailed(m.message);
@@ -1679,7 +1770,8 @@ function feedDispatch() {
         const entry = pool.pending.shift() || pool.visualPending.shift();
         if (!entry) return;
         helper.busy = entry;
-        helper.worker.postMessage({ type: entry.kind === "visual" ? "visual-decode" : "feed-decode",
+        helper.since = performance.now();
+        helper.worker.postMessage({ type: entry.kind === "visual" ? "visual-decode" : entry.kind === "joint" ? "joint-decode" : "feed-decode",
             id: entry.id, request: entry.request.buffer }, [entry.request.buffer]);
         entry.request = null;
     }
@@ -1688,7 +1780,14 @@ function feedDispatch() {
 function feedOnResult(helper, m) {
     const entry = helper.busy;
     helper.busy = null;
-    if (entry && entry.id === m.id && entry.kind === "visual") {
+    if (helper.since) visualStats.helperMs += performance.now() - helper.since;
+    if (entry && entry.id === m.id && entry.kind === "joint") {
+        if (entry.feed.sequence === feedSequence) {
+            entry.feed.result = new Uint8Array(m.feed);
+            getModule().then(Module => feedPump(Module));
+        }
+        visualOnResult(entry.visual, { result: m.visual });
+    } else if (entry && entry.id === m.id && entry.kind === "visual") {
         visualOnResult(entry, m);
     } else if (entry && entry.id === m.id && entry.sequence === feedSequence) {
         entry.result = new Uint8Array(m.result);
@@ -1704,11 +1803,27 @@ function feedPump(Module) {
     const fill = feedFill;
     // Plan spans ahead of what the synth asked for.
     const horizon = (fill ? fill.target : 0) + FEED_PREFETCH_SECONDS;
-    const spanBlocks = FEED_SPAN_BLOCKS * feedSpanChunks;
     // The sequential path may have moved the feed while the pool was starting.
     if (!feedQueue.length) feedPlanned = Number(Module._wmp_feed_block_js()) || 0;
-    while (!feedComplete && feedQueue.length < pool.helpers.length * 2 && feedPlanned * blockSeconds < horizon) {
-        if (!Module._wmp_feed_request_js(feedPlanned, FEED_SPAN_BLOCKS, feedSpanChunks))
+    jointPlan(Module);
+    while (!feedComplete) {
+        let chunks = feedSpanChunks;
+        let wants = feedQueue.length < pool.helpers.length * 2 && feedPlanned * blockSeconds < horizon;
+        if (jointActive()) {
+            const meet = feedBlockTick(Module, feedPlanned);
+            if (meet === visualPlanned &&
+                sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, 1), "visual span end") > visualPlanned) break;
+            if (meet < visualPlanned) {
+                // Past the horizon too: the visual head is where the joint spans start.
+                if (!wants && pool.pending.length < pool.helpers.length && feedQueue.length < JOINT_FEED_QUEUE_MAX) {
+                    wants = true;
+                    chunks = jointMaxChunks(blockSeconds);
+                }
+                chunks = Math.max(1, Math.min(chunks, (feedEdgeAtOrAfter(Module, visualPlanned) - feedPlanned) / FEED_SPAN_BLOCKS));
+            }
+        }
+        if (!wants) break;
+        if (!Module._wmp_feed_request_js(feedPlanned, FEED_SPAN_BLOCKS, chunks))
             throw new Error(parserErrorText(Module, "Could not plan the synth feed"));
         const request = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(),
             sizeToNumber(Module._wmp_feed_buffer_size_js(), "feed request size"));
@@ -1716,7 +1831,7 @@ function feedPump(Module) {
         const entry = { id: pool.lastId, sequence: feedSequence, request, result: null };
         feedQueue.push(entry);
         pool.pending.push(entry);
-        feedPlanned += spanBlocks;
+        feedPlanned += chunks * FEED_SPAN_BLOCKS;
     }
     feedDispatch();
     if (!fill) return;
@@ -1934,6 +2049,7 @@ async function handleMessage(event) {
         if (typeof Module._wmp_set_raw_source_limit_js === "function")
             Module._wmp_set_raw_source_limit_js(rawLimit);
         visualStreamOn = pageOverride("visualstream") !== 0;
+        jointOn = pageOverride("jointdecode") !== 0;
         Module._wmp_visual_config_js(visualStreamOn ? 1 : 0, 1);
         const ok = await parallelParse(Module, file, total, total > rawLimit) ||
             Module._wmp_parse_file_js(total);

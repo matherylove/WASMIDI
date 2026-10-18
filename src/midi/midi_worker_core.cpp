@@ -1609,6 +1609,70 @@ int wmp_feed_decode_js(double byteCount)
 #endif
 }
 
+// Helper: the same request decoded once for the feed and the visual stream (HANDOFF sec. 85).
+// The buffer becomes [u64 feed result size][feed result][visual result].
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_joint_decode_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid joint request"; return 0; }
+    try {
+        std::vector<uint8_t> request(g_feedBuffer.begin(), g_feedBuffer.begin() + std::ptrdiff_t(size));
+        std::vector<uint8_t> feed, visual;
+        if (!g_mappedStore.decodeFeedRequest(request.data(), request.size(), feed, &visual)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        const uint64_t feedSize = feed.size();
+        g_feedBuffer.resize(sizeof(feedSize) + feed.size() + visual.size());
+        std::memcpy(g_feedBuffer.data(), &feedSize, sizeof(feedSize));
+        std::memcpy(g_feedBuffer.data() + sizeof(feedSize), feed.data(), feed.size());
+        std::memcpy(g_feedBuffer.data() + sizeof(feedSize) + feed.size(), visual.data(), visual.size());
+        return 1;
+    } catch (...) {
+        g_error = "Joint decode ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+// Coordinator: the first tick of a feed block, and the first block from `fromBlock` on
+// that starts at or after a tick (the joint spans meet the visual stream on block edges).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_block_tick_js(double block)
+{
+#if WASMIDI_PARSER_BPFA
+    if (!jsExactNonNegativeInteger(block)) return 0.0;
+    return static_cast<double>(g_mappedStore.feedBlockTick(static_cast<uint64_t>(block)));
+#else
+    (void)block;
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_feed_block_at_tick_js(double tick, double fromBlock)
+{
+#if WASMIDI_PARSER_BPFA
+    if (!jsExactNonNegativeInteger(tick) || tick > 4294967295.0 || !jsExactNonNegativeInteger(fromBlock)) return 0.0;
+    return static_cast<double>(g_mappedStore.feedBlockAtTick(static_cast<uint32_t>(tick),
+                                                             static_cast<uint64_t>(fromBlock)));
+#else
+    (void)tick; (void)fromBlock;
+    return 0.0;
+#endif
+}
+
 // ---- Visual stream (HANDOFF sec. 71): the roll sweep and the live state read helper spans ----
 
 #ifdef __EMSCRIPTEN__

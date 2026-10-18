@@ -1175,6 +1175,24 @@ void BpfaMidiStore::feedEdges(uint64_t firstBlock, uint32_t blocks, uint32_t* ed
     }
 }
 
+uint32_t BpfaMidiStore::feedBlockTick(uint64_t block) const
+{
+    uint32_t edge[2];
+    feedEdges(block, 1, edge);
+    return edge[0];
+}
+
+uint64_t BpfaMidiStore::feedBlockAtTick(uint32_t tick, uint64_t fromBlock) const
+{
+    const double blockSeconds = synthFeedBlockSeconds();
+    const double seconds = metadata_.tickToSeconds(tick);
+    uint64_t block = blockSeconds > 0.0 && seconds > blockSeconds ? uint64_t(seconds / blockSeconds) : 0u;
+    block = std::max(block, fromBlock);
+    while (block > fromBlock && feedBlockTick(block - 1u) >= tick) --block;
+    while (feedBlockTick(block) < tick && feedBlockTick(block) <= metadata_.maxTick) ++block;
+    return block;
+}
+
 void BpfaMidiStore::FeedPairs::reset(std::size_t tracks)
 {
     heads.clear();
@@ -1247,7 +1265,7 @@ template <typename Emit> void emitStacked(uint32_t message, uint32_t count, Emit
 // that find their key empty are deferred to the stitch, which pairs them with the queues
 // carried from earlier chunks. Removing a matched pair never leaves a note hanging.
 void BpfaMidiStore::feedDecodeChunk(std::vector<Cursor>& cursors, const uint32_t* edge, uint32_t blocks,
-                                    uint32_t admit, uint8_t floorVelocity, FeedChunk& out)
+                                    uint32_t admit, uint8_t floorVelocity, FeedChunk& out, bool collectVisual)
 {
     out.events.clear();
     out.deferred.clear();
@@ -1270,6 +1288,16 @@ void BpfaMidiStore::feedDecodeChunk(std::vector<Cursor>& cursors, const uint32_t
         anyLeft = anyLeft || !c.finished;
     }
     out.anyLeft = anyLeft;
+    if (collectVisual) {
+        // Chunks split the ticks, so (chunk, track, tick) order sorts like (track, tick).
+        uint32_t begin = 0;
+        for (std::size_t t = 0; t < trackCount; ++t) {
+            const uint32_t end = feedTrackEnd_[t];
+            visRaw_.insert(visRaw_.end(), feedRaw_.begin() + begin, feedRaw_.begin() + end);
+            visRawTrack_.resize(visRaw_.size(), uint16_t(t));
+            begin = end;
+        }
+    }
 
     std::array<int, 64> threshold{}, quota{};
     threshold.fill(-1);
@@ -1626,9 +1654,15 @@ bool BpfaMidiStore::buildFeedRequest(uint64_t firstBlock, uint32_t blocks, uint3
     return true;
 }
 
-bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std::vector<uint8_t>& result)
+bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std::vector<uint8_t>& result,
+                                      std::vector<uint8_t>* visual)
 {
     result.clear();
+    if (visual) {
+        visual->clear();
+        visRaw_.clear();
+        visRawTrack_.clear();
+    }
     PodReader in{data, size};
     if (!valid_ || in.get<uint32_t>() != FeedRequestMagic || in.get<uint32_t>() != tracks_.size()) {
         error_ = "Invalid feed request";
@@ -1660,9 +1694,12 @@ bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std
     if (!in.ok) { error_ = "Truncated feed request"; return false; }
     putPod(result, FeedResultMagic);
     putPod(result, chunks);
+    bool anyLeft = false;
     for (uint32_t k = 0; k < chunks; ++k) {
-        feedDecodeChunk(cursors, edge.data() + std::size_t(k) * blocks, blocks, admit, floorVelocity, feedChunk_);
+        feedDecodeChunk(cursors, edge.data() + std::size_t(k) * blocks, blocks, admit, floorVelocity, feedChunk_,
+                        visual != nullptr);
         const FeedChunk& out = feedChunk_;
+        anyLeft = out.anyLeft;
         putPod(result, out.blocks);
         putPod(result, uint32_t(out.anyLeft ? 1 : 0));
         putPod(result, firstBlock + uint64_t(k) * blocks);
@@ -1675,6 +1712,10 @@ bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std
         putArray(result, out.events.data(), out.events.size());
         putArray(result, out.deferred.data(), out.deferred.size());
         putArray(result, out.pending.data(), out.pending.size());
+    }
+    if (visual) {
+        visualOrderRaw(visSpanEvents_, visSpanTracks_);
+        putVisualResult(*visual, edge.front(), edge.back(), anyLeft);
     }
     return true;
 }
@@ -1917,6 +1958,13 @@ void BpfaMidiStore::visualDecodeSpan(std::vector<Cursor>& cursors, uint32_t endT
         (void)before;
         anyLeft = anyLeft || !cursors[t].finished;
     }
+    visualOrderRaw(events, tracks);
+}
+
+void BpfaMidiStore::visualOrderRaw(std::vector<EventWord>& events, std::vector<uint16_t>& tracks)
+{
+    events.clear();
+    tracks.clear();
     visOrder_.clear();
     visOrder_.reserve(visRaw_.size());
     uint32_t low = ~0u, high = 0;
@@ -2161,6 +2209,13 @@ bool BpfaMidiStore::decodeVisualRequest(const uint8_t* data, std::size_t size, s
     if (!in.ok) { error_ = "Truncated visual request"; return false; }
     bool anyLeft = false;
     visualDecodeSpan(cursors, endTick, visSpanEvents_, visSpanTracks_, anyLeft);
+    putVisualResult(result, startTick, endTick, anyLeft);
+    return true;
+}
+
+void BpfaMidiStore::putVisualResult(std::vector<uint8_t>& result, uint32_t startTick, uint32_t endTick,
+                                    bool anyLeft) const
+{
     putPod(result, VisualResultMagic);
     putPod(result, startTick);
     putPod(result, endTick);
@@ -2168,7 +2223,6 @@ bool BpfaMidiStore::decodeVisualRequest(const uint8_t* data, std::size_t size, s
     putPod(result, uint64_t(visSpanEvents_.size()));
     putArray(result, visSpanEvents_.data(), visSpanEvents_.size());
     putArray(result, visSpanTracks_.data(), visSpanTracks_.size());
-    return true;
 }
 
 bool BpfaMidiStore::appendVisualResult(const uint8_t* data, std::size_t size)

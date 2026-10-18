@@ -455,6 +455,63 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
                 r.appends.length / 3 + "/" + merge.appends.length / 3 + " notes");
     }
 
+    // Joint spans (HANDOFF sec. 85): one helper decode gives the feed result and the visual span.
+    for (const name of ["_wmp_joint_decode_js", "_wmp_feed_block_tick_js", "_wmp_feed_block_at_tick_js"]) {
+        if (typeof Module[name] !== "function")
+            throw new Error("Missing generated export " + name);
+    }
+    const jointSweep = () => {
+        Module._wmp_visual_config_js(1, 0);
+        Module._wmp_reset_render_cursor_js(0, 0);
+        Module._wmp_feed_config_js(1024, 25, 48000, 512, 0, 4);
+        Module._wmp_feed_reset_js(0);
+        let block = Number(Module._wmp_feed_block_js());
+        if (Number(Module._wmp_feed_block_tick_js(block)) !== Number(Module._wmp_visual_head_js()))
+            throw new Error("Joint smoke: the feed and the visual stream do not start together");
+        const appends = [], closes = [];
+        for (let guard = 0, k = 0; guard < 100000; ++guard) {
+            if (!Module._wmp_visual_done_js()) {
+                const chunks = 1 + (k++ % 3);
+                if (!Module._wmp_feed_request_js(block, 4, chunks))
+                    throw new Error("Joint request failed: " + parserErrorText(Module, "?"));
+                const request = bufferBytes(Module);
+                putBuffer(Spans, request);
+                if (!Spans._wmp_feed_decode_js(request.length))
+                    throw new Error("Feed decode failed: " + parserErrorText(Spans, "?"));
+                const feed = bufferBytes(Spans);
+                putBuffer(Spans, request);
+                if (!Spans._wmp_joint_decode_js(request.length))
+                    throw new Error("Joint decode failed: " + parserErrorText(Spans, "?"));
+                const joint = bufferBytes(Spans);
+                const feedSize = Number(new DataView(joint.buffer).getBigUint64(0, true));
+                if (feedSize !== feed.length || !same(joint.subarray(8, 8 + feedSize), feed))
+                    throw new Error("Joint feed result differs from the feed decode");
+                const visual = joint.slice(8 + feedSize);
+                putBuffer(Module, visual);
+                if (!Module._wmp_visual_append_js(visual.length))
+                    throw new Error("Joint visual append failed: " + parserErrorText(Module, "?"));
+                block += 4 * chunks;
+                const tick = Number(Module._wmp_feed_block_tick_js(block));
+                const at = Number(Module._wmp_feed_block_at_tick_js(tick, 0));
+                if (at > block || Number(Module._wmp_feed_block_tick_js(at)) !== tick ||
+                    (at > 0 && Number(Module._wmp_feed_block_tick_js(at - 1)) >= tick))
+                    throw new Error("Feed block at tick " + tick + " is " + at + ", expected the first block of " + block);
+            }
+            if (!Module._wmp_build_render_sweep_js(maxTick, 2048))
+                throw new Error("Visual sweep failed: " + parserErrorText(Module, "?"));
+            const na = sizeNumber(Module._wmp_render_append_count_js());
+            const nc = sizeNumber(Module._wmp_render_close_count_js());
+            if (na) for (const w of new Uint32Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_render_append_ptr_js()), na * 3)) appends.push(w);
+            if (nc) for (const w of new Uint32Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_render_close_ptr_js()), nc * 2)) closes.push(w);
+            if (Module._wmp_render_batch_complete_js()) return { appends, closes };
+        }
+        throw new Error("Joint sweep did not finish");
+    };
+    const joint = jointSweep();
+    if (!same(joint.appends, merge.appends) || !same(joint.closes, merge.closes))
+        throw new Error("Visual stream (joint) differs from the merge sweep: " +
+            joint.appends.length / 3 + "/" + merge.appends.length / 3 + " notes");
+
     // Live state read from the helper-decoded stream against the merge path.
     const ticks = [];
     for (let t = 1000; t < maxTick - 100; t += 333) ticks.push(t);

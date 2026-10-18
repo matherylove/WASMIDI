@@ -119,13 +119,20 @@ public:
     // Coordinator: the request of `chunks` consecutive chunks of `blocks` blocks from firstBlock.
     bool buildFeedRequest(uint64_t firstBlock, uint32_t blocks, uint32_t chunks, std::vector<uint8_t>& request) const;
     // Helper: decodes one request into serialized FeedChunks (cursors carried across them).
-    bool decodeFeedRequest(const uint8_t* request, std::size_t size, std::vector<uint8_t>& result);
+    // With `visual`, the same pass also gives the visual span of the request's ticks, as
+    // decodeVisualRequest would (HANDOFF sec. 85).
+    bool decodeFeedRequest(const uint8_t* request, std::size_t size, std::vector<uint8_t>& result,
+                           std::vector<uint8_t>* visual = nullptr);
     // Coordinator: stitches the chunks of a result (results must arrive in block order).
     bool stitchFeedResult(const uint8_t* result, std::size_t size, std::vector<EventWord>& output,
                           std::vector<double>& times, std::vector<SysExBatchEvent>& sysExEvents,
                           std::vector<uint8_t>& sysExBytes, double& safeSeconds, bool& complete);
     uint64_t synthFeedBlock() const { return feedBlock_; }
     double synthFeedBlockSeconds() const;
+    // Where a block of the current feed starts, and the first block from fromBlock on that
+    // starts at or after a tick.
+    uint32_t feedBlockTick(uint64_t block) const;
+    uint64_t feedBlockAtTick(uint32_t tick, uint64_t fromBlock) const;
 
     // Visual stream (HANDOFF sec. 71): the renderer sweep and the live snapshot read one
     // stream of folded note/controller words in (tick, track) order, decoded here span by
@@ -459,7 +466,7 @@ private:
     uint32_t unitGen_ = 0, unitTick_ = ~0u;
     void feedEdges(uint64_t firstBlock, uint32_t blocks, uint32_t* edge) const;
     void feedDecodeChunk(std::vector<Cursor>& cursors, const uint32_t* edge, uint32_t blocks, uint32_t admit,
-                         uint8_t velocityFloor, FeedChunk& out);
+                         uint8_t velocityFloor, FeedChunk& out, bool collectVisual = false);
     void feedStitch(const FeedChunk& chunk, std::vector<EventWord>& output, std::vector<double>& times,
                     std::vector<SysExBatchEvent>& sysExEvents, std::vector<uint8_t>& sysExBytes,
                     double& safeSeconds, bool& complete);
@@ -491,6 +498,8 @@ private:
     void visualReset(uint32_t startTick);
     void visualDecodeSpan(std::vector<Cursor>& cursors, uint32_t endTick, std::vector<EventWord>& events,
                           std::vector<uint16_t>& tracks, bool& anyLeft);
+    void visualOrderRaw(std::vector<EventWord>& events, std::vector<uint16_t>& tracks);
+    void putVisualResult(std::vector<uint8_t>& result, uint32_t startTick, uint32_t endTick, bool anyLeft) const;
     void visualAppend(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t endTick,
                       bool anyLeft);
     void visualTrim();

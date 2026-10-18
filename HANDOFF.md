@@ -5608,3 +5608,91 @@ notas) contra el entero en todos los casos: mismas notas. `cull_tile_sim`: 0 pí
 - El cierre de WasmiSynth en pausa no se reprodujo.
 - Los tiles visibles que no llegaron a terminarse de a pedazos (tras un alcance, o con poco
   adelanto) se siguen armando en un cuadro (hasta 23 ms en el contenedor).
+
+## 85. Revisión 89 — El feed del synth y el flujo visual se decodifican juntos
+
+**Pedido:** con la rev. 88, en WASMIDI con The Nuker 3 los cuadros por segundo siguen llegando a
+0 antes de 2:10 ("mejoró pero no lo suficiente") y sigue habiendo lag en los mismos lugares. El
+usuario sospecha de la polifonía: usa 12288 voces en Auto con CPU (el modo GPU sigue siendo más
+lento).
+
+**Causa:** el contador de cuadros de WASMIDI cuenta solo los cuadros completos del roll; un
+cuadro mantenido mientras faltan notas no cuenta. 0 cuadros por segundo es entonces el roll
+esperando notas del flujo visual, no la página trabada. En visual-bench (sin synth) el roll de
+la rev. 87 solo se atrasaba en 128-129 s. En WASMIDI los mismos helpers decodifican también el
+feed del synth, y cada tramo de canción se decodificaba dos veces: una para el feed y otra para
+el flujo visual (las dos parten de los checkpoints y llaman a `decodeTrackUntil`). Con 12288
+voces en Auto, en 16 hilos, hay además 9 workers del synth ocupados, así que los helpers tienen
+menos CPU que en visual-bench.
+
+Medido en host (nativo) con The Nuker 3, segundos de helper por segundo de canción:
+
+| tramo | feed | visual | feed + visual | conjunto |
+|---|---|---|---|---|
+| 118-132 s | 0,92 | 0,81 | 1,73 | 1,58 (-9%) |
+| 432-446 s | 2,14 | 2,29 | 4,43 | 3,21 (-28%) |
+
+El conjunto da exactamente los mismos bytes que los dos por separado (0 diferencias en 84
+tramos). Ahorra menos que "el máximo de los dos" porque la parte visual también cuesta por
+ordenar y copiar ~39 M palabras por segundo a 432 s. Probé ordenar en dos pasadas (11 bits bajos
+del tick y después el resto): con datos sintéticos al azar es ~4× más rápido que el conteo por
+tick, pero con The Nuker 3 no cambió nada (los ticks reales están agrupados y el conteo ya va en
+caché), así que no quedó.
+
+**Cambios:**
+
+- `BpfaMidiStore::decodeFeedRequest(..., visual)`: con `visual`, después de decodificar cada
+  bloque de 4 bloques del synth junta las palabras crudas de cada pista en `visRaw_` y al final
+  arma el resultado visual de `[edge.front(), edge.back())` con el mismo orden que
+  `decodeVisualRequest` (`visualOrderRaw`, `putVisualResult`, que ahora comparten los dos).
+- `midi_worker_core.cpp`: `wmp_joint_decode_js` (helper; el buffer queda `[u64 tamaño del
+  feed][resultado del feed][resultado visual]`), `wmp_feed_block_tick_js` y
+  `wmp_feed_block_at_tick_js` (primer tick de un bloque del feed y primer bloque desde uno dado
+  que empieza en o después de un tick). Agregados a `EXPORTED_FUNCTIONS`.
+- `midi-parser-worker.js`, tramos conjuntos:
+  - Los dos flujos se encuentran en un borde de bloque de 4 bloques del feed, contado desde
+    `feedPlanned`. Los tramos solo visuales terminan en esos bordes. Los tramos solo del feed
+    corren hasta la cabeza del flujo visual aunque pasen el horizonte del synth (1 s), porque
+    el roll va varios segundos adelante y si el feed solo avanzara con el synth no lo alcanzaría
+    nunca (la primera versión hizo 3 tramos conjuntos en 140 s).
+  - Juntos, un tramo conjunto se planea cuando cualquiera de los dos lo pide. El tamaño sale del
+    presupuesto de palabras del flujo visual, con tope de 0,75 s de canción, o el de un tramo
+    del feed si el synth lo necesita ya. El feed guarda hasta 256 resultados adelantados.
+  - Cada tramo conjunto llena una entrada de `feedQueue` y una de `visualQueue`, cada una
+    validada con su propia secuencia: un reset del feed no tira la parte visual y un reinicio
+    del roll no tira la del feed.
+  - `?jointdecode=0` vuelve a los tramos separados.
+  - `?visualdebug=1`: la línea `[WASMIDI visual]` dice cuántos tramos fueron conjuntos y
+    `helpers N% busy` (tiempo de los helpers con un tramo encargado).
+- `midi-parser-helper.js`: mensaje `joint-decode` → `joint-result` con los dos buffers.
+- `tools/midi_parser_bootstrap_smoke.cjs`: barre el roll con el flujo armado solo con tramos
+  conjuntos de 1-3 bloques de 4 y lo compara contra el merge; cada parte del feed debe ser
+  igual byte a byte a `wmp_feed_decode_js` del mismo pedido; y `wmp_feed_block_at_tick_js`
+  debe devolver el primer bloque de cada tick.
+
+**Medición (Chromium del contenedor, 4 hilos, The Nuker 3 desde 0 hasta 140 s,
+`?helpers=3&visualdebug=1&rolldraw=0`, 1024 voces para que el synth no sature los 4 hilos):**
+
+| | `?jointdecode=0` | rev. 89 |
+|---|---|---|
+| helpers ocupados (promedio) | 49% | 34% |
+| tramos anexados (conjuntos) | 35 (0) | 189 (186) |
+| MiB del flujo visual anexados | 1764 | 1775 |
+
+Con 12288 voces el synth usa ~246% de carga y hay underruns en el contenedor con o sin tramos
+conjuntos: ahí no se puede medir el roll. El adelanto del roll quedó positivo en las dos corridas
+de 1024 voces; los cuadros por segundo del contenedor no sirven (SwiftShader).
+
+**Verificación:** `tools/feeder_check/check.sh`: 24 IDENTICAL, ningún DIFFER.
+`tools/local_build.sh` completo, con la prueba del contrato del parser.
+
+**No verificado / pendiente:**
+
+- En las PCs del usuario. Si con la rev. 89 sigue habiendo 0 cuadros por segundo antes de 2:10,
+  la línea `[WASMIDI visual]` dice si los helpers están saturados (`helpers N% busy` cerca de
+  100%). Probar también con 6144 voces: si así no cae, el problema es CPU repartida entre el
+  synth y los helpers (la sospecha del usuario), no la decodificación.
+- Los tramos conjuntos son más cortos que los solo visuales (0,75 s contra hasta 8 M palabras),
+  así que el Worker del parser y el del teclado reciben más tramos por segundo.
+- La ráfaga de 830 s: el banco de host se quedó sin memoria ahí (cuestión del banco, que guarda
+  todo).

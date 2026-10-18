@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§84). Este archivo resume el estado al cierre de la rev. 88 y dice
+`HANDOFF.md` (§1-§85). Este archivo resume el estado al cierre de la rev. 89 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 88)
+## Estado actual (rev. 89)
 
 Rendimiento medido por el usuario:
 
@@ -230,6 +230,13 @@ Rendimiento medido por el usuario:
   tile por vez se arma de a pedazos (3 ms por cuadro, 6 ms si está en pantalla). Chromium del
   contenedor hasta 140 s: segundos con un pedazo > 16 ms 54 → 4, máximo 102 → 23 ms. El cierre de
   WasmiSynth en pausa no se reprodujo (pausa de 80 s en 125 s).
+- Rev. 89 (HANDOFF §85): el usuario sigue viendo 0 cuadros/s antes de 2:10 en WASMIDI con 12288 voces
+  (el contador solo cuenta cuadros completos del roll: 0 es el roll esperando notas). Los helpers
+  decodificaban cada tramo dos veces (feed del synth y flujo visual). Ahora, donde se encuentran en
+  un borde de 4 bloques del feed, un tramo conjunto da los dos resultados (mismos bytes); el feed
+  corre hasta la cabeza del flujo visual para encontrarse. Host: 4,43 → 3,21 s de helper por s a
+  432 s. Chromium, 1024 voces hasta 140 s: helpers ocupados 49% → 34%. `[WASMIDI visual]` muestra
+  `helpers N% busy`.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -256,6 +263,7 @@ Mecanismos activos y cómo desactivarlos:
 | Teclado en casillas planas por (pista, canal), snapshots cada 4096 eventos (rev. 86) | sin interruptor (`LiveSnapshotEventInterval`) |
 | Teclado en su propio Worker con helpers (rev. 87) | `?keyworker=0` |
 | Tiles culleados armados de a pedazos por cuadro (rev. 88) | `?tileslice=0` |
+| Feed del synth y flujo visual en tramos conjuntos (rev. 89) | `?jointdecode=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
@@ -265,7 +273,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§84)
+## Pendientes abiertos (ver HANDOFF §67-§85)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -277,8 +285,9 @@ Mecanismos activos y cómo desactivarlos:
    = 1024 × 24 workers) y el roll se atrasaba en 830-858 s con 8 helpers (arreglado en la
    rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
-   Falta: The Nuker 3 en WASMIDI con la rev. 88 (cuadros con la línea `tiles` de `[WASMIDI app]`,
-   log de consola del cierre de WasmiSynth en pausa, 12288 voces);
+   Falta: The Nuker 3 en WASMIDI con la rev. 89 y 12288 voces (`helpers N% busy` de
+   `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
+   log de consola del cierre de WasmiSynth en pausa;
    la ráfaga de 830 s de The Nuker 3 (~121 M palabras/s: anexar + barrer no alcanzan, rev. 87);
    medir el modo GPU en GPU real y Auto (Hash) contra Single en las PCs; helpers
    con fuente cruda; saltos justo después del pico (las densidades del reset decodifican
