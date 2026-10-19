@@ -6011,5 +6011,7 @@ para el flujo entero). Roll atrasado 45 cuadros solo en el primer segundo (el re
 Worker del parser: con `deviceMemory` 32 el tope es lo que queda del heap de 14,5 GiB; que la pestaña
 aguante esa memoria no está probado); el prellenado con 5-8 helpers; WASMIDI con synth en las zonas
 densas con GPU real (el contenedor dibuja con SwiftShader). El bucle del Worker del synth también
-vuelve con `setTimeout(pump, 0)` después de cada tramo de 12 ms y podría tener el mismo freno de 4 ms;
-no se midió ni se cambió.
+vuelve con `setTimeout(pump, 0)` después de cada tramo de 12 ms. Probado con `MessageChannel` en una
+copia del sitio (`browser_bench.py audio nuker4_553.mid MatheryLSD.sf2 7`): a 2048 voces (carga
+~70%) 19 contra 28 underruns, todos en el primer segundo, y a 6144 voces (carga 204%) igual de
+saturado; no se distingue del ruido entre corridas, así que no se cambió.
