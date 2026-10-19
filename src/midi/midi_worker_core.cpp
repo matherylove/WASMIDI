@@ -991,6 +991,45 @@ double wmp_density_js()
 #endif
 }
 
+// Whole-song peaks for the notices: [nps, its seconds, polyphony, its seconds]. NPS is the
+// note-ons of the last 0.25 s times 4, like the live counter, on density buckets.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_song_peaks_js()
+{
+    static double peaks[4];
+    peaks[0] = peaks[1] = peaks[2] = peaks[3] = 0.0;
+#if WASMIDI_PARSER_BPFA
+    if (!g_mappedStore.valid()) return 0.0;
+    const auto& md = g_mappedStore.metadata();
+    const auto& on = g_mappedStore.noteDensity();
+    const auto& off = g_mappedStore.noteOffDensity();
+    const uint64_t bucketTicks = g_mappedStore.densityBucketTicks();
+    const auto secondsAt = [&](std::size_t i) {
+        return md.tickToSeconds(uint32_t(std::min<uint64_t>(uint64_t(i) * bucketTicks, md.maxTick)));
+    };
+    uint64_t window = 0;
+    int64_t active = 0;
+    std::size_t first = 0;
+    for (std::size_t i = 0; i < on.size(); ++i) {
+        const double end = secondsAt(i + 1);
+        window += on[i];
+        while (first < i && secondsAt(first + 1) <= end - 0.25) window -= on[first++];
+        if (double(window) * 4.0 > peaks[0]) {
+            peaks[0] = double(window) * 4.0;
+            peaks[1] = end;
+        }
+        active += int64_t(on[i]) - int64_t(i < off.size() ? off[i] : 0u);
+        if (double(active) > peaks[2]) {
+            peaks[2] = double(active);
+            peaks[3] = end;
+        }
+    }
+#endif
+    return pointerToJsAddress(peaks);
+}
+
 // [maxTick, durationSeconds, ticksPerBeat, noteCount, trackCount, format]
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE

@@ -11,7 +11,7 @@ Column {
     required property var dock
     readonly property var mw: mainWindow
     spacing: 8
-    width: 300
+    width: Math.min(300, parent ? parent.width - 20 : 300)
 
     property int windowFrames: 0
     property int timeUpdates: 0
@@ -23,20 +23,15 @@ Column {
     property var lagRows: []
     property string lagNames: ""
 
-    property int polyShown: 0
-    property int polyPending: 0
-    property real polyPendingSince: 0
     property bool polyMuted: false
-    property int npsShown: 0
-    property int npsPending: 0
-    property real npsPendingSince: 0
     property bool npsMuted: false
+    property real lastTime: 0
 
     property var revision: mw.documentRevision
     onRevisionChanged: {
         polyToast.visible = npsToast.visible = lagToast.visible = false
-        polyShown = polyPending = npsShown = npsPending = 0
         polyMuted = npsMuted = false
+        lastTime = 0
         displayRate = 0
         badSeconds = goodSeconds = 0
     }
@@ -49,7 +44,10 @@ Column {
     // The graph can only draw as often as the playback clock moves.
     Connections {
         target: toasts.mw
-        function onCurrentTimeChanged() { ++toasts.timeUpdates }
+        function onCurrentTimeChanged() {
+            ++toasts.timeUpdates
+            toasts.checkPeaks(toasts.mw.currentTime)
+        }
     }
 
     function clock(seconds) {
@@ -58,26 +56,22 @@ Column {
         return m + ":" + (s < 10 ? "0" : "") + s.toFixed(1)
     }
 
-    // A peak counts once nothing has beaten it for 1.5 s.
+    // The whole MIDI's peaks, shown as playback passes them (not after a seek).
     function checkPeaks(now) {
-        if (mw.peakPolyphony > polyPending) {
-            polyPending = mw.peakPolyphony
-            polyPendingSince = now
-        }
-        if (!polyMuted && polyPending > polyShown && now - polyPendingSince >= 1.5 && mw.currentTime >= 3) {
-            polyShown = polyPending
+        var from = lastTime
+        lastTime = now
+        if (now <= from || now - from > 1)
+            return
+        var poly = mw.songPeakPolyphony, polyTime = mw.songPeakPolyphonyTime
+        if (!polyMuted && poly > 0 && from < polyTime && polyTime <= now) {
             polyToast.text = "<span style='font-family: VT323; font-size: 24px; color: " + Dk.white + ";'>" +
-                Dk.integer(polyShown) + "</span> notes at once, the most so far, at " + clock(mw.peakPolyphonyTime) + "."
+                Dk.integer(poly) + "</span> notes at once, the most in the whole MIDI, at " + clock(polyTime) + "."
             polyToast.show()
         }
-        if (mw.peakNps > npsPending) {
-            npsPending = mw.peakNps
-            npsPendingSince = now
-        }
-        if (!npsMuted && npsPending > npsShown && now - npsPendingSince >= 1.5 && mw.currentTime >= 3) {
-            npsShown = npsPending
+        var nps = mw.songPeakNps, npsTime = mw.songPeakNpsTime
+        if (!npsMuted && nps > 0 && from < npsTime && npsTime <= now) {
             npsToast.text = "<span style='font-family: VT323; font-size: 24px; color: " + Dk.white + ";'>" +
-                Dk.integer(npsShown) + "</span> notes per second, the most so far, at " + clock(mw.peakNpsTime) + "."
+                Dk.integer(nps) + "</span> notes per second, the most in the whole MIDI, at " + clock(npsTime) + "."
             npsToast.show()
         }
     }
@@ -104,7 +98,7 @@ Column {
         row("ROLL", roll.fps < target, roll.fps + " FPS")
         row("KEYBOARD", keys.lag > 0.25 || keys.frames < Math.min(target, 30),
             keys.frames + " FPS" + (keys.lag > 0.25 ? " · " + keys.lag.toFixed(1) + " S BEHIND" : ""))
-        row("GRAPHS", graphFrames < 0.8 * Math.min(frames, clockRate), graphFrames + " FPS")
+        row("GRAPHS", graphFrames >= 0 && graphFrames < 0.8 * Math.min(frames, clockRate), graphFrames + " FPS")
         row("WASMISYNTH", underruns > 0 || mw.synthRenderLoad > 100,
             underruns > 0 ? underruns + " UNDERRUNS" : Math.round(mw.synthRenderLoad) + "% LOAD")
 
@@ -139,9 +133,7 @@ Column {
             toasts.mw.takeKeyboardSample()
         }
         onTriggered: {
-            var now = Date.now() / 1000
-            toasts.checkPeaks(now)
-            toasts.checkLag(now)
+            toasts.checkLag(Date.now() / 1000)
         }
     }
 

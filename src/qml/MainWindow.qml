@@ -9,8 +9,8 @@ ApplicationWindow {
     visible: true
     width: 1440
     height: 900
-    minimumWidth: 840
-    minimumHeight: 600
+    minimumWidth: 320
+    minimumHeight: 480
     color: Dk.desk
     title: mainWindow.fileName.length
         ? "WebAssembly MIDI Player — " + mainWindow.fileName
@@ -20,6 +20,12 @@ ApplicationWindow {
     property color uiAccent: mainWindow.accentColor
     Behavior on uiAccent { ColorAnimation { duration: 600 } }
     Binding { target: Dk; property: "accent"; value: window.uiAccent }
+
+    // Phone: a portrait window. The roll runs bottom to top over a keyboard laid
+    // across the screen, and the panel opens one tab at a time (HANDOFF sec. 96).
+    readonly property bool phone: width < height && width < 760
+    property string phoneTab: ""
+    onPhoneChanged: phoneTab = ""
 
     PlayerController {
         id: mainWindow
@@ -65,6 +71,7 @@ ApplicationWindow {
 
             // Header: LCD and transport.
             RowLayout {
+                visible: !window.phone
                 Layout.fillWidth: true
                 Layout.topMargin: 6
                 Layout.bottomMargin: 6
@@ -164,7 +171,7 @@ ApplicationWindow {
 
                             GridLayout {
                                 Layout.fillWidth: true
-                                columns: 5
+                                columns: 6
                                 columnSpacing: 3
                                 DkReadout {
                                     Layout.fillWidth: true
@@ -184,6 +191,12 @@ ApplicationWindow {
                                     Layout.preferredWidth: 1
                                     label: "Polyphony"
                                     value: Dk.integer(mainWindow.activeVoices)
+                                }
+                                DkReadout {
+                                    Layout.fillWidth: true
+                                    Layout.preferredWidth: 0.9
+                                    label: "CC/s"
+                                    value: Dk.integer(mainWindow.ccPerSecond)
                                 }
                                 DkReadout {
                                     Layout.fillWidth: true
@@ -277,6 +290,66 @@ ApplicationWindow {
                 }
             }
 
+            // Phone header: clock and the three live counters.
+            RowLayout {
+                visible: window.phone
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                Layout.bottomMargin: 4
+                spacing: 3
+
+                Rectangle {
+                    implicitWidth: phoneClock.implicitWidth + 16
+                    implicitHeight: 42
+                    color: Dk.lcd
+                    DkBevel { anchors.fill: parent; kind: 1 }
+                    Column {
+                        x: 8
+                        y: 3
+                        Text {
+                            id: phoneClock
+                            text: Dk.clock(mainWindow.currentTime)
+                            color: Dk.white
+                            font.family: Dk.term
+                            font.pixelSize: 28
+                            lineHeight: 0.85
+                        }
+                        Text {
+                            text: "/ " + Dk.clock(mainWindow.duration)
+                            color: Dk.faint
+                            font.family: Dk.term
+                            font.pixelSize: 13
+                        }
+                    }
+                }
+                DkReadout {
+                    Layout.fillWidth: true
+                    implicitHeight: 42
+                    label: "NPS"
+                    value: Dk.integer(mainWindow.nps)
+                    valueColor: Dk.mix(Dk.accent, 0.25)
+                }
+                DkReadout {
+                    Layout.fillWidth: true
+                    implicitHeight: 42
+                    label: "Poly"
+                    value: Dk.integer(mainWindow.activeVoices)
+                }
+                DkReadout {
+                    Layout.fillWidth: true
+                    implicitHeight: 42
+                    label: "CC/s"
+                    value: Dk.integer(mainWindow.ccPerSecond)
+                }
+                DkReadout {
+                    Layout.fillWidth: true
+                    Layout.maximumWidth: 48
+                    implicitHeight: 42
+                    label: "FPS"
+                    value: Dk.integer(roll.fps)
+                }
+            }
+
             // Roll and dock.
             RowLayout {
                 Layout.fillWidth: true
@@ -291,29 +364,87 @@ ApplicationWindow {
 
                     DkBevel { anchors.fill: parent; kind: 1 }
 
-                    RowLayout {
+                    // Desktop: keyboard at the left. Phone: keyboard along the bottom.
+                    Item {
+                        id: rollArea
                         anchors.fill: parent
                         anchors.margins: 2
-                        spacing: 0
+                        readonly property int keySize: window.phone ? 46 : 62
 
                         Keyboard {
-                            Layout.preferredWidth: 62
-                            Layout.fillHeight: true
+                            x: 0
+                            y: window.phone ? parent.height - height : 0
+                            width: window.phone ? parent.width : rollArea.keySize
+                            height: window.phone ? rollArea.keySize : parent.height
+                            portrait: window.phone
                             mainWindow: mainWindow
                         }
 
                         PianoRoll {
                             id: roll
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
+                            x: window.phone ? 0 : rollArea.keySize
+                            y: 0
+                            width: parent.width - (window.phone ? 0 : rollArea.keySize)
+                            height: parent.height - (window.phone ? rollArea.keySize : 0)
+                            portrait: window.phone
                             mainWindow: mainWindow
                             onOpenRequested: mainWindow.openMidiPicker()
+                        }
+
+                        // Phone panel: the tab's groups over the lower part of the roll.
+                        Rectangle {
+                            visible: window.phone && window.phoneTab !== ""
+                            x: 0
+                            width: parent.width
+                            height: Math.min(roll.height, Math.max(phoneDock.implicitHeight + 16,
+                                window.phoneTab === "song" ? roll.height * 0.45 : 0))
+                            y: roll.height - height
+                            color: Dk.face
+                            DkBevel { anchors.fill: parent; kind: 0 }
+                            MouseArea { anchors.fill: parent }
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 4
+
+                                RowLayout {
+                                    visible: window.phoneTab === "synth"
+                                    Layout.fillWidth: true
+                                    Layout.topMargin: 6
+                                    spacing: 7
+                                    Text {
+                                        text: "VOL"
+                                        color: Dk.faint
+                                        font.family: Dk.term
+                                        font.pixelSize: 15
+                                    }
+                                    DkSlider {
+                                        Layout.fillWidth: true
+                                        from: 0
+                                        to: 100
+                                        value: mainWindow.volume
+                                        onMoved: mainWindow.volume = Math.round(value)
+                                    }
+                                }
+
+                                Dock {
+                                    id: phoneDock
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    section: window.phoneTab
+                                    mainWindow: mainWindow
+                                    onAdvancedRequested: advancedDialog.open()
+                                    onColorsRequested: colorsDialog.open()
+                                }
+                            }
                         }
                     }
                 }
 
                 Dock {
                     id: dock
+                    visible: !window.phone
                     Layout.preferredWidth: 304
                     Layout.fillHeight: true
                     mainWindow: mainWindow
@@ -322,8 +453,117 @@ ApplicationWindow {
                 }
             }
 
+            // Phone transport: position, buttons and the panel tabs.
+            ColumnLayout {
+                visible: window.phone
+                Layout.fillWidth: true
+                Layout.topMargin: 6
+                spacing: 6
+
+                DkSlider {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 4
+                    Layout.rightMargin: 4
+                    accent: Dk.accentLight
+                    from: 0
+                    to: Math.max(0.001, mainWindow.duration)
+                    value: mainWindow.currentTime
+                    enabled: mainWindow.hasMidi
+                    onMoved: mainWindow.seek(value)
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 4
+                    Layout.rightMargin: 4
+                    spacing: 6
+                    DkButton {
+                        implicitWidth: 48
+                        implicitHeight: 44
+                        iconRects: Glyphs.folder
+                        onClicked: mainWindow.openMidiPicker()
+                    }
+                    Item { Layout.fillWidth: true }
+                    DkButton {
+                        implicitWidth: 48
+                        implicitHeight: 44
+                        iconRects: Glyphs.stop
+                        enabled: mainWindow.hasMidi
+                        onClicked: mainWindow.stop()
+                    }
+                    DkButton {
+                        implicitWidth: 64
+                        implicitHeight: 44
+                        iconRects: Glyphs.play
+                        on: mainWindow.isPlaying
+                        enabled: mainWindow.hasMidi
+                        onClicked: mainWindow.play()
+                    }
+                    DkButton {
+                        implicitWidth: 48
+                        implicitHeight: 44
+                        iconRects: Glyphs.pause
+                        on: mainWindow.hasMidi && !mainWindow.isPlaying && mainWindow.currentTime > 0
+                        enabled: mainWindow.hasMidi
+                        onClicked: mainWindow.pause()
+                    }
+                    Item { Layout.fillWidth: true }
+                    DkButton {
+                        implicitWidth: 64
+                        implicitHeight: 44
+                        lcd: true
+                        font.pixelSize: 18
+                        text: Dk.number(mainWindow.noteSpeed, mainWindow.noteSpeed < 10 ? 1 : 0) + " s"
+                        on: window.phoneTab === "view"
+                        onClicked: window.phoneTab = window.phoneTab === "view" ? "" : "view"
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 3
+                    Repeater {
+                        model: [
+                            { key: "song", label: "Song", glyph: Glyphs.song },
+                            { key: "colors", label: "Colors", glyph: Glyphs.palette },
+                            { key: "synth", label: "Synth", glyph: Glyphs.speaker },
+                            { key: "view", label: "View", glyph: Glyphs.gear }
+                        ]
+                        DkButton {
+                            id: tabButton
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: 48
+                            on: window.phoneTab === modelData.key
+                            onClicked: window.phoneTab = on ? "" : modelData.key
+                            contentItem: Item {
+                              implicitHeight: tabColumn.implicitHeight
+                              Column {
+                                id: tabColumn
+                                anchors.centerIn: parent
+                                spacing: 4
+                                PixelIcon {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    rects: tabButton.modelData.glyph
+                                    color: tabButton.on ? Dk.white : Dk.dim
+                                }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    text: tabButton.modelData.label
+                                    color: tabButton.on ? Dk.white : Dk.dim
+                                    font.family: Dk.ui
+                                    font.pixelSize: 11
+                                }
+                              }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Status bar.
             RowLayout {
+                visible: !window.phone
                 Layout.fillWidth: true
                 Layout.topMargin: 4
                 spacing: 2
@@ -369,15 +609,15 @@ ApplicationWindow {
         onTriggered: mainWindow.advanceFrame()
     }
 
+    // Notices at the top right of the roll.
     Toasts {
-        anchors.top: parent.top
-        anchors.topMargin: 30
-        anchors.right: parent.right
-        anchors.rightMargin: 10
+        parent: rollArea
+        x: roll.x + roll.width - width - 6
+        y: roll.y + 6
         z: 50
         mainWindow: mainWindow
         roll: roll
-        dock: dock
+        dock: window.phone ? phoneDock : dock
     }
 
     // MIDI loading window.

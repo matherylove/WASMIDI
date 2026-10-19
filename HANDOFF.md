@@ -6416,3 +6416,49 @@ de más nunca llega al monitor. "Sin tope" es entonces la tasa del monitor (144,
 - Cuadros por segundo en las PCs del usuario con pantalla de más de 60 Hz (el contenedor no tiene GPU).
 - Si a 144-240 Hz mover el reloj en cada cuadro (un pedido de teclado por cuadro al Worker) le pesa al
   Worker del teclado con The Nuker 3.
+
+## 96. Revisión 99 — GUI nueva, parte 5: modo celular vertical, avisos en el roll y picos de todo el MIDI
+
+**Pedido:** la parte 5 de §92 (un modo de celular funcional con el reproductor entero en vertical, del
+mockup `Mobile.dc.html`) y tres defectos que el usuario vio en escritorio con la rev. 98: los avisos van
+en la esquina del visualizador, no de la ventana; los máximos de NPS y polifonía son los de todo el MIDI,
+no los de lo ya tocado; falta el contador de CC por segundo.
+
+### Cambios
+
+- Modo celular (`MainWindow.qml`, `phone`: ventana más alta que ancha y de menos de 760 px de ancho):
+  título, LCD con reloj, NPS, Poly, CC/s y FPS; roll con el tiempo subiendo por la pantalla; teclado de
+  46 px a lo ancho abajo; barra de posición; botones grandes (abrir, stop, play, pausa, note speed) y
+  pestañas Song/Colors/Synth/View que abren los grupos del panel sobre la parte baja del roll (`Dock.section`,
+  un segundo `Dock`; Synth suma el volumen). Tocar el roll vacío abre un MIDI. Ventana mínima 320×480.
+- Roll vertical sin otro camino de dibujo: `GLRenderer::setPortrait` cambia x por y en el vertex shader
+  de las notas (`uPortrait`), y el fondo y el cursor eligen el eje de `gl_FragCoord`. Todo lo demás (tiles
+  culleados, `rasterWidth`, distancias del borde, tijeras con `scissorRoll`) trabaja en el eje del tiempo
+  (`timePx()`) y el de las teclas (`keyPx()`), así que el culling y la regla de capas son los mismos.
+  El teclado (`Keyboard.portrait`) hace lo mismo: una columna por tecla y las negras arriba.
+- Avisos (`Toasts`) dentro del área del roll, arriba a la derecha del roll (en escritorio y en celular).
+- Picos de todo el MIDI: el parser cuenta también los note-off que cierran una nota por cubeta de
+  densidad (`noteOffDensity`, ppq/8 ticks, también en la carga en paralelo). `wmp_song_peaks_js` da el NPS
+  máximo (note-ons de los últimos 0,25 s × 4, como el contador en vivo) y la polifonía máxima (note-ons
+  menos note-offs acumulados al final de cada cubeta) con sus segundos. WASMIDI los pide al terminar la
+  carga (`song-peaks`) y el aviso sale cuando la reproducción pasa por ese momento ("the most in the
+  whole MIDI"), no después de un salto. La polifonía se mide al final de cada cubeta: una nota que empieza
+  y termina dentro de una cubeta no suma.
+- LCD: CC/s (`ccPerSecond`, que ya llegaba con el estado del teclado) en escritorio y celular.
+- `Dock.takeGraphFrames()` da -1 con el gráfico oculto (pestaña cerrada en celular): GRAPHS no cuenta.
+
+### Verificación
+
+- Compilación wasm local (Emscripten 3.1.56, Qt 6.8.3) OK.
+- Chromium del contenedor a 390×844 con un MIDI sintético y MatheryLSD: roll vertical, teclado iluminado
+  abajo con los colores de las notas, pestañas, panel de Synth/Colors/View, gráfico en Song.
+- Escritorio 1280×900, MIDI sintético con una ráfaga en 6,0-6,5 s (8 pistas, 120 notas/s cada una, notas
+  de 1 s) y CC 7 en cada nota: avisos en la esquina del roll con 960 NPS a 0:06.3 y 488 notas a la vez a
+  0:06.6 (lo esperado: 960 y 480 + las de fondo), CC/s 64.
+- `tools/feeder_check/check.sh` (parser BPFA contra el original, también en paralelo).
+
+### No verificado
+
+- Un celular real (táctil, `devicePixelRatio` alto, pantalla completa) y el rendimiento del roll vertical
+  con GPU.
+- Los picos con The Nuker 3/4 (cuánto tarda `wmp_song_peaks_js` con millones de cubetas).
