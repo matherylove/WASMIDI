@@ -311,7 +311,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§89)
+## Pendientes abiertos (lista completa en HANDOFF §90)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -335,8 +335,7 @@ Mecanismos activos y cómo desactivarlos:
 2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
    ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
    (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.
-3. Anteriores: reconstrucción del teclado en seeks lejanos de The Nuker (~15 s);
-   que el hilo coordinador también tome tiles de render; GUI cosmética; mapeo GM de
+3. Anteriores: que el hilo coordinador también tome tiles de render; GUI cosmética; mapeo GM de
    instrumentos/drums; precisión de CC.
 
 ## Errores a no repetir (detalle en HANDOFF §7)

@@ -3,8 +3,8 @@
 **Estado al cierre: revisión 72 (16 de octubre de 2026).** Para retomar el proyecto
 (incluido en Claude Code) leer primero **`CLAUDE.md`** en la raíz: resume el proyecto,
 la forma de trabajo del usuario, el build, la verificación, el estado actual, los
-interruptores de rollback y los pendientes. Después leer **§67** (pendientes abiertos y
-reportes del usuario sin resolver) y, según el tema, las secciones de cada revisión:
+interruptores de rollback y los pendientes. Después leer **§90** (lista de pendientes vigente; §67 es la
+lista anterior) y, según el tema, las secciones de cada revisión:
 parser §43-§60, synth §61-§63 y §66, WASMIDI Audio §64-§65, renderer §34-§38 y §48.
 
 Las secciones 1 a 14 describen el proyecto hasta la rev. 40 y conservan su texto
@@ -6015,3 +6015,90 @@ vuelve con `setTimeout(pump, 0)` después de cada tramo de 12 ms. Probado con `M
 copia del sitio (`browser_bench.py audio nuker4_553.mid MatheryLSD.sf2 7`): a 2048 voces (carga
 ~70%) 19 contra 28 underruns, todos en el primer segundo, y a 6144 voces (carga 204%) igual de
 saturado; no se distingue del ruido entre corridas, así que no se cambió.
+
+## 90. Lista de pendientes después de la rev. 93
+
+**Pedido (Dekx):** "Actualiza el handoff con la lista de todo lo que haga falta". Sin cambios de
+código. Esta lista junta lo abierto en §67 y en los "No verificado / pendiente" de §70-§89; reemplaza
+como lista vigente a la de §67 (que queda como histórica). Cada punto dice dónde está el detalle.
+
+### A. Meta: The Nuker 3 y 4 en tiempo real de principio a fin
+
+Meta del usuario: WASMIDI (synth + roll + teclado + gráficos a la vez) y WASMIDI Audio, con
+MatheryLSD, 1024 voces por worker (24576 en el 5900X), sin lag, sin cuadros perdidos y sin
+diferencia audible frente a un MIDI sin robos ni descartes. Regla de sincronía (§80): nadie espera
+a nadie, el que se atrasa alcanza.
+
+1. **Probar la rev. 93 en las PCs** (5900X + RX 9070XT, 7435HS + RTX 2050, la de 16 núcleos):
+   "Roll cache" en Look-ahead 1024 MB y en Full song. Con `deviceMemory` 32 la canción entera de
+   The Nuker 3 (~4,1 GiB de flujo visual) debería entrar: falta ver que la pestaña aguante esa
+   memoria y cuánto tarda el prellenado con 5-8 helpers (§89).
+2. **Tiempo de carga.** El usuario dice que sharkmidi abre mucho más rápido. Hoy: 42 s la carga de
+   The Nuker 3 en 16 núcleos (rev. 67) más el prellenado del roll de la rev. 93. Falta medir en las
+   PCs cuánto suma el prellenado y decidir si se puede solapar con la carga (§88-§89).
+3. **Ráfaga de 830 s de The Nuker 3** (~121 M palabras visuales/s): anexar + barrer en el Worker del
+   parser y el teclado no alcanzan en host (§83, §88). Con Full song el flujo ya está hecho; falta
+   medir si el barrido sólo alcanza ahí.
+4. **Resto de 127-130 s de The Nuker 3**: picos de anexar de ~0,8 s/s con el flujo cerca de
+   414 MiB (memoria del proyecto, rev. 93). En el contenedor ya da 0 cuadros atrasados; confirmar en
+   las PCs.
+5. **WASMIDI con 12288 voces y The Nuker 3**: el usuario veía 0 cuadros/s antes de 2:10 (§85-§86).
+   Pedir la línea `[WASMIDI visual]` (`helpers N% busy`) y `[WASMIDI app]` con `?visualdebug=1`, y
+   probar con 6144 voces para separar CPU del synth de decodificación.
+6. **Crujidos a 24576 voces** en el 5900X (12288 estables, §77) y el robo caro con "Stack gain"
+   (§77-§78). Abaratar el robo en modo 0.
+7. **Synth por GPU estilo Kestrel (etapa 3)**: pasos por bloque en la GPU (robo, alta, render,
+   reducción, compactación), pool SoA, fase 32.32, suma en árbol fijo, note-offs por tabla
+   canal×tecla (§74-§75). Lo que queda del lado CPU del modo GPU es la fase de eventos (§75-§76).
+8. **Saltos justo después del pico / saltos lejanos**: la ventana de densidades se decodifica desde
+   los checkpoints en el Worker del parser (~0,6 s en host tras el pico de The Nuker 4, 3,6 s a
+   830 s de The Nuker 3; §72, §82-§83). Una nota larga que empezó más de 25 ms antes del destino de
+   un salto no suena (decisión de §80; revisar si el usuario lo nota).
+9. **Helpers con fuente cruda**: un MIDI de menos de ~3-6 GB (según memoria) queda crudo y no tiene
+   helpers ni para el synth ni para el roll (§70-§71); compartir la fuente cruda con los helpers.
+
+### B. Verificaciones que necesitan las PCs del usuario o una GPU real
+
+1. **Modo GPU de WasmiSynth (rev. 70-79)**: que el WGSL compile, que el pipeline de hasta 8 bloques
+   alcance, cuánto tarda el kernel con 24576 voces, 1 contra 12-24 workers (§67 Rev. 73, §75).
+2. **Auto (Hash) contra Single** a 12288 y 24576 voces, CPU y GPU; si el reparto por teclas se
+   desbalancea en algún MIDI (§76).
+3. **Cuadros del roll con GPU real** (tiles parciales y de a pedazos, rev. 85 y 88): con SwiftShader
+   del contenedor los cuadros de WASMIDI no dicen nada (§79, §81, §84). Si en GPU el synth por
+   WebGPU y el WebGL del roll compiten por la GPU (§77, §79).
+4. **Cierre de WasmiSynth en pausa** ("application exit"): no se reprodujo (§81, §84); hace falta el
+   log de consola del momento del cierre.
+5. **Eco plegado con "Stack gain"**: si suena como el original (§77).
+6. **WASMIDI Audio con audio real**: ventanas, letras, gráficos, visualizador y la SF2 que no
+   recargaba (arreglada en la rev. 73, §67 Rev. 73), sin confirmar por el usuario.
+7. **Pestaña oculta real**: el freno de timers de Chrome no se emula en headless (§74).
+8. **Contador de notas descartadas** del recorte del pico más alto en Chromium con el render de 4
+   voces (98.597 contra 22.621 en corridas distintas, §74): revisar si se repite.
+9. **Huecos del roll en The Nuker 4** con `?tiles=0` (§73).
+
+### C. Reportes viejos del usuario sin cerrar (§67)
+
+1. **"¿Dónde están los controles?"** (§67, B): nunca se aclaró a qué se refería. Preguntar.
+2. **Minimizado sin usar CPU/GPU** (§67, C y D): visual-bench se pausa y WASMIDI Audio suena con lo
+   visual congelado (rev. 78), pero WASMIDI (`index.html`) no escucha `visibilitychange`: con la
+   pestaña oculta `requestAnimationFrame` se frena solo, pero el barrido del roll, los tiles, el
+   teclado y los helpers del flujo visual siguen (inferido del código, sin medir).
+
+### D. Otros pendientes (largo plazo)
+
+1. Que el coordinador de `voice_render_float` también tome tiles de render (§62).
+2. Un paso de benchmark con Chromium headless en el CI (§67).
+3. Abrir MIDIs comprimidos (.zip/.7z/.gz/.zst) directamente (§52, §67).
+4. Hash fijo de zstd en `FetchContent` (`CMakeLists.txt` baja zstd 1.5.6 por URL sin `URL_HASH`).
+5. Tabla de pistas de la carga: cadena de lecturas dependientes (~7% del total, §60).
+6. GUI cosmética (§11), mapeo GM de instrumentos y drums, precisión de CC.
+
+### Cerrados desde la lista de §67
+
+- Reconstrucción del teclado en seeks lejanos de The Nuker (~15 s): snapshots por pista y por tecla
+  (rev. 76, §72; rev. 86, §82).
+- WebGPU más lento con 12 workers (§67, A): avance en forma cerrada y reserva por tile (rev. 73).
+- SF2 que no se podía recargar después de cambiar el synth (§67, E): arreglado en la rev. 73.
+- Roll, teclado y gráficos con su propia decodificación (etapa 2): flujo visual con helpers
+  (rev. 75 en adelante).
+- Admisión en el parser y decodificación repartida para el synth (rev. 74).
