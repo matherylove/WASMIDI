@@ -55,6 +55,7 @@ FILES = [
     "tools/browser_bench.py",
     ".gitignore",
     "tools/ssw_schedule_harness.c",
+    "tools/sfz_folder_check.c",
     "tools/worker_freelist_borrow_check.c",
     "web/coi-serviceworker.js",
     "web/midi-parser-worker.js",

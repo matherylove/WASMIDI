@@ -1029,7 +1029,9 @@ int ssw_init(int sample_rate, int channels, int block_frames, int max_voices) {
 
 int ssw_load_sf2(const char* path) {
     if (!g_ready || !path || !*path) return 0;
-    sfz_instrument* next = sf2_load_as_instrument(path);
+    size_t path_len = strlen(path);
+    int is_sfz = path_len > 4 && _stricmp(path + path_len - 4, ".sfz") == 0;
+    sfz_instrument* next = is_sfz ? sfz_parse(path) : sf2_load_as_instrument(path);
     if (!next) return 0;
 
     /* Finish every load-time sample transformation before exposing this layer

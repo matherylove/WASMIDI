@@ -13,6 +13,11 @@
 #include <ctype.h>
 #include <limits.h>
 #include <float.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <strings.h>
+#include <sys/stat.h>
+#endif
 
 #define SFZ_OUTPUT_NORMALIZATION_GAIN 0.50f
 
@@ -84,6 +89,7 @@ typedef struct {
     int resonance_cents;
     int attenuation;
     float gain_veltrack;
+    char sample[260];
 } sfz_region_defaults;
 
 typedef enum {
@@ -97,6 +103,7 @@ typedef enum {
 static sfz_selector_lock g_selector_cache_lock = SFZ_SELECTOR_LOCK_INIT;
 
 // Forward declaration
+static void sfz_parse_reset_state(void);
 static void sfz_parse_internal(sfz_instrument* inst,
                                const char* path,
                                sfz_region_defaults* global_defs,
@@ -148,6 +155,7 @@ enum {
 };
 
 static void init_region_defaults(sfz_region_defaults* defs) {
+    defs->sample[0] = '\0';
     defs->lokey = INT_MIN;
     defs->hikey = INT_MIN;
     defs->lovel = INT_MIN;
@@ -523,9 +531,20 @@ static int sfz_next_opcode(const char* line, int* cursor, char* key, size_t key_
         if (line[i] == quote) ++i;
     } else {
         int value_start = i;
-        while (line[i] && !isspace((unsigned char)line[i])) {
-            ++i;
+        int value_end = i;
+        while (line[i]) {
+            if (!isspace((unsigned char)line[i])) {
+                value_end = ++i;
+                continue;
+            }
+            int j = i;
+            while (line[j] && isspace((unsigned char)line[j])) ++j;
+            int k = j;
+            while (line[k] && (isalnum((unsigned char)line[k]) || line[k] == '_')) ++k;
+            if (!line[j] || (k > j && line[k] == '=')) break;
+            i = j;
         }
+        i = value_end;
         value_len = i - value_start;
         if ((size_t)value_len >= value_cap) value_len = (int)value_cap - 1;
         memcpy(value, line + value_start, (size_t)value_len);
@@ -549,7 +568,7 @@ static sfz_sample_cache_entry* sfz_get_or_load_sample(sfz_instrument* inst, cons
     sfz_sample_cache_entry* entry = sfz_find_sample_cache(inst, full_path);
     if (entry) return entry;
 
-    wav_data* wav = wav_load(full_path);
+    wav_data* wav = full_path[0] == '*' ? wav_make_waveform(full_path, 44100) : wav_load(full_path);
     if (!wav) return NULL;
 
     entry = (sfz_sample_cache_entry*)calloc(1, sizeof(sfz_sample_cache_entry));
@@ -887,21 +906,97 @@ static int parse_loop_mode_value(const char* value) {
     return SFZ_LOOP_NONE;
 }
 
-static void sfz_load_region_sample(sfz_instrument* inst, sfz_region* region, const char* sfz_path, const char* sample_path) {
+/* dir(base) + middle + leaf, with '\' read as '/' outside Windows. */
+static void sfz_join_path(char* out, size_t cap, const char* base, const char* middle, const char* leaf) {
+    char dir[512];
+    strncpy(dir, base, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = '\0';
+    char* cut = NULL;
+    for (char* p = dir; *p; ++p) {
+        if (*p == '/' || *p == '\\') cut = p;
+    }
+    if (cut) cut[1] = '\0';
+    else dir[0] = '\0';
+    snprintf(out, cap, "%s%s%s", dir, middle, leaf);
+#ifndef _WIN32
+    for (char* p = out; *p; ++p) {
+        if (*p == '\\') *p = '/';
+    }
+    /* Collapse "a/./b" and "a//b"; ".." is left for the file system. */
+    char* w = out;
+    for (char* r = out; *r;) {
+        if (r[0] == '/' && r[1] == '/') { ++r; continue; }
+        if (r[0] == '/' && r[1] == '.' && r[2] == '/') { r += 2; continue; }
+        *w++ = *r++;
+    }
+    *w = '\0';
+#endif
+}
+
+/* Sample libraries made on Windows often spell names with a different case
+ * than the files have; find each path part ignoring case. */
+static void sfz_resolve_path_case(char* path) {
+#ifndef _WIN32
+    struct stat st;
+    if (!path[0] || stat(path, &st) == 0) return;
+    char built[512];
+    size_t used = 0;
+    const char* p = path;
+    if (*p == '/') {
+        built[used++] = '/';
+        ++p;
+    }
+    built[used] = '\0';
+    while (*p) {
+        const char* end = strchr(p, '/');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char part[256];
+        if (len >= sizeof(part)) return;
+        memcpy(part, p, len);
+        part[len] = '\0';
+        char probe[512];
+        snprintf(probe, sizeof(probe), "%s%s", built, part);
+        if (stat(probe, &st) != 0) {
+            DIR* d = opendir(used ? built : ".");
+            if (!d) return;
+            struct dirent* e;
+            int found = 0;
+            while ((e = readdir(d)) != NULL) {
+                if (strcasecmp(e->d_name, part) == 0) {
+                    strncpy(part, e->d_name, sizeof(part) - 1);
+                    part[sizeof(part) - 1] = '\0';
+                    found = 1;
+                    break;
+                }
+            }
+            closedir(d);
+            if (!found) return;
+        }
+        int n = snprintf(built + used, sizeof(built) - used, "%s%s", part, end ? "/" : "");
+        if (n < 0 || (size_t)n >= sizeof(built) - used) return;
+        used += (size_t)n;
+        p = end ? end + 1 : p + len;
+    }
+    strncpy(path, built, 511);
+    path[511] = '\0';
+#else
+    (void)path;
+#endif
+}
+
+static void sfz_load_region_sample(sfz_instrument* inst, sfz_region* region, const char* sample_path) {
     if (!region || !sample_path || !sample_path[0]) return;
-    strcpy(region->sample, sample_path);
+    strncpy(region->sample, sample_path, sizeof(region->sample) - 1);
+    region->sample[sizeof(region->sample) - 1] = '\0';
 
     char full_path[512];
-    strncpy(full_path, sfz_path, sizeof(full_path));
-    full_path[sizeof(full_path) - 1] = '\0';
-    char* last_slash = strrchr(full_path, '\\');
-    if (last_slash) {
-        *(last_slash + 1) = '\0';
+    if (sample_path[0] == '*') {
+        strncpy(full_path, sample_path, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
     } else {
-        full_path[0] = '\0';
+        sfz_join_path(full_path, sizeof(full_path), inst->source_path, inst->default_path, sample_path);
+        sfz_resolve_path_case(full_path);
     }
-    if (strlen(inst->default_path) > 0) strcat(full_path, inst->default_path);
-    strcat(full_path, sample_path);
 
     sfz_sample_cache_entry* entry = sfz_get_or_load_sample(inst, full_path);
     region->cache_entry = entry;
@@ -949,7 +1044,21 @@ sfz_instrument* sfz_parse(const char* path) {
     init_region_defaults(&master_defs);
     init_region_defaults(&group_defs);
 
+    sfz_parse_reset_state();
     sfz_parse_internal(inst, path, &global_defs, &master_defs, &group_defs);
+
+    /* A region whose sample is missing or unreadable cannot sound; drop it so
+     * the rest of the instrument still loads. */
+    int kept = 0;
+    for (int i = 0; i < inst->num_regions; i++) {
+        if (inst->regions[i].sample_data) {
+            if (kept != i) inst->regions[kept] = inst->regions[i];
+            ++kept;
+        } else {
+            free(inst->regions[i].opcodes);
+        }
+    }
+    inst->num_regions = kept;
 
     if (inst->num_regions == 0) {
         sfz_free(inst);
@@ -1018,301 +1127,438 @@ sfz_instrument* sfz_parse(const char* path) {
     return inst;
 }
 
+static void sfz_apply_opcode(sfz_region* region, sfz_region_defaults* defs, const char* key, const char* value) {
+    int midi_key = -1;
+    int parsed_key = parse_midi_key_value(value, &midi_key);
+    int midi_key_low = -1;
+    int midi_key_high = -1;
+    int parsed_range = parse_midi_key_range(value, &midi_key_low, &midi_key_high);
+
+    if (defs) {
+        if (strcmp(key, "lokey") == 0 && parsed_key) {
+            defs->lokey = midi_key;
+        } else if (strcmp(key, "hikey") == 0 && parsed_key) {
+            defs->hikey = midi_key;
+        } else if (strcmp(key, "key") == 0 && parsed_range) {
+            defs->lokey = midi_key_low;
+            defs->hikey = midi_key_high;
+            defs->pitch_keycenter = (midi_key_low + midi_key_high) / 2;
+        } else if (strcmp(key, "lovel") == 0) {
+            defs->lovel = atoi(value);
+        } else if (strcmp(key, "hivel") == 0) {
+            defs->hivel = atoi(value);
+        } else if (strcmp(key, "xfin_lovel") == 0) {
+            defs->xfin_lovel = atoi(value);
+        } else if (strcmp(key, "xfin_hivel") == 0) {
+            defs->xfin_hivel = atoi(value);
+        } else if (strcmp(key, "xfout_lovel") == 0) {
+            defs->xfout_lovel = atoi(value);
+        } else if (strcmp(key, "xfout_hivel") == 0) {
+            defs->xfout_hivel = atoi(value);
+        } else if ((strcmp(key, "pitch_keycenter") == 0 || strcmp(key, "key") == 0) && parsed_key) {
+            defs->pitch_keycenter = midi_key;
+            if (strcmp(key, "key") == 0) {
+                defs->lokey = midi_key;
+                defs->hikey = midi_key;
+            }
+        } else if (strcmp(key, "pan") == 0) {
+            defs->pan = atoi(value);
+        } else if (strcmp(key, "volume") == 0) {
+            defs->volume_millibels = (int)lrintf((float)atof(value) * 1000.0f);
+        } else if (strcmp(key, "offset") == 0) {
+            defs->offset = atoi(value);
+        } else if (strcmp(key, "end") == 0) {
+            defs->end = atoi(value);
+        } else if (strcmp(key, "group") == 0) {
+            defs->group = atoi(value);
+        } else if (strcmp(key, "off_by") == 0) {
+            defs->off_by = atoi(value);
+        } else if (strcmp(key, "trigger") == 0) {
+            defs->trigger = parse_trigger_value(value);
+        } else if (strcmp(key, "loop_mode") == 0) {
+            defs->loop_mode = parse_loop_mode_value(value);
+        } else if (strcmp(key, "loop_start") == 0) {
+            defs->loop_start = atoi(value);
+        } else if (strcmp(key, "loop_end") == 0) {
+            defs->loop_end = atoi(value);
+        } else if (strcmp(key, "ampeg_attack") == 0) {
+            defs->ampeg_attack_millis = (int)lrintf((float)atof(value) * 1000.0f);
+        } else if (strcmp(key, "ampeg_decay") == 0) {
+            defs->ampeg_decay_millis = (int)lrintf((float)atof(value) * 1000.0f);
+        } else if (strcmp(key, "ampeg_sustain") == 0) {
+            defs->ampeg_sustain_permille = (int)lrintf((float)atof(value) * 10.0f);
+        } else if (strcmp(key, "ampeg_release") == 0) {
+            defs->ampeg_release_millis = (int)lrintf((float)atof(value) * 1000.0f);
+        } else if (strcmp(key, "ampeg_veltrack") == 0) {
+            defs->ampeg_veltrack = (float)atof(value);
+        } else if (strcmp(key, "ampeg_attack_veltrack") == 0) {
+            defs->ampeg_attack_veltrack = (float)atof(value);
+        } else if (strcmp(key, "ampeg_decay_veltrack") == 0) {
+            defs->ampeg_decay_veltrack = (float)atof(value);
+        } else if (strcmp(key, "ampeg_sustain_veltrack") == 0) {
+            defs->ampeg_sustain_veltrack = (float)atof(value);
+        } else if (strcmp(key, "ampeg_release_veltrack") == 0) {
+            defs->ampeg_release_veltrack = (float)atof(value);
+        } else if (strcmp(key, "fil_type") == 0) {
+            defs->filter_type = parse_filter_type_value(value);
+        } else if (strcmp(key, "cutoff") == 0) {
+            defs->cutoff_hz = atoi(value);
+        } else if (strcmp(key, "fil_veltrack") == 0) {
+            defs->fil_veltrack = (float)atof(value);
+        } else if (strcmp(key, "resonance") == 0) {
+            defs->resonance_cents = (int)lrintf((float)atof(value) * 100.0f);
+        } else if (strcmp(key, "transpose") == 0) {
+            defs->transpose = atoi(value);
+        } else if (strcmp(key, "tune") == 0) {
+            defs->tune_cents = atoi(value);
+        } else if (strcmp(key, "attenuation") == 0) {
+            defs->attenuation = atoi(value);
+        } else if (strcmp(key, "gain_veltrack") == 0) {
+            defs->gain_veltrack = (float)atof(value);
+        }
+        return;
+    }
+
+    if (!region) return;
+    if (strcmp(key, "lokey") == 0 && parsed_key) {
+        region->lokey = midi_key;
+    } else if (strcmp(key, "hikey") == 0 && parsed_key) {
+        region->hikey = midi_key;
+    } else if (strcmp(key, "key") == 0 && parsed_range) {
+        region->lokey = midi_key_low;
+        region->hikey = midi_key_high;
+        region->pitch_keycenter = (midi_key_low + midi_key_high) / 2;
+    } else if (strcmp(key, "lovel") == 0) {
+        region->lovel = atoi(value);
+    } else if (strcmp(key, "hivel") == 0) {
+        region->hivel = atoi(value);
+    } else if (strcmp(key, "xfin_lovel") == 0) {
+        region->xfin_lovel = atoi(value);
+    } else if (strcmp(key, "xfin_hivel") == 0) {
+        region->xfin_hivel = atoi(value);
+    } else if (strcmp(key, "xfout_lovel") == 0) {
+        region->xfout_lovel = atoi(value);
+    } else if (strcmp(key, "xfout_hivel") == 0) {
+        region->xfout_hivel = atoi(value);
+    } else if (strcmp(key, "pitch_keycenter") == 0 && parsed_key) {
+        region->pitch_keycenter = midi_key;
+    } else if (strcmp(key, "key") == 0 && parsed_key) {
+        region->lokey = midi_key;
+        region->hikey = midi_key;
+        region->pitch_keycenter = midi_key;
+    } else if (strcmp(key, "pan") == 0) {
+        region->pan = atoi(value);
+        pan_to_gains(region->pan, &region->pan_l_gain, &region->pan_r_gain);
+    } else if (strcmp(key, "volume") == 0) {
+        region->volume_db = (float)atof(value);
+        region->volume_gain = db_to_gain(region->volume_db);
+    } else if (strcmp(key, "offset") == 0) {
+        region->offset = atoi(value);
+    } else if (strcmp(key, "end") == 0) {
+        region->end = atoi(value);
+    } else if (strcmp(key, "group") == 0) {
+        region->group = atoi(value);
+    } else if (strcmp(key, "off_by") == 0) {
+        region->off_by = atoi(value);
+    } else if (strcmp(key, "trigger") == 0) {
+        region->trigger = parse_trigger_value(value);
+    } else if (strcmp(key, "loop_mode") == 0) {
+        region->loop_mode = parse_loop_mode_value(value);
+    } else if (strcmp(key, "loop_start") == 0) {
+        region->loop_start = atoi(value);
+    } else if (strcmp(key, "loop_end") == 0) {
+        region->loop_end = atoi(value);
+    } else if (strcmp(key, "ampeg_attack") == 0) {
+        region->ampeg_attack = (float)atof(value);
+    } else if (strcmp(key, "ampeg_decay") == 0) {
+        region->ampeg_decay = (float)atof(value);
+    } else if (strcmp(key, "ampeg_sustain") == 0) {
+        region->ampeg_sustain = (float)atof(value) * 0.01f;
+    } else if (strcmp(key, "ampeg_release") == 0) {
+        region->ampeg_release = (float)atof(value);
+    } else if (strcmp(key, "ampeg_veltrack") == 0) {
+        region->ampeg_veltrack = (float)atof(value);
+    } else if (strcmp(key, "ampeg_attack_veltrack") == 0) {
+        region->ampeg_attack_veltrack = (float)atof(value);
+    } else if (strcmp(key, "ampeg_decay_veltrack") == 0) {
+        region->ampeg_decay_veltrack = (float)atof(value);
+    } else if (strcmp(key, "ampeg_sustain_veltrack") == 0) {
+        region->ampeg_sustain_veltrack = (float)atof(value);
+    } else if (strcmp(key, "ampeg_release_veltrack") == 0) {
+        region->ampeg_release_veltrack = (float)atof(value);
+    } else if (strcmp(key, "fil_type") == 0) {
+        region->filter_type = parse_filter_type_value(value);
+    } else if (strcmp(key, "cutoff") == 0) {
+        region->cutoff_hz = (float)atof(value);
+    } else if (strcmp(key, "fil_veltrack") == 0) {
+        region->fil_veltrack = (float)atof(value);
+    } else if (strcmp(key, "resonance") == 0) {
+        region->resonance_q = 0.707f + ((float)atof(value) * 0.01f);
+    } else if (strcmp(key, "transpose") == 0) {
+        region->transpose = atoi(value);
+    } else if (strcmp(key, "tune") == 0) {
+        region->tune_cents = atoi(value);
+        region->tune_multiplier = powf(2.0f, ((float)region->transpose + ((float)region->tune_cents * 0.01f)) * (1.0f / 12.0f));
+    } else if (strcmp(key, "attenuation") == 0) {
+        region->attenuation = atoi(value);
+        region->attenuation_gain = centibels_to_gain(region->attenuation);
+    } else if (strcmp(key, "gain_veltrack") == 0) {
+        region->gain_veltrack = (float)atof(value);
+    }
+}
+
+#define SFZ_MAX_DEFINES 256
+
+typedef struct {
+    char name[64];
+    char value[256];
+} sfz_define;
+
+static sfz_define g_sfz_defines[SFZ_MAX_DEFINES];
+static int g_sfz_define_count = 0;
+static int g_sfz_in_block_comment = 0;
+static int g_sfz_include_depth = 0;
+static sfz_parse_context g_sfz_context = SFZ_PARSE_CTX_NONE;
+
+static void sfz_parse_reset_state(void) {
+    g_sfz_define_count = 0;
+    g_sfz_in_block_comment = 0;
+    g_sfz_include_depth = 0;
+    g_sfz_context = SFZ_PARSE_CTX_NONE;
+}
+
+static const char* sfz_canonical_opcode(const char* key) {
+    if (strcmp(key, "loopmode") == 0) return "loop_mode";
+    if (strcmp(key, "loopstart") == 0) return "loop_start";
+    if (strcmp(key, "loopend") == 0) return "loop_end";
+    if (strcmp(key, "offby") == 0) return "off_by";
+    if (strcmp(key, "polyphony_group") == 0) return "group";
+    if (strcmp(key, "filtype") == 0) return "fil_type";
+    return key;
+}
+
+static void sfz_strip_block_comments(char* line) {
+    char* out = line;
+    for (char* p = line; *p;) {
+        if (g_sfz_in_block_comment) {
+            if (p[0] == '*' && p[1] == '/') {
+                g_sfz_in_block_comment = 0;
+                p += 2;
+            } else {
+                ++p;
+            }
+        } else if (p[0] == '/' && p[1] == '*') {
+            g_sfz_in_block_comment = 1;
+            p += 2;
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = '\0';
+}
+
+static void sfz_expand_defines(const char* in, char* out, size_t cap) {
+    size_t o = 0;
+    while (*in && o + 1 < cap) {
+        if (*in == '$') {
+            int best = -1;
+            size_t best_len = 0;
+            for (int i = 0; i < g_sfz_define_count; ++i) {
+                size_t n = strlen(g_sfz_defines[i].name);
+                if (n > best_len && strncmp(in, g_sfz_defines[i].name, n) == 0) {
+                    best = i;
+                    best_len = n;
+                }
+            }
+            if (best >= 0) {
+                for (const char* v = g_sfz_defines[best].value; *v && o + 1 < cap; ++v) out[o++] = *v;
+                in += best_len;
+                continue;
+            }
+        }
+        out[o++] = *in++;
+    }
+    out[o] = '\0';
+}
+
+static void sfz_add_define(const char* text) {
+    while (*text == ' ' || *text == '\t') ++text;
+    if (*text != '$') return;
+    char name[64];
+    size_t n = 0;
+    while (text[n] && !isspace((unsigned char)text[n]) && n + 1 < sizeof(name)) {
+        name[n] = text[n];
+        ++n;
+    }
+    name[n] = '\0';
+    const char* value = text + n;
+    while (*value == ' ' || *value == '\t') ++value;
+    int slot = -1;
+    for (int i = 0; i < g_sfz_define_count; ++i) {
+        if (strcmp(g_sfz_defines[i].name, name) == 0) slot = i;
+    }
+    if (slot < 0) {
+        if (g_sfz_define_count >= SFZ_MAX_DEFINES) return;
+        slot = g_sfz_define_count++;
+    }
+    strncpy(g_sfz_defines[slot].name, name, sizeof(g_sfz_defines[slot].name) - 1);
+    g_sfz_defines[slot].name[sizeof(g_sfz_defines[slot].name) - 1] = '\0';
+    strncpy(g_sfz_defines[slot].value, value, sizeof(g_sfz_defines[slot].value) - 1);
+    g_sfz_defines[slot].value[sizeof(g_sfz_defines[slot].value) - 1] = '\0';
+    trim_inplace(g_sfz_defines[slot].value);
+}
+
+static void sfz_begin_region(sfz_instrument* inst,
+                             sfz_region_defaults* global_defs,
+                             sfz_region_defaults* master_defs,
+                             sfz_region_defaults* group_defs) {
+    sfz_region* region = sfz_append_region(inst);
+    if (!region) return;
+    region_apply_defaults(region, global_defs, master_defs, group_defs);
+    const char* inherited = group_defs->sample[0] ? group_defs->sample
+                          : master_defs->sample[0] ? master_defs->sample
+                          : global_defs->sample;
+    if (inherited[0]) sfz_load_region_sample(inst, region, inherited);
+}
+
+static void sfz_parse_segment(sfz_instrument* inst,
+                              char* seg,
+                              sfz_region_defaults* global_defs,
+                              sfz_region_defaults* master_defs,
+                              sfz_region_defaults* group_defs) {
+    if (*seg == '<') {
+        char* close = strchr(seg, '>');
+        if (!close) return;
+        *close = '\0';
+        const char* header = seg + 1;
+        if (strcmp(header, "global") == 0) {
+            g_sfz_context = SFZ_PARSE_CTX_GLOBAL;
+            init_region_defaults(global_defs);
+            init_region_defaults(master_defs);
+            init_region_defaults(group_defs);
+        } else if (strcmp(header, "master") == 0) {
+            g_sfz_context = SFZ_PARSE_CTX_MASTER;
+            init_region_defaults(master_defs);
+            init_region_defaults(group_defs);
+        } else if (strcmp(header, "group") == 0) {
+            g_sfz_context = SFZ_PARSE_CTX_GROUP;
+            init_region_defaults(group_defs);
+        } else if (strcmp(header, "region") == 0) {
+            g_sfz_context = SFZ_PARSE_CTX_REGION;
+            sfz_begin_region(inst, global_defs, master_defs, group_defs);
+        } else {
+            g_sfz_context = SFZ_PARSE_CTX_NONE;
+        }
+        seg = close + 1;
+    }
+
+    sfz_region* region = (g_sfz_context == SFZ_PARSE_CTX_REGION && inst->num_regions > 0)
+        ? &inst->regions[inst->num_regions - 1]
+        : NULL;
+    sfz_region_defaults* defs = NULL;
+    if (g_sfz_context == SFZ_PARSE_CTX_GLOBAL) defs = global_defs;
+    else if (g_sfz_context == SFZ_PARSE_CTX_MASTER) defs = master_defs;
+    else if (g_sfz_context == SFZ_PARSE_CTX_GROUP) defs = group_defs;
+
+    int cursor = 0;
+    char key_buf[64];
+    char value[512];
+    while (sfz_next_opcode(seg, &cursor, key_buf, sizeof(key_buf), value, sizeof(value))) {
+        trim_inplace(key_buf);
+        trim_inplace(value);
+        if (!key_buf[0] || !value[0]) continue;
+        const char* key = sfz_canonical_opcode(key_buf);
+        if (strcmp(key, "default_path") == 0) {
+            strncpy(inst->default_path, value, sizeof(inst->default_path) - 1);
+            inst->default_path[sizeof(inst->default_path) - 1] = '\0';
+            continue;
+        }
+        if (region) {
+            region_add_opcode(region, key, value);
+        }
+        if (strcmp(key, "sample") == 0) {
+            if (region) {
+                sfz_load_region_sample(inst, region, value);
+            } else if (defs) {
+                strncpy(defs->sample, value, sizeof(defs->sample) - 1);
+                defs->sample[sizeof(defs->sample) - 1] = '\0';
+            }
+            continue;
+        }
+        sfz_apply_opcode(region, defs, key, value);
+    }
+}
+
 static void sfz_parse_internal(sfz_instrument* inst,
                                const char* path,
                                sfz_region_defaults* global_defs,
                                sfz_region_defaults* master_defs,
                                sfz_region_defaults* group_defs) {
-    FILE* f = fopen(path, "r");
+    char resolved[512];
+    strncpy(resolved, path, sizeof(resolved) - 1);
+    resolved[sizeof(resolved) - 1] = '\0';
+    sfz_resolve_path_case(resolved);
+    FILE* f = fopen(resolved, "r");
     if (!f) {
 #ifdef DEBUG
         logger_log("Could not open SFZ file: %s, Exiting...\n", path);
 #endif
-        // TODO: Add error handler
         return;
     }
 
-    char line[1024];
-    sfz_parse_context context = SFZ_PARSE_CTX_NONE;
-    while (fgets(line, sizeof(line), f)) {
+    enum { SFZ_LINE_CAP = 16384 };
+    char* line = (char*)malloc(SFZ_LINE_CAP);
+    char* expanded = (char*)malloc(SFZ_LINE_CAP);
+    if (!line || !expanded) {
+        free(line);
+        free(expanded);
+        fclose(f);
+        return;
+    }
+
+    while (fgets(line, SFZ_LINE_CAP, f)) {
+        sfz_strip_block_comments(line);
         strip_sfz_comments(line);
         trim_inplace(line);
         if (!line[0]) continue;
-        char* start = line;
 
-        if (strncmp(start, "#include", 8) == 0) {
-            char* include_path_str = start + 8;
+        if (strncmp(line, "#define", 7) == 0) {
+            sfz_add_define(line + 7);
+            continue;
+        }
+
+        sfz_expand_defines(line, expanded, SFZ_LINE_CAP);
+
+        if (strncmp(expanded, "#include", 8) == 0) {
+            char* include_path_str = expanded + 8;
             while (*include_path_str == ' ' || *include_path_str == '\t') include_path_str++;
-
             if (*include_path_str == '"') {
                 include_path_str++;
                 char* end_quote = strchr(include_path_str, '"');
                 if (end_quote) *end_quote = '\0';
             }
-
             char full_include_path[512];
-            strncpy(full_include_path, path, sizeof(full_include_path));
-            char* last_slash = strrchr(full_include_path, '\\');
-            if (last_slash) {
-                *(last_slash + 1) = '\0';
-            } else {
-                full_include_path[0] = '\0';
+            sfz_join_path(full_include_path, sizeof(full_include_path), inst->source_path, "", include_path_str);
+            if (g_sfz_include_depth < 16) {
+                ++g_sfz_include_depth;
+                sfz_parse_internal(inst, full_include_path, global_defs, master_defs, group_defs);
+                --g_sfz_include_depth;
             }
-            strcat(full_include_path, include_path_str);
-#ifdef DEBUG
-            logger_log("Including SFZ file: %s\n", full_include_path);
-#endif 
-            sfz_parse_internal(inst, full_include_path, global_defs, master_defs, group_defs);
             continue;
         }
 
-        if (strstr(start, "default_path=")) {
-            char* default_path_str = strchr(start, '=') + 1;
-
-            if (*default_path_str == '"') {
-                default_path_str++;
-                char* end_quote = strchr(default_path_str, '"');
-                if (end_quote) *end_quote = '\0';
-            }
-
-            strcpy(inst->default_path, default_path_str);
-        }
-
-        char* region_tag = strstr(start, "<region>");
-        char* group_tag = strstr(start, "<group>");
-        char* global_tag = strstr(start, "<global>");
-        char* master_tag = strstr(start, "<master>");
-
-        if (global_tag) {
-            context = SFZ_PARSE_CTX_GLOBAL;
-        }
-        if (master_tag && (!global_tag || master_tag > global_tag)) {
-            context = SFZ_PARSE_CTX_MASTER;
-            init_region_defaults(master_defs);
-            init_region_defaults(group_defs);
-        }
-        if (group_tag && (!global_tag || group_tag > global_tag) && (!master_tag || group_tag > master_tag)) {
-            context = SFZ_PARSE_CTX_GROUP;
-            init_region_defaults(group_defs);
-        }
-        if (region_tag &&
-            (!group_tag || region_tag > group_tag) &&
-            (!global_tag || region_tag > global_tag) &&
-            (!master_tag || region_tag > master_tag)) {
-            context = SFZ_PARSE_CTX_REGION;
-            sfz_region* region = sfz_append_region(inst);
-            if (!region) continue;
-            region_apply_defaults(region, global_defs, master_defs, group_defs);
-        }
-
-        sfz_region* region = (context == SFZ_PARSE_CTX_REGION && inst->num_regions > 0)
-            ? &inst->regions[inst->num_regions - 1]
-            : NULL;
-        sfz_region_defaults* defs = NULL;
-        if (context == SFZ_PARSE_CTX_GLOBAL) defs = global_defs;
-        else if (context == SFZ_PARSE_CTX_MASTER) defs = master_defs;
-        else if (context == SFZ_PARSE_CTX_GROUP) defs = group_defs;
-
-        int cursor = 0;
-        char key[64];
-        char value[512];
-        while (sfz_next_opcode(start, &cursor, key, sizeof(key), value, sizeof(value))) {
-#ifdef DEBUG
-            logger_log("SFZ Parse: key='%s', value='%s'\n", key, value);
-#endif
-            trim_inplace(key);
-            trim_inplace(value);
-            if (!key[0] || !value[0]) continue;
-            if (region) {
-                region_add_opcode(region, key, value);
-            }
-
-            if (strcmp(key, "sample") == 0) {
-                if (region) {
-                    sfz_load_region_sample(inst, region, path, value);
-                }
-                continue;
-            }
-
-            int midi_key = -1;
-            int parsed_key = parse_midi_key_value(value, &midi_key);
-            int midi_key_low = -1;
-            int midi_key_high = -1;
-            int parsed_range = parse_midi_key_range(value, &midi_key_low, &midi_key_high);
-
-            if (defs) {
-                if (strcmp(key, "lokey") == 0 && parsed_key) {
-                    defs->lokey = midi_key;
-                } else if (strcmp(key, "hikey") == 0 && parsed_key) {
-                    defs->hikey = midi_key;
-                } else if (strcmp(key, "key") == 0 && parsed_range) {
-                    defs->lokey = midi_key_low;
-                    defs->hikey = midi_key_high;
-                    defs->pitch_keycenter = (midi_key_low + midi_key_high) / 2;
-                } else if (strcmp(key, "lovel") == 0) {
-                    defs->lovel = atoi(value);
-                } else if (strcmp(key, "hivel") == 0) {
-                    defs->hivel = atoi(value);
-                } else if (strcmp(key, "xfin_lovel") == 0) {
-                    defs->xfin_lovel = atoi(value);
-                } else if (strcmp(key, "xfin_hivel") == 0) {
-                    defs->xfin_hivel = atoi(value);
-                } else if (strcmp(key, "xfout_lovel") == 0) {
-                    defs->xfout_lovel = atoi(value);
-                } else if (strcmp(key, "xfout_hivel") == 0) {
-                    defs->xfout_hivel = atoi(value);
-                } else if ((strcmp(key, "pitch_keycenter") == 0 || strcmp(key, "key") == 0) && parsed_key) {
-                    defs->pitch_keycenter = midi_key;
-                    if (strcmp(key, "key") == 0) {
-                        defs->lokey = midi_key;
-                        defs->hikey = midi_key;
-                    }
-                } else if (strcmp(key, "pan") == 0) {
-                    defs->pan = atoi(value);
-                } else if (strcmp(key, "volume") == 0) {
-                    defs->volume_millibels = (int)lrintf((float)atof(value) * 1000.0f);
-                } else if (strcmp(key, "offset") == 0) {
-                    defs->offset = atoi(value);
-                } else if (strcmp(key, "end") == 0) {
-                    defs->end = atoi(value);
-                } else if (strcmp(key, "group") == 0) {
-                    defs->group = atoi(value);
-                } else if (strcmp(key, "off_by") == 0) {
-                    defs->off_by = atoi(value);
-                } else if (strcmp(key, "trigger") == 0) {
-                    defs->trigger = parse_trigger_value(value);
-                } else if (strcmp(key, "loop_mode") == 0) {
-                    defs->loop_mode = parse_loop_mode_value(value);
-                } else if (strcmp(key, "loop_start") == 0) {
-                    defs->loop_start = atoi(value);
-                } else if (strcmp(key, "loop_end") == 0) {
-                    defs->loop_end = atoi(value);
-                } else if (strcmp(key, "ampeg_attack") == 0) {
-                    defs->ampeg_attack_millis = (int)lrintf((float)atof(value) * 1000.0f);
-                } else if (strcmp(key, "ampeg_decay") == 0) {
-                    defs->ampeg_decay_millis = (int)lrintf((float)atof(value) * 1000.0f);
-                } else if (strcmp(key, "ampeg_sustain") == 0) {
-                    defs->ampeg_sustain_permille = (int)lrintf((float)atof(value) * 10.0f);
-                } else if (strcmp(key, "ampeg_release") == 0) {
-                    defs->ampeg_release_millis = (int)lrintf((float)atof(value) * 1000.0f);
-                } else if (strcmp(key, "ampeg_veltrack") == 0) {
-                    defs->ampeg_veltrack = (float)atof(value);
-                } else if (strcmp(key, "ampeg_attack_veltrack") == 0) {
-                    defs->ampeg_attack_veltrack = (float)atof(value);
-                } else if (strcmp(key, "ampeg_decay_veltrack") == 0) {
-                    defs->ampeg_decay_veltrack = (float)atof(value);
-                } else if (strcmp(key, "ampeg_sustain_veltrack") == 0) {
-                    defs->ampeg_sustain_veltrack = (float)atof(value);
-                } else if (strcmp(key, "ampeg_release_veltrack") == 0) {
-                    defs->ampeg_release_veltrack = (float)atof(value);
-                } else if (strcmp(key, "fil_type") == 0) {
-                    defs->filter_type = parse_filter_type_value(value);
-                } else if (strcmp(key, "cutoff") == 0) {
-                    defs->cutoff_hz = atoi(value);
-                } else if (strcmp(key, "fil_veltrack") == 0) {
-                    defs->fil_veltrack = (float)atof(value);
-                } else if (strcmp(key, "resonance") == 0) {
-                    defs->resonance_cents = (int)lrintf((float)atof(value) * 100.0f);
-                } else if (strcmp(key, "transpose") == 0) {
-                    defs->transpose = atoi(value);
-                } else if (strcmp(key, "tune") == 0) {
-                    defs->tune_cents = atoi(value);
-                } else if (strcmp(key, "attenuation") == 0) {
-                    defs->attenuation = atoi(value);
-                } else if (strcmp(key, "gain_veltrack") == 0) {
-                    defs->gain_veltrack = (float)atof(value);
-                }
-                continue;
-            }
-
-            if (!region) continue;
-            if (strcmp(key, "lokey") == 0 && parsed_key) {
-                region->lokey = midi_key;
-            } else if (strcmp(key, "hikey") == 0 && parsed_key) {
-                region->hikey = midi_key;
-            } else if (strcmp(key, "key") == 0 && parsed_range) {
-                region->lokey = midi_key_low;
-                region->hikey = midi_key_high;
-                region->pitch_keycenter = (midi_key_low + midi_key_high) / 2;
-            } else if (strcmp(key, "lovel") == 0) {
-                region->lovel = atoi(value);
-            } else if (strcmp(key, "hivel") == 0) {
-                region->hivel = atoi(value);
-            } else if (strcmp(key, "xfin_lovel") == 0) {
-                region->xfin_lovel = atoi(value);
-            } else if (strcmp(key, "xfin_hivel") == 0) {
-                region->xfin_hivel = atoi(value);
-            } else if (strcmp(key, "xfout_lovel") == 0) {
-                region->xfout_lovel = atoi(value);
-            } else if (strcmp(key, "xfout_hivel") == 0) {
-                region->xfout_hivel = atoi(value);
-            } else if (strcmp(key, "pitch_keycenter") == 0 && parsed_key) {
-                region->pitch_keycenter = midi_key;
-            } else if (strcmp(key, "key") == 0 && parsed_key) {
-                region->lokey = midi_key;
-                region->hikey = midi_key;
-                region->pitch_keycenter = midi_key;
-            } else if (strcmp(key, "pan") == 0) {
-                region->pan = atoi(value);
-                pan_to_gains(region->pan, &region->pan_l_gain, &region->pan_r_gain);
-            } else if (strcmp(key, "volume") == 0) {
-                region->volume_db = (float)atof(value);
-                region->volume_gain = db_to_gain(region->volume_db);
-            } else if (strcmp(key, "offset") == 0) {
-                region->offset = atoi(value);
-            } else if (strcmp(key, "end") == 0) {
-                region->end = atoi(value);
-            } else if (strcmp(key, "group") == 0) {
-                region->group = atoi(value);
-            } else if (strcmp(key, "off_by") == 0) {
-                region->off_by = atoi(value);
-            } else if (strcmp(key, "trigger") == 0) {
-                region->trigger = parse_trigger_value(value);
-            } else if (strcmp(key, "loop_mode") == 0) {
-                region->loop_mode = parse_loop_mode_value(value);
-            } else if (strcmp(key, "loop_start") == 0) {
-                region->loop_start = atoi(value);
-            } else if (strcmp(key, "loop_end") == 0) {
-                region->loop_end = atoi(value);
-            } else if (strcmp(key, "ampeg_attack") == 0) {
-                region->ampeg_attack = (float)atof(value);
-            } else if (strcmp(key, "ampeg_decay") == 0) {
-                region->ampeg_decay = (float)atof(value);
-            } else if (strcmp(key, "ampeg_sustain") == 0) {
-                region->ampeg_sustain = (float)atof(value) * 0.01f;
-            } else if (strcmp(key, "ampeg_release") == 0) {
-                region->ampeg_release = (float)atof(value);
-            } else if (strcmp(key, "ampeg_veltrack") == 0) {
-                region->ampeg_veltrack = (float)atof(value);
-            } else if (strcmp(key, "ampeg_attack_veltrack") == 0) {
-                region->ampeg_attack_veltrack = (float)atof(value);
-            } else if (strcmp(key, "ampeg_decay_veltrack") == 0) {
-                region->ampeg_decay_veltrack = (float)atof(value);
-            } else if (strcmp(key, "ampeg_sustain_veltrack") == 0) {
-                region->ampeg_sustain_veltrack = (float)atof(value);
-            } else if (strcmp(key, "ampeg_release_veltrack") == 0) {
-                region->ampeg_release_veltrack = (float)atof(value);
-            } else if (strcmp(key, "fil_type") == 0) {
-                region->filter_type = parse_filter_type_value(value);
-            } else if (strcmp(key, "cutoff") == 0) {
-                region->cutoff_hz = (float)atof(value);
-            } else if (strcmp(key, "fil_veltrack") == 0) {
-                region->fil_veltrack = (float)atof(value);
-            } else if (strcmp(key, "resonance") == 0) {
-                region->resonance_q = 0.707f + ((float)atof(value) * 0.01f);
-            } else if (strcmp(key, "transpose") == 0) {
-                region->transpose = atoi(value);
-            } else if (strcmp(key, "tune") == 0) {
-                region->tune_cents = atoi(value);
-                region->tune_multiplier = powf(2.0f, ((float)region->transpose + ((float)region->tune_cents * 0.01f)) * (1.0f / 12.0f));
-            } else if (strcmp(key, "attenuation") == 0) {
-                region->attenuation = atoi(value);
-                region->attenuation_gain = centibels_to_gain(region->attenuation);
-            } else if (strcmp(key, "gain_veltrack") == 0) {
-                region->gain_veltrack = (float)atof(value);
-            }
+        char* seg = expanded;
+        while (*seg) {
+            char* next = strchr(seg + 1, '<');
+            if (next) *next = '\0';
+            sfz_parse_segment(inst, seg, global_defs, master_defs, group_defs);
+            if (!next) break;
+            *next = '<';
+            seg = next;
         }
     }
+    free(line);
+    free(expanded);
     fclose(f);
 
     // Log attenuation values for debugging

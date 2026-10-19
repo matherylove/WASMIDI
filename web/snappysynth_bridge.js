@@ -687,6 +687,134 @@
         }
     }
 
+    // SFZ libraries come as a folder: the .sfz text plus the samples it names
+    // (HANDOFF sec. 91). The worker has no AudioContext, so FLAC/Ogg/Opus
+    // samples are decoded here and handed over as WAV under the same name.
+    function folderEntries(files) {
+        const list = [];
+        for (const item of Array.from(files || [])) {
+            const file = item && item.file ? item.file : item;
+            if (!file) continue;
+            const path = String(item.path || file.webkitRelativePath || file.name || "").replace(/\\/g, "/").replace(/^\/+/, "");
+            if (path) list.push({ path, file });
+        }
+        return list;
+    }
+
+    function sfzChoices(entries) {
+        return entries
+            .filter(e => /\.sfz$/i.test(e.path))
+            .map(e => e.path)
+            .sort((a, b) => (a.split("/").length - b.split("/").length) || a.localeCompare(b));
+    }
+
+    function nativeRate(bytes, ext) {
+        if (ext === "flac" && bytes.length > 21 && bytes[0] === 0x66)
+            return (bytes[18] << 12) | (bytes[19] << 4) | (bytes[20] >> 4);
+        if (ext === "opus") return 48000;
+        for (let i = 0; i + 16 < bytes.length; ++i) {
+            if (bytes[i] === 1 && bytes[i + 1] === 0x76 && bytes[i + 2] === 0x6f && bytes[i + 3] === 0x72 &&
+                bytes[i + 4] === 0x62 && bytes[i + 5] === 0x69 && bytes[i + 6] === 0x73)
+                return bytes[i + 12] | (bytes[i + 13] << 8) | (bytes[i + 14] << 16) | (bytes[i + 15] << 24);
+        }
+        return 48000;
+    }
+
+    function wavBlob(audio) {
+        const channels = Math.min(2, audio.numberOfChannels);
+        const frames = audio.length;
+        const out = new DataView(new ArrayBuffer(44 + frames * channels * 2));
+        const tag = (o, t) => { for (let i = 0; i < 4; ++i) out.setUint8(o + i, t.charCodeAt(i)); };
+        tag(0, "RIFF"); out.setUint32(4, 36 + frames * channels * 2, true); tag(8, "WAVE");
+        tag(12, "fmt "); out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, channels, true);
+        out.setUint32(24, audio.sampleRate, true); out.setUint32(28, audio.sampleRate * channels * 2, true);
+        out.setUint16(32, channels * 2, true); out.setUint16(34, 16, true);
+        tag(36, "data"); out.setUint32(40, frames * channels * 2, true);
+        const data = [];
+        for (let c = 0; c < channels; ++c) data.push(audio.getChannelData(c));
+        let o = 44;
+        for (let i = 0; i < frames; ++i) {
+            for (let c = 0; c < channels; ++c, o += 2) {
+                const v = Math.max(-1, Math.min(1, data[c][i]));
+                out.setInt16(o, Math.round(v * 32767), true);
+            }
+        }
+        return new Blob([out.buffer], { type: "audio/wav" });
+    }
+
+    async function decodeToWav(file, ext) {
+        const buffer = await file.arrayBuffer();
+        const rate = Math.max(3000, Math.min(768000, nativeRate(new Uint8Array(buffer, 0, Math.min(256, buffer.byteLength)), ext) || 48000));
+        const ctx = new OfflineAudioContext(2, 1, rate);
+        return wavBlob(await ctx.decodeAudioData(buffer));
+    }
+
+    async function loadSoundfontFolder(files, sfzPath) {
+        const entries = folderEntries(files);
+        const choices = sfzChoices(entries);
+        const root = sfzPath && choices.includes(sfzPath) ? sfzPath : choices[0];
+        if (!root) {
+            updateStatus("No .sfz file in that folder");
+            return false;
+        }
+        state.soundfontName = root.split("/").pop();
+        const addingLayer = state.soundfontLoaded;
+        updateStatus(addingLayer ? "Adding SFZ layer…" : "Loading SFZ…");
+        try {
+            const backend = ensureBackend();
+            const compressed = entries.filter(e => /\.(flac|ogg|oga|opus)$/i.test(e.path));
+            let done = 0;
+            for (const entry of compressed) {
+                const ext = entry.path.split(".").pop().toLowerCase();
+                try {
+                    entry.file = await decodeToWav(entry.file, ext);
+                } catch (error) {
+                    console.warn("[WASMIDI] Could not decode sample", entry.path, error);
+                }
+                if (++done % 16 === 0 || done === compressed.length)
+                    updateStatus("Decoding SFZ samples " + done + "/" + compressed.length + "…");
+            }
+            await backend;
+            const answered = new Promise(resolve => soundfontWaiters.push(resolve));
+            worker.postMessage({
+                type: "loadSoundfont",
+                folder: entries.map(e => ({ path: e.path, file: e.file })),
+                root,
+                name: state.soundfontName
+            });
+            return await answered;
+        } catch (error) {
+            updateStatus(error && error.message ? error.message : "Could not load the SFZ folder");
+            console.error("[WASMIDI] SnappySynthV2 SFZ load failed:", error);
+            return false;
+        }
+    }
+
+    let folderInput = null;
+
+    function openSoundfontFolder() {
+        if (!folderInput) {
+            folderInput = document.createElement("input");
+            folderInput.type = "file";
+            folderInput.webkitdirectory = true;
+            folderInput.multiple = true;
+            folderInput.style.position = "fixed";
+            folderInput.style.left = "-10000px";
+            folderInput.style.top = "-10000px";
+            folderInput.style.opacity = "0";
+            document.body.appendChild(folderInput);
+            folderInput.onchange = async () => {
+                const files = folderInput.files ? Array.from(folderInput.files) : [];
+                folderInput.value = null;
+                if (files.length) await loadSoundfontFolder(files);
+            };
+        }
+        folderInput.click();
+        ensureBackend().catch(error => {
+            console.warn("[WASMIDI] SnappySynth backend not ready:", error);
+        });
+    }
+
     function getInput() {
         if (input)
             return input;
@@ -1238,7 +1366,10 @@
         setLocalVelocityFloor,
         ensureBackend,
         loadSoundfontFile,
+        loadSoundfontFolder,
+        sfzChoices: files => sfzChoices(folderEntries(files)),
         openSoundfont,
+        openSoundfontFolder,
         play,
         pause,
         stop,

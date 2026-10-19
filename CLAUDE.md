@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§89). Este archivo resume el estado al cierre de la rev. 93 y dice
+`HANDOFF.md` (§1-§91). Este archivo resume el estado al cierre de la rev. 94 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 93)
+## Estado actual (rev. 94)
 
 Rendimiento medido por el usuario:
 
@@ -266,6 +266,11 @@ Rendimiento medido por el usuario:
   → 0 cuadros, adelanto mínimo -0,17 → 1,78 s, teclado en 128 s 11 → 44/s; prellenado de 1024 MB
   (hasta 278 s) en 17-20 s. The Nuker 3 entero: 4173 MiB en 95 s con 3 helpers (no entró en el tope
   de 4 GiB del contenedor y quedó como look-ahead).
+
+- Rev. 94 (HANDOFF §91): mockup de la GUI nueva aprobado (https://claude.ai/artifact/6Rzqy1QJQrBaJq39comYMd,
+  kit de dekx.css, fondo neural de `dekx.js`; falta cablearlo). WasmiSynth carga una carpeta SFZ
+  (botón "SFZ", soltar carpeta en Audio): rutas de Windows sin mayúsculas, `#define`/`#include`, sample
+  en `<group>`, WAV 8/24/32/float, FLAC/Ogg/Opus decodificados en la página. `tools/sfz_folder_check.c`.
 
 Mecanismos activos y cómo desactivarlos:
 
