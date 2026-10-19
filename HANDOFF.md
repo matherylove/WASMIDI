@@ -5773,3 +5773,46 @@ el synth con 12288 voces satura los 4 hilos).
   ~1,3 GB.
 - Propuesta: armar ese flujo en la carga con los Workers que ya cargan en paralelo y que roll,
   teclado y feed del synth lean de él, en lugar de decodificar las 9679 pistas en vivo con helpers.
+
+## 87. Revisión 91 — El flujo visual se guarda en pedazos
+
+**Pedido:** seguir con lo que atrasa al roll en 127-130 s de The Nuker 3 después de la rev. 90.
+
+**Causa:** probé en Chromium (visual-bench, 118-137 s, 3 helpers) tramos visuales más chicos (2 M
+palabras: 283 cuadros atrasados, igual que la rev. 90) y más tramos en vuelo (8: 406; 2 M palabras
+y 12 en vuelo: 813). Más trabajo en vuelo empeora: los helpers no son el límite. Las líneas
+`[WASMIDI visual]` mostraban anexar tramos en el Worker del parser hasta 1,1 s por segundo
+(3 tramos, 245 MiB). El flujo era un solo vector de palabras: anexar un tramo lo hacía crecer
+(copiar todo el flujo al pasar la capacidad) y recortar borraba el frente (mover el resto,
+cientos de MB). Lo mismo pasaba en la copia del flujo del Worker del teclado.
+
+**Cambios:**
+
+- `BpfaMidiStore`: el flujo visual es una lista de pedazos (`VisualPiece`: posición absoluta
+  de su primera palabra, palabras y pistas), uno por tramo anexado. Anexar crea un pedazo del
+  tamaño justo y recortar suelta pedazos enteros que todos los lectores pasaron; nada se mueve.
+  Las posiciones siguen siendo absolutas (`renderPos_`, `livePos_`, `visBase_`, ahora con
+  `visEnd_`), y `visualPieceAt` / `visualLowerBound` reemplazan el índice y la búsqueda por
+  tick en el vector. El barrido del roll, el teclado (bucle sin llamadas de la rev. 87), las
+  densidades y la exportación al Worker del teclado recorren los pedazos en orden.
+
+**Medición (Chromium del contenedor, `browser_bench.py visual "The Nuker 3 Ultimate F4.mid" 118 20
+--query=helpers=3&visualdebug=1`):**
+
+| | rev. 90 | rev. 91 |
+|---|---|---|
+| cuadros con el roll atrasado (118-137 s) | 293 | 200 |
+| adelanto mínimo del roll | -1,21 s | -0,99 s |
+| teclado | 40,0/s | 47,0/s |
+| peor segundo de anexar | 389 ms (1 tramo) | 149 ms (4 tramos) |
+
+El arranque en 118 s se pone al día un segundo antes (atrasado hasta 119 s en vez de 120 s) y en
+128-129 s quedan 102 cuadros atrasados. En el contenedor de 4 hilos ese tramo usa toda la CPU
+(3 helpers, Worker del parser, Worker del teclado y la página).
+
+**Verificación:** `tools/host_bench/visual_check.cpp` (barrido y teclado desde el flujo contra el
+merge, también con tramos de helper y con el teclado en su Worker): `many9679.mid` 0-20 s y
+`nuker4_553.mid` 0-8 s (1,23 M notas, con recortes), todo IDENTICAL. `tools/local_build.sh`
+completo, con la prueba del contrato del parser.
+
+**No verificado / pendiente:** en las PCs del usuario y en WASMIDI con el synth.

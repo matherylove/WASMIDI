@@ -507,9 +507,15 @@ private:
     bool visualAutoDecode_ = true;
     bool visValid_ = false;
     bool visDone_ = false;
-    std::vector<EventWord> visEvents_;
-    std::vector<uint16_t> visTracks_;
-    uint64_t visBase_ = 0;          // absolute index of visEvents_[0]
+    // The stream in appended pieces: appending never moves the words held and trimming drops
+    // whole pieces (HANDOFF sec. 87).
+    struct VisualPiece { uint64_t base = 0; std::vector<EventWord> events; std::vector<uint16_t> tracks; };
+    std::deque<VisualPiece> visPieces_;
+    uint64_t visBase_ = 0;          // absolute index of the first word held
+    uint64_t visEnd_ = 0;           // absolute index past the last word held
+    std::size_t visualPieceAt(uint64_t position) const;
+    uint64_t visualLowerBound(uint32_t tick) const;
+    void visualClearWords(uint64_t base);
     uint32_t visStart_ = 0;         // the stream holds every event in [visStart_, visHead_)
     uint32_t visHead_ = 0;
     MergeCursor visCursor_;
