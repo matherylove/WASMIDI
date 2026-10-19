@@ -549,6 +549,42 @@ Item {
 
         RowLayout {
             Layout.fillWidth: true
+            spacing: 4
+            Text { text: "Roll cache"; color: "#6c627d"; font.pixelSize: 8 }
+            Item { Layout.fillWidth: true }
+            ConfigField {
+                Layout.preferredWidth: 44
+                visible: root.mainWindow.rollMode !== 2
+                minValue: 64
+                maxValue: 16384
+                text: String(root.mainWindow.rollLookAheadMB)
+                onEditingFinished: {
+                    var n = parseInt(text)
+                    if (isFinite(n))
+                        root.mainWindow.rollLookAheadMB = n
+                    text = String(root.mainWindow.rollLookAheadMB)
+                }
+                ToolTip.visible: hovered
+                ToolTip.text: "RAM for the notes decoded ahead of the roll, in MB. Applies to the next MIDI."
+            }
+            Text { visible: root.mainWindow.rollMode !== 2; text: "MB"; color: "#6c627d"; font.pixelSize: 8 }
+            FlatButton {
+                Layout.preferredWidth: 72
+                implicitHeight: 21
+                text: root.mainWindow.rollMode === 2 ? "Full song" : "Look-ahead"
+                normalColor: root.mainWindow.rollMode === 2 ? "#2a194b" : "#110e20"
+                borderColor: root.mainWindow.rollMode === 2 ? "#6b48a8" : "#352550"
+                textColor: root.mainWindow.rollMode === 2 ? "#c4b5fd" : "#a99bc4"
+                onClicked: root.mainWindow.rollMode = root.mainWindow.rollMode === 2 ? 1 : 2
+                ToolTip.visible: hovered
+                ToolTip.text: root.mainWindow.rollMode === 2
+                    ? "Full song: the whole roll is decoded while the MIDI loads and kept, so seeks and dense parts never wait. Applies to the next MIDI."
+                    : "Look-ahead: the roll is decoded ahead up to the RAM limit, filled while the MIDI loads. Applies to the next MIDI."
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
             SectionLabel { text: "COLORS" }
             Item { Layout.fillWidth: true }
             FlatButton {

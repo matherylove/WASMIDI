@@ -788,8 +788,10 @@ async function requestSharpRenderer(message) {
         sharpRenderSafeThrough = sharpRenderCompletedTarget;
         sharpRenderReady = true;
         Module._wmp_reset_render_cursor_js(startTick, perTrack ? 1 : 0);
-        liveRestartStream(startTick);
-        visualRestart(Module);
+        // A start inside the held stream keeps it and the spans in flight (HANDOFF sec. 89).
+        const kept = typeof Module._wmp_visual_kept_js === "function" && Module._wmp_visual_kept_js() === 1;
+        if (!kept) visualRestart(Module);
+        liveRestartStream(Module);
         postMessage({
             type: "sharp-render-reset",
             generation,
@@ -1370,9 +1372,28 @@ let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read t
 // target, with the old 32 M words.
 let visualAhead = true;
 let visualPlanWords = 32 * 1048576;
-function visualPlanDefault() {
+// Roll modes (HANDOFF sec. 89), from the parse message or ?rollmode=: 1 look-ahead (a RAM limit,
+// lookAheadMB or ?lookahead=MB, decoded before the MIDI opens), 2 the whole song decoded at load
+// and kept (seeks reuse it), 0 the rev. 92 run-ahead with no prefill.
+let rollMode = 0;
+const VISUAL_BYTES_PER_WORD = 1.5;
+// The keyboard Worker gets each piece when it is this many words from it.
+const LIVE_FORWARD_WORDS = 32 * 1048576;
+function rollModeFor(message) {
+    const forced = pageOverride("rollmode");
+    const mode = forced !== null ? forced : Number(message.rollMode);
+    return mode === 1 || mode === 2 ? mode : 0;
+}
+function visualPlanDefault(message) {
     const forced = pageOverride("visualplan");
     if (forced) return Math.max(1, forced) * 1048576;
+    if (rollMode === 2) return 1e10;
+    if (rollMode === 1) {
+        const forcedMB = pageOverride("lookahead");
+        const mb = forcedMB !== null ? forcedMB : Number(message.lookAheadMB);
+        const limit = Number.isFinite(mb) && mb > 0 ? Math.min(16384, Math.max(64, mb)) : 1024;
+        return Math.round(limit * 1048576 / VISUAL_BYTES_PER_WORD);
+    }
     if (!visualAhead) return 32 * 1048576;
     const deviceGiB = Number(self.navigator && self.navigator.deviceMemory);
     const gib = Number.isFinite(deviceGiB) && deviceGiB > 0 ? deviceGiB : 8;
@@ -1441,10 +1462,9 @@ function visualPump(Module) {
         Module.HEAPU8.set(entry.result, ptr);
         if (!Module._wmp_visual_append_js(entry.result.length))
             throw new Error(parserErrorText(Module, "Could not append the visual span"));
-        if (liveKeys)
-            liveKeys.worker.postMessage({ type: "live-append", result: entry.result.buffer }, [entry.result.buffer]);
         appended = true;
     }
+    if (appended) liveFeedPump(Module);
     visualStats.appendMs += performance.now() - appendStart;
     jointPlan(Module);
     // Past the roll's target, while the synth feed runs, one helper stays free for it.
@@ -1477,6 +1497,79 @@ function visualPump(Module) {
 
 function visualQueueLimit(pool) {
     return pool.helpers.length + (visualSpanMax > VISUAL_SPAN_WORDS ? 1 : pool.helpers.length);
+}
+
+// Roll modes (HANDOFF sec. 89): before the MIDI opens, look-ahead decodes its plan from the start
+// and the whole-song mode decodes all of it. The whole song falls back to look-ahead when it does
+// not fit in the parser heap (16 GiB) or half the machine's RAM.
+async function visualPrefill(Module) {
+    if (typeof Module._wmp_visual_prefill_local_js !== "function") return;
+    const GiB = 1024 * 1024 * 1024;
+    const infoPtr = pointerToNumber(Module._wmp_document_info_js(), "document info");
+    const maxTick = infoPtr ? new Float64Array(Module.HEAPU8.buffer, infoPtr, 6)[0] : 0;
+    const deviceGiB = Number(self.navigator && self.navigator.deviceMemory);
+    const ram = (Number.isFinite(deviceGiB) && deviceGiB > 0 ? deviceGiB : 8) * GiB;
+    const used = typeof Module._wmp_heap_used_js === "function" ? Number(Module._wmp_heap_used_js()) : 0;
+    const budget = Math.max(64 * 1048576, Math.min(14.5 * GiB - (used || Module.HEAPU8.length), ram / 2));
+    let full = rollMode === 2;
+    if (!full) visualPlanWords = Math.min(visualPlanWords, Math.max(1048576, Math.floor(budget / VISUAL_BYTES_PER_WORD)));
+    Module._wmp_visual_keep_all_js(full ? 1 : 0);
+    Module._wmp_visual_plan_js(visualPlanWords);
+    Module._wmp_reset_render_cursor_js(0, 0);
+    const started = performance.now();
+    let shown = -1;
+    const report = () => {
+        const head = Number(Module._wmp_visual_head_js());
+        const songPart = maxTick > 0 ? head / maxTick : 1;
+        const fraction = full ? songPart : Math.max(songPart, Number(Module._wmp_visual_ahead_words_js()) / visualPlanWords);
+        const percent = Module._wmp_visual_done_js() ? 100 : Math.min(99, Math.floor(fraction * 100));
+        if (percent === shown) return;
+        shown = percent;
+        progress(94, (full ? "Decoding the whole roll " : "Prefilling the roll look-ahead ") + percent + "%");
+    };
+    const checkBudget = () => {
+        if (!full || Number(Module._wmp_visual_held_bytes_js()) <= budget) return;
+        // What is decoded becomes the look-ahead.
+        full = false;
+        rollMode = 1;
+        visualPlanWords = Math.max(1048576, Math.floor(budget / VISUAL_BYTES_PER_WORD));
+        Module._wmp_visual_keep_all_js(0);
+        Module._wmp_visual_plan_js(visualPlanWords);
+        console.warn("[WASMIDI roll] the whole song does not fit in " + (budget / GiB).toFixed(1) +
+            " GiB; using look-ahead");
+    };
+    report();
+    await feedStartPool().catch(() => {});
+    if (feedPool && feedPool.settled) {
+        await feedPool.settled;
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    if (feedPool && feedPool.ready) {
+        visualPump(Module);
+        while (visualPoolActive) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            report();
+            checkBudget();
+            const stopped = Module._wmp_visual_done_js() === 1 ||
+                sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, 1), "visual span end") <= visualPlanned;
+            if (stopped && !visualQueue.length) break;
+            visualPump(Module);
+        }
+    }
+    // Without helpers (raw source, few cores) this Worker decodes.
+    let yielded = performance.now();
+    while (!visualPoolActive && Module._wmp_visual_prefill_local_js(VISUAL_SPAN_WORDS)) {
+        checkBudget();
+        if (performance.now() - yielded > 100) {
+            report();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            yielded = performance.now();
+        }
+    }
+    console.info("[WASMIDI roll] " + (full ? "whole song" : "look-ahead") + " ready: " +
+        (Number(Module._wmp_visual_held_bytes_js()) / 1048576).toFixed(0) + " MiB, to " +
+        (Number(Module._wmp_tick_to_seconds_js(Number(Module._wmp_visual_head_js()))) || 0).toFixed(1) + " s, " +
+        ((performance.now() - started) / 1000).toFixed(1) + " s");
 }
 
 // ---- Joint spans (HANDOFF sec. 85) ----
@@ -1590,7 +1683,8 @@ function liveStart(Module) {
     if (!Module._wmp_live_image_js()) return;
     const image = copyWasmBytes(Module, Module._wmp_live_buffer_ptr_js(),
         sizeToNumber(Module._wmp_live_buffer_size_js(), "keyboard image size"));
-    if (!Module._wmp_live_stream_export_js()) return;
+    // The keyboard Worker starts with an empty stream and gets the pieces as it nears them.
+    if (!Module._wmp_live_forward_begin_js()) return;
     const stream = copyWasmBytes(Module, Module._wmp_live_buffer_ptr_js(),
         sizeToNumber(Module._wmp_live_buffer_size_js(), "visual stream size"));
     const url = new URL("midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
@@ -1605,14 +1699,30 @@ function liveStart(Module) {
     worker.onerror = event => liveFailed(keys, new Error((event && event.message) || "Keyboard Worker crashed"));
     worker.postMessage({
         type: "live-init", baseUrl: WASMIDI_MIDI_PARSER_BASE_URL, version: WASMIDI_MIDI_PARSER_BOOTSTRAP,
-        image: image.buffer, stream: stream.buffer, gen: liveStreamGen, plan: visualPlanWords
+        image: image.buffer, stream: stream.buffer, gen: liveStreamGen, plan: 2 * LIVE_FORWARD_WORDS
     }, [image.buffer, stream.buffer]);
+    liveFeedPump(Module);
 }
 
-function liveRestartStream(startTick) {
+// After a reset the keyboard Worker's stream restarts where forwarding does: the piece of the
+// start, or the start itself.
+function liveRestartStream(Module) {
     if (!liveKeys) return;
     ++liveStreamGen;
-    liveKeys.worker.postMessage({ type: "live-restart", startTick, gen: liveStreamGen });
+    liveKeys.worker.postMessage({
+        type: "live-restart", startTick: Number(Module._wmp_live_forward_tick_js()),
+        base: Number(Module._wmp_live_forward_base_js()), gen: liveStreamGen
+    });
+    liveFeedPump(Module);
+}
+
+function liveFeedPump(Module) {
+    if (!liveKeys) return;
+    while (Module._wmp_live_forward_js(LIVE_FORWARD_WORDS)) {
+        const piece = copyWasmBytes(Module, Module._wmp_live_buffer_ptr_js(),
+            sizeToNumber(Module._wmp_live_buffer_size_js(), "visual piece size"));
+        liveKeys.worker.postMessage({ type: "live-append", result: piece.buffer }, [piece.buffer]);
+    }
 }
 
 function liveForward(message) {
@@ -1652,6 +1762,7 @@ async function liveOnMessage(keys, m) {
         visualStats.keyMs += Number(m.ms) || 0;
         ++visualStats.keys;
         Module._wmp_live_external_position_js((m.gen >>> 0) === liveStreamGen ? Number(m.position) : -1);
+        liveFeedPump(Module);
         postMessage({
             type: "live-state",
             tick: m.tick,
@@ -1752,6 +1863,7 @@ async function feedStartPool() {
             image: copy.buffer, slabs, slabBytes
         }, [copy.buffer]);
     }
+    pool.settled = Promise.allSettled(inits);
     try {
         await Promise.all(inits);
         if (feedPool !== pool || pool.failed) return;
@@ -2067,8 +2179,9 @@ async function handleMessage(event) {
         if (typeof Module._wmp_set_raw_source_limit_js === "function")
             Module._wmp_set_raw_source_limit_js(rawLimit);
         visualStreamOn = pageOverride("visualstream") !== 0;
-        visualAhead = pageOverride("visualahead") !== 0;
-        visualPlanWords = visualPlanDefault();
+        rollMode = visualStreamOn ? rollModeFor(message) : 0;
+        visualAhead = rollMode !== 0 || pageOverride("visualahead") !== 0;
+        visualPlanWords = visualPlanDefault(message);
         // Running ahead, the visual head is far from the synth feed: joint spans would make the
         // feed chase it. ?jointdecode=1 keeps them.
         jointOn = pageOverride("jointdecode") === 1 || (!visualAhead && pageOverride("jointdecode") !== 0);
@@ -2091,6 +2204,9 @@ async function handleMessage(event) {
         // The BPFA store keeps its own copy of the source (raw or zstd) and never reads
         // the file after indexing: drop the contiguous JS copy (HANDOFF sec. 53).
         self.__wasmidiMidiParserWholeFile = null;
+
+        if (rollMode !== 0)
+            await visualPrefill(Module);
 
         self.__wasmidiMidiParserStage = "Packing mapped MIDI metadata";
         const packed = Module._wmp_pack();

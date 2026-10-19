@@ -85,8 +85,9 @@ async function feedMessage(m) {
 }
 const feedBase = { baseUrl: "", version: "" };
 
-// Keyboard Worker (HANDOFF sec. 83): keeps a copy of the visual stream and answers the
-// key-state requests; on a reset it asks the parser Worker for the rebuilt keys. Messages run
+// Keyboard Worker (HANDOFF sec. 83): holds the visual stream pieces the parser Worker forwards
+// as it nears them (HANDOFF sec. 89) and answers the key-state requests; on a reset it asks the
+// parser Worker for the rebuilt keys. Messages run
 // one at a time, a request waiting for its rebuild included.
 let liveChain = Promise.resolve();
 let liveRebuildWaiter = null;
@@ -129,7 +130,10 @@ async function liveHandle(m) {
         return;
     }
     if (m.type === "live-restart") {
-        Module._wmp_live_restart_js(Number(m.startTick) || 0);
+        if (m.base !== undefined && typeof Module._wmp_live_restart_at_js === "function")
+            Module._wmp_live_restart_at_js(Number(m.startTick) || 0, Number(m.base) || 0);
+        else
+            Module._wmp_live_restart_js(Number(m.startTick) || 0);
         liveGen = m.gen >>> 0;
         return;
     }

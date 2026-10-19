@@ -326,6 +326,9 @@ void BpfaMidiStore::clear()
     liveOnly_ = false;
     liveExternal_ = false;
     liveExternalPos_ = -1;
+    liveForwarding_ = false;
+    visualKeepAll_ = false;
+    visualKept_ = false;
     visValid_ = false;
     visDone_ = false;
     visualClearWords(0);
@@ -1832,12 +1835,31 @@ void BpfaMidiStore::resetRenderCursor(uint32_t startTick, bool perTrackColors)
     renderActiveColors_.fill(0);
     renderActiveIds_.fill(0);
     renderCursor_.valid = false;
+    visualKept_ = false;
     if (!valid_) return;
+    startTick = std::min(startTick, metadata_.maxTick);
     if (visualEnabled_) {
-        visualReset(std::min(startTick, metadata_.maxTick));
+        liveExternalPos_ = -1;
+        // The stream holds every word from visStart_ to visHead_: a start among them keeps it
+        // and the spans already planned (HANDOFF sec. 89).
+        if (visValid_ && startTick >= visStart_ && startTick < visHead_) {
+            renderPos_ = visualLowerBound(startTick);
+            visRenderAt_ = VisualCursor{};
+            liveOnStream_ = false;
+            liveSinceVisualReset_ = false;
+            visualKept_ = true;
+            if (renderPos_ < visEnd_) {
+                const VisualPiece& piece = visPieces_[visualPieceAt(renderPos_)];
+                liveForwardFrom(piece.base, std::min(startTick, piece.startTick));
+            } else {
+                liveForwardFrom(visEnd_, startTick);
+            }
+            return;
+        }
+        visualReset(startTick);
         return;
     }
-    mergeReset(renderCursor_, std::min(startTick, metadata_.maxTick), true);
+    mergeReset(renderCursor_, startTick, true);
 }
 
 bool BpfaMidiStore::buildRenderSweep(uint32_t endTick, std::size_t maxSourceEvents, std::vector<VisualNote>& appends,
@@ -1987,12 +2009,14 @@ void BpfaMidiStore::visualAddPiece(VisualPiece&& piece)
     if (!piece.words) return;
     piece.base = visEnd_;
     visEnd_ += piece.words;
+    visHeldBytes_ += piece.bytes.size() + piece.marks.size() * sizeof(VisualMark);
     visPieces_.push_back(std::move(piece));
 }
 
 void BpfaMidiStore::visualClearWords(uint64_t base)
 {
     std::deque<VisualPiece>().swap(visPieces_);
+    visHeldBytes_ = 0;
     visPopped_ = 0;
     visBase_ = visEnd_ = base;
     visRenderAt_ = VisualCursor{};
@@ -2172,6 +2196,7 @@ void BpfaMidiStore::visualReset(uint32_t startTick)
     renderPos_ = 0;
     liveOnStream_ = false;
     liveSinceVisualReset_ = false;
+    liveForwardFrom(0, startTick);
 }
 
 uint32_t BpfaMidiStore::visualSpanEnd(uint32_t startTick, uint64_t sourceEvents) const
@@ -2252,6 +2277,7 @@ void BpfaMidiStore::visualOrderRaw(std::vector<EventWord>& events, std::vector<u
 
 void BpfaMidiStore::visualAppend(VisualPiece&& piece, uint32_t endTick, bool anyLeft)
 {
+    piece.endTick = endTick;
     visualAddPiece(std::move(piece));
     visHead_ = std::max(visHead_, endTick);
     if (!anyLeft || endTick > metadata_.maxTick) {
@@ -2291,6 +2317,13 @@ void BpfaMidiStore::setVisualPlan(std::size_t planWords)
     visualPlanWords_ = std::max<std::size_t>(std::size_t(1) << 20, planWords);
 }
 
+bool BpfaMidiStore::decodeVisualAhead(std::size_t sourceEvents)
+{
+    if (!valid_ || !visValid_ || visDone_ || !visualRoomAhead()) return false;
+    const uint64_t head = visHead_;
+    return decodeVisualLocal(visualSpanEnd(visHead_, std::max<std::size_t>(1, sourceEvents))) && visHead_ > head;
+}
+
 bool BpfaMidiStore::visualRoomAhead() const
 {
     uint64_t from = liveOnStream_ ? std::min(livePos_, renderPos_) : renderPos_;
@@ -2303,6 +2336,7 @@ bool BpfaMidiStore::visualRoomAhead() const
 // stream grows past VisualRetainWords.
 void BpfaMidiStore::visualTrim()
 {
+    if (visualKeepAll_) return;
     uint64_t keep = liveOnly_ ? visEnd_ : renderPos_;
     if (liveExternal_) {
         // the keyboard Worker keeps its own copy of the stream
@@ -2318,8 +2352,10 @@ void BpfaMidiStore::visualTrim()
     const uint64_t retain = std::max<uint64_t>(VisualRetainWords, visualPlanWords_ + (uint64_t(16) << 20));
     if (reader > visBase_ && reader - visBase_ > retain) keep = std::max(keep, reader - retain);
     if (!liveOnly_) keep = std::min(keep, renderPos_);
+    if (liveForwarding_) keep = std::min(keep, liveFwdPos_);
     while (!visPieces_.empty() && visPieces_.front().base + visPieces_.front().words <= keep) {
         visStart_ = std::max(visStart_, visPieces_.front().lastTick + 1u);
+        visHeldBytes_ -= visPieces_.front().bytes.size() + visPieces_.front().marks.size() * sizeof(VisualMark);
         visPieces_.pop_front();
         ++visPopped_;
         visBase_ = visPieces_.empty() ? visEnd_ : visPieces_.front().base;
@@ -2503,7 +2539,11 @@ bool BpfaMidiStore::appendVisualResult(const uint8_t* data, std::size_t size)
     in.array(piece.bytes, std::size_t(byteCount));
     in.array(piece.marks, std::size_t(markCount));
     if (!in.ok) { error_ = "Truncated visual result"; return false; }
-    if (visDone_ || startTick != visHead_) { error_ = "Visual result out of order"; return false; }
+    // The keyboard Worker gets no piece for the spans with no words (liveForward).
+    if (visDone_ || startTick < visHead_ || (startTick > visHead_ && !liveOnly_)) {
+        error_ = "Visual result out of order";
+        return false;
+    }
     visualAppend(std::move(piece), endTick, anyLeft);
     return true;
 }
@@ -3350,15 +3390,82 @@ bool BpfaMidiStore::importVisualStream(const uint8_t* data, std::size_t size)
     if (!in.ok) { error_ = "Truncated visual stream"; return false; }
     visualReset(start);
     visualClearWords(base);
+    for (std::size_t i = 0; i < held.size(); ++i) held[i].endTick = i + 1 < held.size() ? held[i + 1].startTick : head;
     for (VisualPiece& piece : held) visualAddPiece(std::move(piece));
     visHead_ = head;
     visDone_ = done;
     return true;
 }
 
-void BpfaMidiStore::restartVisualStream(uint32_t startTick)
+void BpfaMidiStore::restartVisualStream(uint32_t startTick, uint64_t base)
 {
-    if (valid_) visualReset(std::min(startTick, metadata_.maxTick));
+    if (!valid_) return;
+    visualReset(std::min(startTick, metadata_.maxTick));
+    visualClearWords(base);
+}
+
+void BpfaMidiStore::liveForwardFrom(uint64_t position, uint32_t tick)
+{
+    liveFwdPos_ = liveFwdStart_ = position;
+    liveFwdHead_ = tick;
+}
+
+bool BpfaMidiStore::beginLiveForward(std::vector<uint8_t>& blob)
+{
+    blob.clear();
+    if (!valid_ || !visValid_) return false;
+    liveForwardFrom(visBase_, visStart_);
+    liveForwarding_ = true;
+    putPod(blob, VisualStreamMagic);
+    putPod(blob, visStart_);
+    putPod(blob, visStart_);
+    putPod(blob, uint32_t(0));
+    putPod(blob, visBase_);
+    putPod(blob, uint64_t(0));
+    return true;
+}
+
+// The next piece as a visual result (WVS2) once the keyboard Worker is within windowWords of
+// it, or, with every piece sent, the head (an empty result). False: nothing to send yet.
+bool BpfaMidiStore::liveForward(std::size_t windowWords, std::vector<uint8_t>& blob)
+{
+    blob.clear();
+    if (!valid_ || !visValid_ || !liveForwarding_ || liveFwdPos_ < visBase_) return false;
+    if (liveFwdPos_ < visEnd_) {
+        uint64_t reader = liveExternalPos_ >= 0 ? uint64_t(liveExternalPos_) : liveFwdStart_;
+        // Pieces far behind the sweep go anyway: the keyboard Worker caps what it holds.
+        if (renderPos_ > VisualRetainWords) reader = std::max(reader, renderPos_ - VisualRetainWords);
+        if (liveFwdPos_ >= reader + windowWords) return false;
+        const std::size_t index = visualPieceAt(liveFwdPos_);
+        const VisualPiece& piece = visPieces_[index];
+        const bool last = index + 1 == visPieces_.size() && visDone_;
+        putPod(blob, VisualResultMagic);
+        putPod(blob, piece.startTick);
+        putPod(blob, piece.endTick);
+        putPod(blob, uint32_t(last ? 0 : 1));
+        putPod(blob, piece.words);
+        putPod(blob, piece.lastTick);
+        putPod(blob, uint32_t(0));
+        putPod(blob, uint64_t(piece.bytes.size()));
+        putPod(blob, uint64_t(piece.marks.size()));
+        putArray(blob, piece.bytes.data(), piece.bytes.size());
+        putArray(blob, piece.marks.data(), piece.marks.size());
+        liveFwdPos_ = piece.base + piece.words;
+        liveFwdHead_ = last ? visHead_ : std::max(liveFwdHead_, piece.endTick);
+        return true;
+    }
+    if (liveFwdHead_ >= visHead_) return false;
+    putPod(blob, VisualResultMagic);
+    putPod(blob, liveFwdHead_);
+    putPod(blob, visHead_);
+    putPod(blob, uint32_t(visDone_ ? 0 : 1));
+    putPod(blob, uint64_t(0));
+    putPod(blob, liveFwdHead_);
+    putPod(blob, uint32_t(0));
+    putPod(blob, uint64_t(0));
+    putPod(blob, uint64_t(0));
+    liveFwdHead_ = visHead_;
+    return true;
 }
 
 bool BpfaMidiStore::exportLiveRebuild(double tick, double npsStartTick, double ccStartTick, bool density,
@@ -3475,6 +3582,7 @@ void BpfaMidiStore::setLiveExternal(bool external)
 {
     liveExternal_ = external;
     liveExternalPos_ = -1;
+    if (!external) liveForwarding_ = false;
     liveBeginReset();
     liveCursorValid_ = false;
     liveOnStream_ = false;
