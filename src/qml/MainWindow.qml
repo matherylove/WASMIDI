@@ -21,11 +21,21 @@ ApplicationWindow {
     Behavior on uiAccent { ColorAnimation { duration: 600 } }
     Binding { target: Dk; property: "accent"; value: window.uiAccent }
 
-    // Phone: a portrait window. The roll runs bottom to top over a keyboard laid
+    // Phone: a portrait window. Notes fall onto a keyboard laid
     // across the screen, and the panel opens one tab at a time (HANDOFF sec. 96).
     readonly property bool phone: width < height && width < 760
+    // Compact: a short or narrow landscape window (a phone on its side) keeps the
+    // horizontal roll with the phone header, panel and transport (HANDOFF sec. 97).
+    readonly property bool compact: !phone && (height < 540 || width < 860)
+    readonly property bool mobileUi: phone || compact
     property string phoneTab: ""
-    onPhoneChanged: phoneTab = ""
+    onMobileUiChanged: phoneTab = ""
+    readonly property var phoneTabs: [
+        { key: "song", label: "Song", glyph: Glyphs.song },
+        { key: "colors", label: "Colors", glyph: Glyphs.palette },
+        { key: "synth", label: "Synth", glyph: Glyphs.speaker },
+        { key: "view", label: "View", glyph: Glyphs.gear }
+    ]
 
     PlayerController {
         id: mainWindow
@@ -71,7 +81,7 @@ ApplicationWindow {
 
             // Header: LCD and transport.
             RowLayout {
-                visible: !window.phone
+                visible: !window.mobileUi
                 Layout.fillWidth: true
                 Layout.topMargin: 6
                 Layout.bottomMargin: 6
@@ -292,7 +302,7 @@ ApplicationWindow {
 
             // Phone header: clock and the three live counters.
             RowLayout {
-                visible: window.phone
+                visible: window.mobileUi
                 Layout.fillWidth: true
                 Layout.topMargin: 4
                 Layout.bottomMargin: 4
@@ -393,7 +403,7 @@ ApplicationWindow {
 
                         // Phone panel: the tab's groups over the lower part of the roll.
                         Rectangle {
-                            visible: window.phone && window.phoneTab !== ""
+                            visible: window.mobileUi && window.phoneTab !== ""
                             x: 0
                             width: parent.width
                             height: Math.min(roll.height, Math.max(phoneDock.implicitHeight + 16,
@@ -428,14 +438,23 @@ ApplicationWindow {
                                     }
                                 }
 
-                                Dock {
-                                    id: phoneDock
+                                Flickable {
+                                    id: phoneFlick
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    section: window.phoneTab
-                                    mainWindow: mainWindow
-                                    onAdvancedRequested: advancedDialog.open()
-                                    onColorsRequested: colorsDialog.open()
+                                    clip: true
+                                    contentWidth: width
+                                    contentHeight: phoneDock.height
+                                    boundsBehavior: Flickable.StopAtBounds
+                                    Dock {
+                                        id: phoneDock
+                                        width: phoneFlick.width
+                                        height: Math.max(phoneFlick.height, implicitHeight)
+                                        section: window.phoneTab
+                                        mainWindow: mainWindow
+                                        onAdvancedRequested: advancedDialog.open()
+                                        onColorsRequested: colorsDialog.open()
+                                    }
                                 }
                             }
                         }
@@ -444,7 +463,7 @@ ApplicationWindow {
 
                 Dock {
                     id: dock
-                    visible: !window.phone
+                    visible: !window.mobileUi
                     Layout.preferredWidth: 304
                     Layout.fillHeight: true
                     mainWindow: mainWindow
@@ -455,12 +474,13 @@ ApplicationWindow {
 
             // Phone transport: position, buttons and the panel tabs.
             ColumnLayout {
-                visible: window.phone
+                visible: window.mobileUi
                 Layout.fillWidth: true
-                Layout.topMargin: 6
+                Layout.topMargin: window.compact ? 4 : 6
                 spacing: 6
 
                 DkSlider {
+                    visible: window.phone
                     Layout.fillWidth: true
                     Layout.leftMargin: 4
                     Layout.rightMargin: 4
@@ -483,7 +503,7 @@ ApplicationWindow {
                         iconRects: Glyphs.folder
                         onClicked: mainWindow.openMidiPicker()
                     }
-                    Item { Layout.fillWidth: true }
+                    Item { visible: window.phone; Layout.fillWidth: true }
                     DkButton {
                         implicitWidth: 48
                         implicitHeight: 44
@@ -507,7 +527,17 @@ ApplicationWindow {
                         enabled: mainWindow.hasMidi
                         onClicked: mainWindow.pause()
                     }
-                    Item { Layout.fillWidth: true }
+                    Item { visible: window.phone; Layout.fillWidth: true }
+                    DkSlider {
+                        visible: window.compact
+                        Layout.fillWidth: true
+                        accent: Dk.accentLight
+                        from: 0
+                        to: Math.max(0.001, mainWindow.duration)
+                        value: mainWindow.currentTime
+                        enabled: mainWindow.hasMidi
+                        onMoved: mainWindow.seek(value)
+                    }
                     DkButton {
                         implicitWidth: 64
                         implicitHeight: 44
@@ -517,18 +547,25 @@ ApplicationWindow {
                         on: window.phoneTab === "view"
                         onClicked: window.phoneTab = window.phoneTab === "view" ? "" : "view"
                     }
+                    Repeater {
+                        model: window.compact ? window.phoneTabs : []
+                        DkButton {
+                            required property var modelData
+                            implicitWidth: 44
+                            implicitHeight: 44
+                            iconRects: modelData.glyph
+                            on: window.phoneTab === modelData.key
+                            onClicked: window.phoneTab = on ? "" : modelData.key
+                        }
+                    }
                 }
 
                 RowLayout {
+                    visible: window.phone
                     Layout.fillWidth: true
                     spacing: 3
                     Repeater {
-                        model: [
-                            { key: "song", label: "Song", glyph: Glyphs.song },
-                            { key: "colors", label: "Colors", glyph: Glyphs.palette },
-                            { key: "synth", label: "Synth", glyph: Glyphs.speaker },
-                            { key: "view", label: "View", glyph: Glyphs.gear }
-                        ]
+                        model: window.phoneTabs
                         DkButton {
                             id: tabButton
                             required property var modelData
@@ -563,7 +600,7 @@ ApplicationWindow {
 
             // Status bar.
             RowLayout {
-                visible: !window.phone
+                visible: !window.mobileUi
                 Layout.fillWidth: true
                 Layout.topMargin: 4
                 spacing: 2
@@ -617,7 +654,7 @@ ApplicationWindow {
         z: 50
         mainWindow: mainWindow
         roll: roll
-        dock: window.phone ? phoneDock : dock
+        dock: window.mobileUi ? phoneDock : dock
     }
 
     // MIDI loading window.

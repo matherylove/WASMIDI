@@ -6462,3 +6462,44 @@ no los de lo ya tocado; falta el contador de CC por segundo.
 - Un celular real (táctil, `devicePixelRatio` alto, pantalla completa) y el rendimiento del roll vertical
   con GPU.
 - Los picos con The Nuker 3/4 (cuánto tarda `wmp_song_peaks_js` con millones de cubetas).
+
+## 97. Revisión 100 — celular horizontal y roll vertical como Synthesia
+
+### Pedido
+
+Dekx, con una captura de un celular acostado: "Esta bugeado en movil desde el pov horizontal" (salía el
+diseño de escritorio: encabezado cortado y grupos del panel encimados). Y: "el sintetizador vertical esta
+al reves, debe hacer caer las notas como synthesia".
+
+### Causa
+
+- `phone` solo se activaba con la ventana más alta que ancha. Un celular acostado (~780×360) caía en el
+  diseño de escritorio, que necesita ~900×600.
+- En vertical el cursor iba centrado como en horizontal (la mitad de la ventana ya tocada) y el eje del
+  tiempo quedaba hacia abajo en pantalla: las notas subían desde el teclado. Medido en Chromium: entre dos
+  capturas a 0,86 s el roll se corría 254 px hacia arriba.
+
+### Cambios
+
+- `MainWindow.qml`: `compact` = no `phone` y ventana de menos de 540 px de alto o 860 px de ancho;
+  `mobileUi` = `phone` o `compact`. Con `compact` se usa el encabezado del celular (reloj, NPS, Poly,
+  CC/s, FPS), el panel por pestañas sobre el roll y una sola fila de transporte: abrir, stop, play, pausa,
+  barra de posición, velocidad de notas y las cuatro pestañas como íconos. El roll y el teclado siguen
+  horizontales. El panel de pestañas (celular y compacto) se desplaza si no entra (`Flickable`).
+- `gl_renderer.cpp`, modo vertical: la ventana va de `currentTick` a `currentTick + windowTicks` (el cursor
+  queda sobre el teclado y todo lo visible está por sonar), el eje del tiempo se invierte en el shader de
+  notas (`vec4(y, -x, …)`), en `scissorRoll` y en el centro del cursor. Las notas caen hacia el teclado.
+  Horizontal no cambia.
+
+### Verificación
+
+- Compilación wasm local OK.
+- Chromium 390×844 con el MIDI sintético: entre capturas a 2,57 y 3,43 s el roll se corre 253 px hacia
+  abajo (correlación 0,99); el cursor brilla justo sobre el teclado y las teclas se iluminan cuando llegan
+  las notas.
+- Chromium 780×360: diseño compacto sin cortes, roll horizontal con teclado a la izquierda, pestañas Synth
+  y Song abiertas sobre el roll.
+
+### No verificado
+
+- Un celular real en ambas orientaciones.

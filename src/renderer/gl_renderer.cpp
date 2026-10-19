@@ -445,7 +445,7 @@ void main() {
         widthPx >= 3.0 ? vec2(px, widthPx - px) : vec2(2.0),
         rowPx >= 3.0 ? vec2(py, rowPx - py) : vec2(2.0));
     vT = 1.0 - float(isTop);
-    gl_Position = uPortrait == 1 ? vec4(y, x, z, 1.0) : vec4(x, y, z, 1.0);
+    gl_Position = uPortrait == 1 ? vec4(y, -x, z, 1.0) : vec4(x, y, z, 1.0);
 }
 )GLSL";
 
@@ -1003,7 +1003,7 @@ void GLRenderer::setPortrait(bool portrait)
 void GLRenderer::scissorRoll(int t, int k, int tLength, int kLength) const
 {
     if (portrait_)
-        glScissor(k, t, kLength, tLength);
+        glScissor(k, timePx() - t - tLength, kLength, tLength);
     else
         glScissor(t, k, tLength, kLength);
 }
@@ -2125,8 +2125,10 @@ void GLRenderer::calculateSharpView(
 
     windowTicks = sharpStableWindowTicks_;
     const uint32_t half = std::max<uint32_t>(1u, windowTicks >> 1u);
-    viewStart = currentTick > half ? currentTick - half : 0u;
-    viewEnd = std::min<uint32_t>(document_->maxTick, currentTick + half);
+    // Portrait falls like Synthesia: the playhead sits on the keyboard and the
+    // whole window is ahead of it (HANDOFF sec. 97).
+    viewStart = portrait_ ? currentTick : (currentTick > half ? currentTick - half : 0u);
+    viewEnd = std::min<uint32_t>(document_->maxTick, portrait_ ? currentTick + windowTicks : currentTick + half);
     if (viewEnd <= viewStart)
         viewEnd = std::min<uint32_t>(document_->maxTick, viewStart + 1u);
 
@@ -2799,7 +2801,7 @@ void GLRenderer::drawSharpRing(
     // center during the first half-window and then remains centered.
     const float pixelsPerTick = 2.0f / float(std::max<uint32_t>(1u, windowTicks));
     const int timeLength = timePx();
-    const int lineX = std::clamp(
+    const int lineX = portrait_ ? 0 : std::clamp(
         static_cast<int>(std::min(
             float(currentTick) * pixelsPerTick * float(timeLength) * 0.5f,
             float(timeLength) * 0.5f)),
@@ -2813,7 +2815,7 @@ void GLRenderer::drawSharpRing(
         const int glowLeft = std::max(0, lineX - 15);
         scissorRoll(glowLeft, 0, std::min(timeLength, lineX + 17) - glowLeft, keyPx());
         glUseProgram(playheadProgram_);
-        glUniform1f(playheadCenterUniform_, float(lineX) + 1.0f);
+        glUniform1f(playheadCenterUniform_, portrait_ ? float(timeLength - lineX) - 1.0f : float(lineX) + 1.0f);
         glUniform1i(playheadPortraitUniform_, portrait_ ? 1 : 0);
         glUniform3f(playheadColorUniform_,
             playheadColor_[0], playheadColor_[1], playheadColor_[2]);
