@@ -5696,3 +5696,80 @@ de 1024 voces; los cuadros por segundo del contenedor no sirven (SwiftShader).
   así que el Worker del parser y el del teclado reciben más tramos por segundo.
 - La ráfaga de 830 s: el banco de host se quedó sin memoria ahí (cuestión del banco, que guarda
   todo).
+
+## 86. Revisión 90 — Cada pista guarda su bloque descomprimido entre tramos
+
+**Pedido:** la rev. 89 "no mejora nada": en WASMIDI con The Nuker 3 siguen los 0 cuadros por
+segundo antes de 2:10 y el lag en los mismos lugares. El usuario mandó además el código de
+sharkmidi (GPL-3, solo ideas) para ver qué sirve; la revisión está al final de esta sección.
+
+**Causa:** reproducido en visual-bench, en el Chromium del contenedor (4 hilos, 3 helpers): el
+roll se atrasa de 118 a 131 s de The Nuker 3. Cada pedido a un helper (tramo del feed, visual o
+conjunto) trae la posición de cada una de las 9679 pistas y ponía `c.block = nullptr`, así que
+cada pista volvía a descomprimir con zstd su bloque de 64 KiB aunque fuera el mismo bloque del
+tramo anterior. Con tramos de 0,25-0,75 s de canción eso es casi siempre así: la mayoría de las
+pistas avanza unos pocos bytes por tramo.
+
+**Cambios:**
+
+- `BpfaMidiStore::decodeFeedRequest` y `decodeVisualRequest`: el cursor de cada pista conserva
+  su bloque si la posición pedida cae dentro de él. El bloque está en el buffer propio del cursor
+  (`own`, ranura `0xfffe`), que solo escribe ese cursor, y `decodeNext` sigue validándolo con
+  `sourceSlotValid` antes de usarlo, así que una ranura de la caché compartida que cambió no se
+  reusa.
+- Probé además dos cosas que no quedaron porque no cambiaron nada: que la posición del Worker del
+  teclado no frene la planificación de tramos visuales (287 contra 293 cuadros atrasados, dentro
+  del ruido) y subir el adelanto del flujo de 32 M a 96 M palabras (peor: 406).
+
+**Medición:**
+
+Host (nativo), The Nuker 3, 118-134 s, 3 helpers en ronda con tramos visuales: 0,64 → 0,52
+segundos de helper por segundo de canción (-19%).
+
+Chromium del contenedor, `browser_bench.py visual "The Nuker 3 Ultimate F4.mid" 118 20
+--query=helpers=3&visualdebug=1` (la columna rev. 90 es el código publicado; la corrida tenía
+además `keyplan=1`, el interruptor de prueba que dejaba la planificación como antes):
+
+| | rev. 89 | rev. 90 |
+|---|---|---|
+| cuadros con el roll atrasado (118-137 s) | 782 | 293 |
+| adelanto mínimo del roll | -2,60 s | -1,21 s |
+| helpers ocupados (promedio) | 56% | 31% |
+| teclado | 28,6/s | 40,0/s |
+
+Lo que queda atrasado es 127-130 s (~70 M palabras visuales por segundo). Ahí los helpers ya no
+están saturados; las líneas `[WASMIDI visual]` muestran a veces anexar en el Worker del parser
+hasta ~0,8 s por segundo con el flujo en ~414 MiB (crecer y recortar el vector de palabras de
+10 bytes).
+
+**Verificación:** `tools/feeder_check/check.sh`: 24 IDENTICAL, ningún DIFFER.
+`tools/local_build.sh` completo, con la prueba del contrato del parser (tramos conjuntos y
+visuales comparados contra el merge).
+
+**No verificado / pendiente:** en las PCs del usuario y en WASMIDI con synth (en el contenedor
+el synth con 12288 voces satura los 4 hilos).
+
+### Revisión de sharkmidi (ideas, sin código)
+
+- **Renderizador:** mismo diseño que el roll de WASMIDI (los dos vienen de BPFA): instancia
+  (inicio, fin, color/tecla/velocidad), shader con brillo y transparencia, contador por tecla que
+  junta notas superpuestas, anillo con cola. Lo distinto no sirve aquí: escribe el fin de nota en
+  un buffer mapeado persistente (OpenGL 4.4, no existe en WebGL2; WASMIDI ya sube los cierres en
+  tramos seguidos), no cullea (en el navegador 1,7 M notas crudas por cuadro trababan la página,
+  §81) y su "force cull" borra notas largas con más de 262 k en pantalla (rompe la regla de capas).
+  Lo valioso es de dónde lee: barre en el mismo hilo que dibuja, directo de un arreglo de eventos
+  ya ordenado por tick.
+- **RSB:** en la carga arma un arreglo de todos los eventos de canal ordenado por tick. Cada grupo
+  (tick, pista) son tramos `[estado][byte 3][tecla…]`, un byte por evento con el bit 7 en el último
+  del tramo; el note-on con velocidad 0 se guarda como note-off con velocidad 64 para alargar
+  tramos. Aparte: tamaño (u32) y pista (u16) por grupo con un ancla cada 64 grupos, y (tick,
+  offset) por tick distinto. Una pasada cuenta los bytes exactos de cada grupo y la segunda escribe
+  en paralelo: cada hilo es dueño de un pedazo de la salida y visita todas las pistas con cursores
+  que parten de checkpoints.
+- Medido con un contador propio sobre The Nuker 3: 4.158 M eventos de canal, 141 M grupos, 380 M
+  tramos, 5,29 M ticks distintos → 4,92 GB de datos + 0,85 GB de grupos + 0,13 GB de ticks =
+  **5,89 GB** (1,42 bytes por evento). `nuker4_830.mid`: 1,46 bytes por evento. Las palabras del
+  flujo visual (10 bytes) serían 41,6 GB para la canción entera; la fuente zstd de hoy ocupa
+  ~1,3 GB.
+- Propuesta: armar ese flujo en la carga con los Workers que ya cargan en paralelo y que roll,
+  teclado y feed del synth lean de él, en lugar de decodificar las 9679 pistas en vivo con helpers.
