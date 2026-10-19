@@ -328,9 +328,7 @@ void BpfaMidiStore::clear()
     liveExternalPos_ = -1;
     visValid_ = false;
     visDone_ = false;
-    std::vector<EventWord>().swap(visEvents_);
-    std::vector<uint16_t>().swap(visTracks_);
-    visBase_ = 0;
+    visualClearWords(0);
     visStart_ = visHead_ = 0;
     visCursor_ = MergeCursor{};
     visCursorTick_ = ~0u;
@@ -1914,11 +1912,32 @@ bool BpfaMidiStore::buildRenderSweep(uint32_t endTick, std::size_t maxSourceEven
 
 // ---- Visual stream (HANDOFF sec. 71) ----
 
+void BpfaMidiStore::visualClearWords(uint64_t base)
+{
+    std::deque<VisualPiece>().swap(visPieces_);
+    visBase_ = visEnd_ = base;
+}
+
+std::size_t BpfaMidiStore::visualPieceAt(uint64_t position) const
+{
+    const auto it = std::upper_bound(visPieces_.begin(), visPieces_.end(), position,
+        [](uint64_t at, const VisualPiece& piece) { return at < piece.base; });
+    return it == visPieces_.begin() ? 0 : std::size_t(it - visPieces_.begin()) - 1u;
+}
+
+uint64_t BpfaMidiStore::visualLowerBound(uint32_t tick) const
+{
+    const auto piece = std::partition_point(visPieces_.begin(), visPieces_.end(),
+        [tick](const VisualPiece& p) { return p.events.back().tick < tick; });
+    if (piece == visPieces_.end()) return visEnd_;
+    const auto it = std::lower_bound(piece->events.begin(), piece->events.end(), tick,
+        [](const EventWord& e, uint32_t t) { return e.tick < t; });
+    return piece->base + uint64_t(it - piece->events.begin());
+}
+
 void BpfaMidiStore::visualReset(uint32_t startTick)
 {
-    visEvents_.clear();
-    visTracks_.clear();
-    visBase_ = 0;
+    visualClearWords(0);
     visStart_ = visHead_ = startTick;
     visDone_ = startTick > metadata_.maxTick;
     visValid_ = true;
@@ -2007,8 +2026,14 @@ void BpfaMidiStore::visualOrderRaw(std::vector<EventWord>& events, std::vector<u
 void BpfaMidiStore::visualAppend(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t endTick,
                                  bool anyLeft)
 {
-    visEvents_.insert(visEvents_.end(), events, events + count);
-    visTracks_.insert(visTracks_.end(), tracks, tracks + count);
+    if (count) {
+        visPieces_.emplace_back();
+        VisualPiece& piece = visPieces_.back();
+        piece.base = visEnd_;
+        piece.events.assign(events, events + count);
+        piece.tracks.assign(tracks, tracks + count);
+        visEnd_ += count;
+    }
     visHead_ = std::max(visHead_, endTick);
     if (!anyLeft || endTick > metadata_.maxTick) {
         visDone_ = true;
@@ -2042,8 +2067,7 @@ bool BpfaMidiStore::visualRoomAhead() const
 {
     uint64_t from = liveOnStream_ ? std::min(livePos_, renderPos_) : renderPos_;
     if (liveExternal_) from = liveExternalPos_ >= 0 ? std::min(uint64_t(liveExternalPos_), renderPos_) : renderPos_;
-    const uint64_t head = visBase_ + visEvents_.size();
-    return from >= head || head - from < VisualPlanWords;
+    return from >= visEnd_ || visEnd_ - from < VisualPlanWords;
 }
 
 // Drops the words both readers have passed. The live snapshot runs behind the sweep, so
@@ -2051,7 +2075,7 @@ bool BpfaMidiStore::visualRoomAhead() const
 // stream grows past VisualRetainWords.
 void BpfaMidiStore::visualTrim()
 {
-    uint64_t keep = liveOnly_ ? visBase_ + visEvents_.size() : renderPos_;
+    uint64_t keep = liveOnly_ ? visEnd_ : renderPos_;
     if (liveExternal_) {
         // the keyboard Worker keeps its own copy of the stream
     } else if (liveOnStream_) {
@@ -2059,18 +2083,15 @@ void BpfaMidiStore::visualTrim()
     } else if (!liveCursorValid_ || !liveSinceVisualReset_ || liveNextTick_ < visStart_) {
         keep = visBase_;  // the live snapshot has yet to join the stream
     } else {
-        const auto first = std::lower_bound(visEvents_.begin(), visEvents_.end(), liveNextTick_,
-            [](const EventWord& e, uint32_t t) { return e.tick < t; });
-        keep = std::min(keep, visBase_ + uint64_t(first - visEvents_.begin()));
+        keep = std::min(keep, visualLowerBound(liveNextTick_));
     }
-    if (visEvents_.size() > VisualRetainWords) keep = std::max(keep, visBase_ + (visEvents_.size() - VisualRetainWords));
+    if (visEnd_ - visBase_ > VisualRetainWords) keep = std::max(keep, visEnd_ - VisualRetainWords);
     if (!liveOnly_) keep = std::min(keep, renderPos_);
-    const uint64_t drop = keep > visBase_ ? keep - visBase_ : 0;
-    if (drop < 65536u || drop * 2u < visEvents_.size()) return;
-    visStart_ = std::max(visStart_, visEvents_[std::size_t(drop - 1u)].tick + 1u);
-    visEvents_.erase(visEvents_.begin(), visEvents_.begin() + std::ptrdiff_t(drop));
-    visTracks_.erase(visTracks_.begin(), visTracks_.begin() + std::ptrdiff_t(drop));
-    visBase_ += drop;
+    while (!visPieces_.empty() && visPieces_.front().base + visPieces_.front().events.size() <= keep) {
+        visStart_ = std::max(visStart_, visPieces_.front().events.back().tick + 1u);
+        visPieces_.pop_front();
+        visBase_ = visPieces_.empty() ? visEnd_ : visPieces_.front().base;
+    }
 }
 
 namespace {
@@ -2134,19 +2155,22 @@ bool BpfaMidiStore::buildRenderSweepStream(uint32_t endTick, std::size_t maxWord
     if (visualAutoDecode_ && !visDone_ && visHead_ <= endTick && visualRoomAhead())
         decodeVisualLocal(visualSpanEnd(visHead_, maxWords));
     std::size_t consumed = 0;
-    while (consumed < maxWords) {
-        const uint64_t local = renderPos_ - visBase_;
-        if (local >= visEvents_.size()) break;
-        const EventWord& e = visEvents_[std::size_t(local)];
-        if (e.tick > endTick) break;
-        renderStep(e.tick, e.packed & 0x00ffffffu, visTracks_[std::size_t(local)], (e.packed >> 24) + 1u, appends,
-                   closes);
-        ++renderPos_;
-        ++consumed;
+    bool reached = false;
+    for (std::size_t p = visualPieceAt(renderPos_); !reached && consumed < maxWords && p < visPieces_.size(); ++p) {
+        const VisualPiece& piece = visPieces_[p];
+        if (renderPos_ < piece.base) break;
+        std::size_t local = std::size_t(renderPos_ - piece.base);
+        const std::size_t size = piece.events.size();
+        for (; local < size && consumed < maxWords; ++local, ++consumed) {
+            const EventWord& e = piece.events[local];
+            if (e.tick > endTick) { reached = true; break; }
+            renderStep(e.tick, e.packed & 0x00ffffffu, piece.tracks[local], (e.packed >> 24) + 1u, appends, closes);
+        }
+        renderPos_ = piece.base + local;
     }
-    const uint64_t local = renderPos_ - visBase_;
-    if (local < visEvents_.size()) {
-        nextTick = visEvents_[std::size_t(local)].tick;
+    if (renderPos_ >= visBase_ && renderPos_ < visEnd_) {
+        const VisualPiece& piece = visPieces_[visualPieceAt(renderPos_)];
+        nextTick = piece.events[std::size_t(renderPos_ - piece.base)].tick;
         hasNextTick = true;
         complete = nextTick > endTick;
     } else if (visDone_) {
@@ -2756,14 +2780,18 @@ void BpfaMidiStore::liveDensityFromStream(const LiveRequest& r)
 {
     const double densityStart = std::min(r.npsStartTick, r.ccStartTick);
     const uint32_t densityTick = static_cast<uint32_t>(std::floor(densityStart));
-    auto it = std::lower_bound(visEvents_.begin(), visEvents_.end(), densityTick,
-        [](const EventWord& e, uint32_t t) { return e.tick < t; });
-    for (; it != visEvents_.end() && it->tick <= r.wholeTick; ++it) {
-        const uint32_t m = it->packed & 0x00ffffffu;
-        const uint32_t n = liveWordCount(it->packed);
-        if (double(it->tick) + 1.0e-9 >= densityStart) liveAddDensity(it->tick, m, n);
-        if (it->tick == r.wholeTick)
-            liveConsume(r, it->tick, m, visTracks_[std::size_t(it - visEvents_.begin())], n, false);
+    const uint64_t first = visualLowerBound(densityTick);
+    if (first >= visEnd_) return;
+    for (std::size_t p = visualPieceAt(first); p < visPieces_.size(); ++p) {
+        const VisualPiece& piece = visPieces_[p];
+        for (std::size_t i = first > piece.base ? std::size_t(first - piece.base) : 0; i < piece.events.size(); ++i) {
+            const EventWord& e = piece.events[i];
+            if (e.tick > r.wholeTick) return;
+            const uint32_t m = e.packed & 0x00ffffffu;
+            const uint32_t n = liveWordCount(e.packed);
+            if (double(e.tick) + 1.0e-9 >= densityStart) liveAddDensity(e.tick, m, n);
+            if (e.tick == r.wholeTick) liveConsume(r, e.tick, m, piece.tracks[i], n, false);
+        }
     }
 }
 
@@ -2814,53 +2842,57 @@ void BpfaMidiStore::liveEndReset(const LiveRequest& r)
 // the calls: ~25 ns per word through them at 440 s of The Nuker 3 (HANDOFF sec. 83).
 void BpfaMidiStore::liveStreamRun(uint32_t endTick)
 {
-    const EventWord* events = visEvents_.data();
-    const uint16_t* tracks = visTracks_.data();
-    const std::size_t size = visEvents_.size();
-    std::size_t local = std::size_t(livePos_ - visBase_);
-    const std::size_t first = local;
+    if (livePos_ < visBase_ || livePos_ >= visEnd_) return;
     const uint32_t* pairOf = livePairOf_.data();
     std::size_t pairs = livePairOf_.size();
-    for (; local < size; ++local) {
-        const uint32_t tick = events[local].tick;
-        if (tick >= endTick) break;
-        const uint32_t packed = events[local].packed, type = packed & 0xf0u;
-        if (type != 0x80u && type != 0x90u) {
-            if (type >= 0xb0u && type <= 0xe0u) liveAddPoint(liveCc_, liveCcCount_, tick, 1u);
-            continue;
-        }
-        const uint32_t n = (packed >> 24) + 1u, track = tracks[local], channel = packed & 0x0fu;
-        const uint32_t pitch = (packed >> 8) & 0x7fu;
-        const std::size_t at = std::size_t(track) * 16u + channel;
-        uint32_t pair = at < pairs ? pairOf[at] : ~0u;
-        if (type == 0x90u && (packed & 0x7f0000u)) {
-            liveAddPoint(liveNps_, liveNpsCount_, tick, n);
-            uint32_t slot;
-            if (pair == ~0u) {
-                slot = liveSlot(uint16_t(track), uint8_t(channel), uint8_t(pitch), true);
-                pairOf = livePairOf_.data();
-                pairs = livePairOf_.size();
-            } else {
-                slot = pair * 128u + pitch;
+    bool reached = false;
+    for (std::size_t p = visualPieceAt(livePos_); !reached && p < visPieces_.size(); ++p) {
+        const VisualPiece& piece = visPieces_[p];
+        const EventWord* events = piece.events.data();
+        const uint16_t* tracks = piece.tracks.data();
+        const std::size_t size = piece.events.size();
+        std::size_t local = std::size_t(livePos_ - piece.base);
+        for (; local < size; ++local) {
+            const uint32_t tick = events[local].tick;
+            if (tick >= endTick) { reached = true; break; }
+            const uint32_t packed = events[local].packed, type = packed & 0xf0u;
+            if (type != 0x80u && type != 0x90u) {
+                if (type >= 0xb0u && type <= 0xe0u) liveAddPoint(liveCc_, liveCcCount_, tick, 1u);
+                continue;
             }
+            const uint32_t n = (packed >> 24) + 1u, track = tracks[local], channel = packed & 0x0fu;
+            const uint32_t pitch = (packed >> 8) & 0x7fu;
+            const std::size_t at = std::size_t(track) * 16u + channel;
+            uint32_t pair = at < pairs ? pairOf[at] : ~0u;
+            if (type == 0x90u && (packed & 0x7f0000u)) {
+                liveAddPoint(liveNps_, liveNpsCount_, tick, n);
+                uint32_t slot;
+                if (pair == ~0u) {
+                    slot = liveSlot(uint16_t(track), uint8_t(channel), uint8_t(pitch), true);
+                    pairOf = livePairOf_.data();
+                    pairs = livePairOf_.size();
+                } else {
+                    slot = pair * 128u + pitch;
+                }
+                LiveKey& k = liveSlots_[slot];
+                k.total = uint32_t(std::min<uint64_t>(uint64_t(k.total) + n, std::numeric_limits<uint32_t>::max()));
+                k.tailStart = tick;
+                k.tailColor = uint32_t(globalColors_[channel] & 0x0fu) | (uint32_t(trackColors_[track][channel] & 0x0fu) << 4);
+                if (k.activeAt == ~0u) {
+                    k.activeAt = uint32_t(liveActive_.size());
+                    liveActive_.push_back(slot);
+                }
+                continue;
+            }
+            if (pair == ~0u) continue;
+            const uint32_t slot = pair * 128u + pitch;
             LiveKey& k = liveSlots_[slot];
-            k.total = uint32_t(std::min<uint64_t>(uint64_t(k.total) + n, std::numeric_limits<uint32_t>::max()));
-            k.tailStart = tick;
-            k.tailColor = uint32_t(globalColors_[channel] & 0x0fu) | (uint32_t(trackColors_[track][channel] & 0x0fu) << 4);
-            if (k.activeAt == ~0u) {
-                k.activeAt = uint32_t(liveActive_.size());
-                liveActive_.push_back(slot);
-            }
-            continue;
+            if (k.total == 0) continue;
+            if (k.total > n) k.total -= n;
+            else liveClearSlot(slot);
         }
-        if (pair == ~0u) continue;
-        const uint32_t slot = pair * 128u + pitch;
-        LiveKey& k = liveSlots_[slot];
-        if (k.total == 0) continue;
-        if (k.total > n) k.total -= n;
-        else liveClearSlot(slot);
+        livePos_ = piece.base + local;
     }
-    livePos_ += local - first;
 }
 
 void BpfaMidiStore::liveAdvance(const LiveRequest& r)
@@ -2884,23 +2916,22 @@ void BpfaMidiStore::liveAdvance(const LiveRequest& r)
         const bool onStream = covered && visHead_ > through;
         if (onStream) {
             if (!liveOnStream_) {
-                const auto first = std::lower_bound(visEvents_.begin(), visEvents_.end(), liveNextTick_,
-                    [](const EventWord& e, uint32_t t) { return e.tick < t; });
-                livePos_ = visBase_ + uint64_t(first - visEvents_.begin());
+                livePos_ = visualLowerBound(liveNextTick_);
                 liveOnStream_ = true;
                 liveCursorSynced_ = false;
             }
             // Only the note-offs of an exact request tick are deferred: the words before it
             // take the inlined path.
             liveStreamRun(r.exactTick && through == wholeTick ? wholeTick : through + 1u);
-            for (;;) {
-                const uint64_t local = livePos_ - visBase_;
-                if (local >= visEvents_.size()) break;
-                const EventWord& e = visEvents_[std::size_t(local)];
-                if (e.tick > through) break;
-                const uint32_t m = e.packed & 0x00ffffffu;
-                liveConsume(r, e.tick, m, visTracks_[std::size_t(local)], liveWordCount(e.packed), true);
-                ++livePos_;
+            bool past = false;
+            for (std::size_t p = visualPieceAt(livePos_); !past && livePos_ >= visBase_ && p < visPieces_.size(); ++p) {
+                const VisualPiece& piece = visPieces_[p];
+                for (std::size_t local = std::size_t(livePos_ - piece.base); local < piece.events.size(); ++local) {
+                    const EventWord& e = piece.events[local];
+                    if (e.tick > through) { past = true; break; }
+                    liveConsume(r, e.tick, e.packed & 0x00ffffffu, piece.tracks[local], liveWordCount(e.packed), true);
+                    ++livePos_;
+                }
             }
         } else {
             uint32_t evTick = 0, evMessage = 0;
@@ -3052,9 +3083,18 @@ bool BpfaMidiStore::exportVisualStream(std::vector<uint8_t>& blob) const
     putPod(blob, visHead_);
     putPod(blob, uint32_t(visDone_ ? 1 : 0));
     putPod(blob, visBase_);
-    putPod(blob, uint64_t(visEvents_.size()));
-    putArray(blob, visEvents_.data(), visEvents_.size());
-    putArray(blob, visTracks_.data(), visTracks_.size());
+    putPod(blob, uint64_t(visEnd_ - visBase_));
+    blob.reserve(blob.size() + std::size_t(visEnd_ - visBase_) * (sizeof(EventWord) + sizeof(uint16_t)) + 16u);
+    for (const VisualPiece& piece : visPieces_) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(piece.events.data());
+        blob.insert(blob.end(), bytes, bytes + piece.events.size() * sizeof(EventWord));
+    }
+    while (blob.size() & 7u) blob.push_back(0);
+    for (const VisualPiece& piece : visPieces_) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(piece.tracks.data());
+        blob.insert(blob.end(), bytes, bytes + piece.tracks.size() * sizeof(uint16_t));
+    }
+    while (blob.size() & 7u) blob.push_back(0);
     return true;
 }
 
@@ -3071,9 +3111,14 @@ bool BpfaMidiStore::importVisualStream(const uint8_t* data, std::size_t size)
     in.array(tracks, std::size_t(count));
     if (!in.ok) { error_ = "Truncated visual stream"; return false; }
     visualReset(start);
-    visEvents_ = std::move(events);
-    visTracks_ = std::move(tracks);
-    visBase_ = base;
+    visualClearWords(base);
+    if (!events.empty()) {
+        visPieces_.emplace_back();
+        visPieces_.back().base = base;
+        visPieces_.back().events = std::move(events);
+        visPieces_.back().tracks = std::move(tracks);
+        visEnd_ = base + count;
+    }
     visHead_ = head;
     visDone_ = done;
     return true;
