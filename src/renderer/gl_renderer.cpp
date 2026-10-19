@@ -424,8 +424,8 @@ void main() {
     float z = float(endTick - int(aStartTick)) / 16777216.0;
 
     vec3 base = texelFetch(uPalette, ivec2(int(colorIndex), 0), 0).rgb;
-    bool active = uCurrentTick >= int(aStartTick) && uCurrentTick <= endTick;
-    if (uGlowEnabled == 1 && active)
+    bool sounding = uCurrentTick >= int(aStartTick) && uCurrentTick <= endTick;
+    if (uGlowEnabled == 1 && sounding)
         base = min(base * 2.0 + vec3(0.1), vec3(1.0));
     float opacity = uTransparencyEnabled == 1
         ? float((aPackedData & 0xffu) + 1u) / 128.0
