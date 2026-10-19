@@ -1686,7 +1686,8 @@ bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std
         c.runningStatus = uint8_t(in.get<uint32_t>());
         c.end = cursorEnd(tracks_[t]);
         c.finished = false;
-        c.block = nullptr;
+        // Each track's last block stays decoded in its own buffer between requests (HANDOFF sec. 86).
+        if (c.position < c.blockBegin || c.position >= c.blockEnd) c.block = nullptr;
         bool ok = in.ok && c.position >= tracks_[t].byteBegin && c.position <= c.end && decodeNext(c, false);
         while (ok && c.eventTick < edge[0]) ok = decodeNext(c, false);
         if (!ok) c.finished = true;
@@ -2201,7 +2202,8 @@ bool BpfaMidiStore::decodeVisualRequest(const uint8_t* data, std::size_t size, s
         c.runningStatus = uint8_t(in.get<uint32_t>());
         c.end = cursorEnd(tracks_[t]);
         c.finished = false;
-        c.block = nullptr;
+        // Each track's last block stays decoded in its own buffer between requests (HANDOFF sec. 86).
+        if (c.position < c.blockBegin || c.position >= c.blockEnd) c.block = nullptr;
         bool ok = in.ok && c.position >= tracks_[t].byteBegin && c.position <= c.end && decodeNext(c, false);
         while (ok && c.eventTick < startTick) ok = decodeNext(c, false);
         if (!ok) c.finished = true;
