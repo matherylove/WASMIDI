@@ -6102,3 +6102,80 @@ a nadie, el que se atrasa alcanza.
 - Roll, teclado y gráficos con su propia decodificación (etapa 2): flujo visual con helpers
   (rev. 75 en adelante).
 - Admisión en el parser y decodificación repartida para el synth (rev. 74).
+
+## 91. Revisión 94 — WasmiSynth carga carpetas SFZ; mockup de la GUI nueva
+
+**Pedido (Dekx, hilo "GUI nueva"):** GUI nueva al estilo de dekx.cc (pantalla completa sin scroll,
+modo celular vertical, notas y teclado con degradado y textura sin perder rendimiento, popups de
+polifonía/NPS máximos y de lag, note speed en segundos, colores por pista en loop de 16 con
+importación del config.xml, fondo neural, sin letreros innecesarios ni nombres de otros programas)
+mostrando antes un mockup; y que WasmiSynth acepte una carpeta con un .sfz y lo que pida (samples)
+para tener SFZ completo además de SF2.
+
+### Mockup
+
+Publicado y aprobado: https://claude.ai/artifact/6Rzqy1QJQrBaJq39comYMd (escritorio 1600×900, celular
+390×844 con el roll vertical, diálogo de colores). Correcciones del usuario: el fondo neural tiene que
+ser el de `dekx.js` (≤ 80 nodos, uno por 18.000 px², puntos de 2 px, líneas de menos de 140 px con
+alfa (1 − d/140)·0,2, fondo #07071a, una sola red detrás de toda la página) y el kit visual el de
+dekx.css y WASMIDI Audio (biseles, título con degradado horizontal, cajas de grupo, LCD en VT323),
+no el de 0xDEADDEAD. Las notas nuevas tienen que rendir igual o mejor que las actuales: se mide antes y
+después con visual-bench y `?visualdebug=1` cuando se cableen. El cableado de la GUI va en las
+revisiones siguientes; esta revisión trae solo el SFZ.
+
+### Causa (SFZ)
+
+El parser SFZ heredado de SnappySynthV2 nunca se llamaba en el navegador (`ssw_load_sf2` solo abría
+SF2) y estaba hecho para rutas de Windows: separaba carpetas solo con `\`, leía solo WAV de 16 bits,
+un valor sin comillas terminaba en el primer espacio (`sample=Soft Layer\piano c4.wav` se cortaba),
+`sample=` en `<group>`/`<global>` se ignoraba, una línea con dos cabeceras perdía la segunda, `<control>`
+o `<effect>` dejaban el contexto en la última región, no había `#define`, y una sola muestra faltante
+hacía fallar todo el instrumento (`ssw_instrument_is_materialized`).
+
+### Cambios
+
+- `Parser/sfz_parser.c`: rutas relativas a la carpeta del .sfz principal (también los `#include`,
+  como sfizz), `\` → `/` fuera de Windows, búsqueda sin mayúsculas/minúsculas por cada parte de la
+  ruta (librerías hechas en Windows), `#define $X` y su sustitución, comentarios `/* */`, la línea se
+  parte en cada `<cabecera>` y cualquier cabecera desconocida cierra el contexto, `default_path` como
+  opcode en cualquier lugar, `sample=` heredado de `<group>`/`<master>`/`<global>`, valores sin
+  comillas que siguen hasta el próximo `opcode=`, alias `loopmode`/`loopstart`/`loopend`/`offby`/
+  `polyphony_group`/`filtype`, generadores `*sine`, `*saw`, `*square`, `*triangle`, `*noise`,
+  `*silence` (tabla de 2048 muestras = un ciclo de C4), `#include` hasta 16 niveles, líneas de hasta
+  16 KB. Las regiones sin muestra se descartan y el resto carga. El bloque que aplica los opcodes quedó
+  igual, movido a `sfz_apply_opcode`.
+- `Parser/wav_loader.c`: WAV PCM de 8/16/24/32 bits, float de 32/64 bits y WAVE_FORMAT_EXTENSIBLE, más
+  de 2 canales se quedan con los 2 primeros; sigue guardando int16 como antes.
+- `snappy_wasm_core.c`: `ssw_load_sf2` abre con el parser SFZ si la ruta termina en `.sfz` (sin export
+  nuevo).
+- FLAC, Ogg Vorbis y Opus: el Worker del synth no tiene `AudioContext`, así que `snappysynth_bridge.js`
+  los decodifica en la página con `OfflineAudioContext.decodeAudioData` a la frecuencia nativa (leída de
+  STREAMINFO de FLAC o del encabezado de Vorbis; Opus 48 kHz) y los pasa como WAV de 16 bits con el
+  mismo nombre. No se agregó código de terceros: descargar dr_flac/stb_vorbis al repo fue bloqueado en
+  esta sesión y la decodificación del navegador alcanza.
+- `snappysynth-worker.js`: `loadSoundfont` acepta `folder` (lista `{path, file}`) y `root`; monta
+  la carpeta entera con WORKERFS (`blobs` con rutas, se lee bajo demanda) en `/soundfonts/layerN`.
+- Bridge: `loadSoundfontFolder(files, sfz)`, `openSoundfontFolder()`, `sfzChoices(files)`. Si la
+  carpeta tiene varios .sfz se usa el menos profundo y primero en orden alfabético (la GUI nueva va a
+  dejar elegir).
+- WASMIDI: botón "SFZ" al lado de "Load SF2" (`openSfzFolderPicker`, `webkitdirectory`).
+  WASMIDI Audio: botón "SFZ…" y soltar una carpeta en la ventana principal.
+- `tools/sfz_folder_check.c` (en el CI, paso "Host tests"): arma una librería con todo lo anterior,
+  la carga con el parser y con el motor real y comprueba regiones, niveles y que una nota suene.
+
+### Verificación
+
+- Host: `tools/sfz_folder_check.c` OK (5 regiones, la faltante descartada, 24 bits al nivel correcto,
+  `ssw_load_sf2` con .sfz, nota con pico > 0,01). Todo el paso "Host tests" del CI pasa.
+- Compilación completa con `tools/local_build.sh` (Emscripten 3.1.56, Qt 6.8.3) OK.
+- Chromium (WASMIDI Audio, `set_input_files` de la carpeta): librería con `Piano C4.flac` (estéreo
+  44,1 kHz), `d4.wav` (24 bits), `e4.ogg` (48 kHz), `default_path=Samples\` y nombres con otras
+  mayúsculas → "SFZ ready in 691 ms (3 regions)", y un MIDI de 6 notas suena (voces activas > 0).
+
+### No verificado
+
+- Librerías SFZ reales grandes: la memoria del Worker del synth (todas las muestras pasan a int16 al
+  cargar) y el tiempo de decodificar miles de FLAC en la página.
+- Opcodes que el motor no implementa (lorand/hirand, seq_*, sw_*, locc/hicc, curvas, efectos,
+  `amp_veltrack`, `pitch_keytrack`…) se ignoran como antes; "soporte total" de opcodes queda pendiente.
+- El botón "SFZ" de WASMIDI no se probó en el navegador (mismo bridge que WASMIDI Audio).

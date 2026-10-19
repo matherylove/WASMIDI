@@ -56,6 +56,7 @@
         <button type="button" id="stop" aria-label="Stop" title="Stop" disabled><svg viewBox="0 0 7 7" width="14" height="14" shape-rendering="crispEdges" aria-hidden="true"><path fill="currentColor" d="M0 0h7v7h-7z"/></svg></button>
         <button type="button" id="open-midi" title="Open MIDI">MIDI…</button>
         <button type="button" id="open-sf2" title="Open SoundFont">SF2…</button>
+        <button type="button" id="open-sfz" title="Open a folder with an .sfz and its samples">SFZ…</button>
         <button type="button" id="gpu" title="WasmiSynth engine: CPU or WebGPU" aria-pressed="false">CPU</button>
         <span class="spacer"></span>
         <label class="vol"><span>VOL</span><input type="range" id="volume" min="0" max="100" step="1" value="100" aria-label="Volume"></label>
@@ -65,10 +66,11 @@
         <button type="button" data-toggle="lyrics" aria-pressed="false" title="Lyrics and markers">LYR</button>
         <button type="button" data-toggle="graphs" aria-pressed="false" title="Graphs">GRAPH</button>
         <button type="button" data-toggle="vis" aria-pressed="false" title="Spectrum visualizer">VIS</button>
-        <span class="hint">Drop a .mid and a .sf2 here</span>
+        <span class="hint">Drop a .mid and a .sf2 or SFZ folder here</span>
       </div>
       <input type="file" id="midi-input" accept=".mid,.midi,.kar,audio/midi" hidden>
-      <input type="file" id="sf2-input" accept=".sf2,.sf3,.sfz" hidden>
+      <input type="file" id="sf2-input" accept=".sf2,.sf3" hidden>
+      <input type="file" id="sfz-input" webkitdirectory multiple hidden>
     </div>
     <div class="win-status">
       <span class="status-cell grow" id="status">Idle</span>

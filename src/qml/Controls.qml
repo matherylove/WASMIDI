@@ -690,6 +690,14 @@ Item {
             FlatButton {
                 Layout.preferredWidth: 43
                 implicitHeight: 21
+                enabled: !root.mainWindow.isPlaying
+                text: "SFZ"
+                onClicked: root.mainWindow.openSfzFolderPicker()
+            }
+
+            FlatButton {
+                Layout.preferredWidth: 43
+                implicitHeight: 21
                 visible: root.mainWindow.soundfontLoaded
                 enabled: !root.mainWindow.isPlaying
                 text: "Clear"

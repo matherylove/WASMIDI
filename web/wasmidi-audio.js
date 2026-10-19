@@ -306,6 +306,48 @@
         updateButtons();
     }
 
+    async function loadSfzFolder(files) {
+        if (!files || !files.length) return;
+        try {
+            const choices = bridge().sfzChoices(files);
+            if (!choices.length) throw new Error("no .sfz file in that folder");
+            log("Loading SFZ " + choices[0] + " (" + files.length + " files" +
+                (choices.length > 1 ? ", " + choices.length + " .sfz found" : "") + ")");
+            const t0 = performance.now();
+            await ensureSynth();
+            const ok = await bridge().loadSoundfontFolder(files, choices[0]);
+            if (ok === false || !bridge().state.soundfontLoaded)
+                throw new Error(bridge().state.status || "load failed");
+            $("i-sf2").textContent = choices[0].split("/").pop();
+            log("SFZ ready in " + fmtMs(performance.now() - t0) + " (" +
+                (bridge().state.regions | 0) + " regions)", "ok");
+            reapplyGpu();
+        } catch (error) {
+            log("SFZ failed: " + (error && error.message ? error.message : error), "err");
+        }
+        updateButtons();
+    }
+
+    async function droppedFiles(items) {
+        const out = [];
+        async function walk(entry, prefix) {
+            if (entry.isFile) {
+                const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+                out.push({ path: prefix + entry.name, file });
+            } else if (entry.isDirectory) {
+                const reader = entry.createReader();
+                for (;;) {
+                    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+                    if (!batch.length) break;
+                    for (const child of batch) await walk(child, prefix + entry.name + "/");
+                }
+            }
+        }
+        const entries = Array.from(items || []).map(item => item.webkitGetAsEntry && item.webkitGetAsEntry()).filter(Boolean);
+        for (const entry of entries) await walk(entry, "");
+        return out;
+    }
+
     function reapplyGpu() {
         const b = bridge();
         if (b && settings.gpu) b.setGpu(true);
@@ -968,6 +1010,12 @@ void main() {
         pick($("sf2-input"), loadSf2);
         $("open-midi").addEventListener("click", () => $("midi-input").click());
         $("open-sf2").addEventListener("click", () => $("sf2-input").click());
+        $("sfz-input").addEventListener("change", () => {
+            const files = Array.from($("sfz-input").files || []);
+            $("sfz-input").value = "";
+            void loadSfzFolder(files);
+        });
+        $("open-sfz").addEventListener("click", () => $("sfz-input").click());
         $("play").addEventListener("click", () => { void play(); });
         $("pause").addEventListener("click", pause);
         $("stop").addEventListener("click", stop);
@@ -1004,13 +1052,17 @@ void main() {
         const main = $("w-main");
         main.addEventListener("dragover", e => { e.preventDefault(); main.classList.add("drag"); });
         main.addEventListener("dragleave", () => main.classList.remove("drag"));
-        main.addEventListener("drop", e => {
+        main.addEventListener("drop", async e => {
             e.preventDefault();
             main.classList.remove("drag");
-            for (const file of Array.from(e.dataTransfer.files || [])) {
+            const files = Array.from(e.dataTransfer.files || []);
+            const items = Array.from(e.dataTransfer.items || []);
+            const hasFolder = items.some(item => { const en = item.webkitGetAsEntry && item.webkitGetAsEntry(); return en && en.isDirectory; });
+            for (const file of files) {
                 if (/\.(mid|midi|smf|kar)$/i.test(file.name)) void loadMidi(file);
-                else if (/\.(sf2|sfz|sf3)$/i.test(file.name)) void loadSf2(file);
+                else if (/\.(sf2|sf3)$/i.test(file.name)) void loadSf2(file);
             }
+            if (hasFolder) void loadSfzFolder(await droppedFiles(items));
         });
         document.addEventListener("keydown", e => {
             if (e.target && /input|select|textarea/i.test(e.target.tagName)) return;

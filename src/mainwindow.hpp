@@ -242,6 +242,7 @@ public:
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
     Q_INVOKABLE void openMidiPicker();
     Q_INVOKABLE void openSoundfontPicker();
+    Q_INVOKABLE void openSfzFolderPicker();
     Q_INVOKABLE void clearSoundfonts();
     Q_INVOKABLE void clearFile();
     Q_INVOKABLE void notifyVisualizerFramePresented();

@@ -168,8 +168,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
      * formats. The only differences are the accept filter and what happens
      * after a File has already been selected.
      */
+    const isSfz =
+        (kind | 0) === 2;
     const isSf2 =
-        (kind | 0) === 1;
+        (kind | 0) === 1 || isSfz;
 
     console.debug(
         '[WASMIDI picker] opening',
@@ -180,6 +182,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             'input');
 
     input.type = 'file';
+    if (isSfz) {
+        input.webkitdirectory = true;
+        input.multiple = true;
+    }
 
     input.accept =
         isSf2
@@ -252,8 +258,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         'SnappySynthV2 bridge is unavailable.');
                 }
 
-                await bridge.loadSoundfontFile(
-                    file);
+                if (isSfz)
+                    await bridge.loadSoundfontFolder(
+                        Array.from(input.files));
+                else
+                    await bridge.loadSoundfontFile(
+                        file);
             } catch (error) {
                 console.error(
                     '[WASMIDI] Could not load selected SF2:',
@@ -1865,6 +1875,16 @@ void MainWindow::openSoundfontPicker()
 #endif
 }
 
+
+void MainWindow::openSfzFolderPicker()
+{
+#ifdef __EMSCRIPTEN__
+    wasmidi_browser_open_file_picker(2);
+#else
+    synthStatus_ = QStringLiteral("The SFZ folder picker is available in the WebAssembly build.");
+    emit synthStateChanged();
+#endif
+}
 
 void MainWindow::clearSoundfonts()
 {

@@ -68,6 +68,11 @@ jobs:
           python3 tools/extract_vor_redundancy_logic.py
           cc -O1 -Wall -o /tmp/vor tools/vor_redundancy_check.c
           /tmp/vor
+          S=third_party/snappysynthv2
+          cc -O1 -I$S -DSNAPPYSYNTH_WASM=1 -pthread -o /tmp/sfzc tools/sfz_folder_check.c \
+             $S/snappy_wasm_core.c $S/Voice/voice.c $S/Parser/sf2_parser.c $S/Parser/sfz_parser.c \
+             $S/Parser/wav_loader.c $S/wasm_stubs.c -lm
+          timeout 60 /tmp/sfzc
           node tools/pump_slice_sim.mjs
           c++ -O2 -std=c++17 -Isrc/renderer -o /tmp/compositor \
             tools/note_raster_compositor_check.cpp \

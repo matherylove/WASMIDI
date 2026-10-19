@@ -712,6 +712,35 @@ function mountSoundfontFile(file) {
     return path;
 }
 
+function mountSoundfontFolder(entries, root) {
+    if (!Module || !entries || !entries.length || !root)
+        return "";
+    if (!Module.FS || !Module.WORKERFS)
+        throw new Error("WORKERFS is not available in SnappySynthV2 core.");
+
+    ensureDir("/soundfonts");
+    const index = soundfontFiles.length;
+    const mount = "/soundfonts/layer" + index;
+    ensureDir(mount);
+
+    Module.FS.mount(
+        Module.WORKERFS,
+        { blobs: entries.map(e => ({ name: e.path, data: e.file })) },
+        mount);
+
+    const path = mount + "/" + root;
+    const stat = Module.FS.stat(path);
+    if (!stat || stat.size <= 0) {
+        try { Module.FS.unmount(mount); } catch (_) {}
+        throw new Error("The selected .sfz is empty or WORKERFS could not expose it.");
+    }
+
+    soundfontFiles.push(entries[0].file);
+    soundfontPaths.push(path);
+    soundfontMounts.push(mount);
+    return path;
+}
+
 function unmountAllSoundfonts() {
     for (let i = soundfontMounts.length - 1; i >= 0; --i) {
         try { Module.FS.unmount(soundfontMounts[i]); } catch (_) {}
@@ -1375,11 +1404,13 @@ onmessage = async event => {
                 return;
             }
 
-            const file = data.file;
-            if (!file)
+            const file = data.folder ? null : data.file;
+            if (!file && !data.folder)
                 throw new Error("No SF2 file was provided.");
+            const label = data.folder ? (data.name || "instrument.sfz") : (file.name || "soundfont.sf2");
+            const size = data.folder ? data.folder.length + " files" : Number(file.size || 0) + " bytes";
 
-            const path = mountSoundfontFile(file);
+            const path = data.folder ? mountSoundfontFolder(data.folder, data.root) : mountSoundfontFile(file);
             const regions = callLoadSoundfont(path);
             if (regions > 0) {
                 Module._ssw_warmup();
@@ -1392,8 +1423,7 @@ onmessage = async event => {
                 try { Module.FS.unmount(mount); } catch (_) {}
                 throw new Error(
                     "SnappySynthV2 could not parse and fully materialize " +
-                    (file.name || "soundfont.sf2") +
-                    " before playback (" + Number(file.size || 0) + " bytes).");
+                    label + " before playback (" + size + ").");
             }
 
             soundfontLoaded = true;
@@ -1410,8 +1440,8 @@ onmessage = async event => {
             postState("soundfont", {
                 loaded: true,
                 name: layers > 1
-                    ? (file.name || "soundfont.sf2") + " (+" + (layers - 1) + " layer" + (layers > 2 ? "s" : "") + ")"
-                    : (file.name || "soundfont.sf2"),
+                    ? label + " (+" + (layers - 1) + " layer" + (layers > 2 ? "s" : "") + ")"
+                    : label,
                 layers,
                 regions: Module._ssw_region_count()
             });

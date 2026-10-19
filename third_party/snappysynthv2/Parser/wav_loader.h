@@ -15,6 +15,7 @@ typedef struct {
 } wav_data;
 
 wav_data* wav_load(const char* path);
+wav_data* wav_make_waveform(const char* name, int sample_rate);
 void wav_free(wav_data* data);
 
 #endif // WAV_LOADER_H
