@@ -641,6 +641,22 @@ async function buildVisualPages(message) {
     void drainVisualPages();
 }
 
+// setTimeout(0) in a loop is clamped to 4 ms after a few nested calls: ~250 sweeps a second,
+// fewer than the densest parts need (HANDOFF sec. 89). A message to ourselves yields without the
+// clamp; ?sweepyield=0 goes back to setTimeout.
+const sweepYieldChannel = typeof MessageChannel === "function" ? new MessageChannel() : null;
+const sweepYieldWaiters = [];
+if (sweepYieldChannel)
+    sweepYieldChannel.port1.onmessage = () => { const resolve = sweepYieldWaiters.shift(); if (resolve) resolve(); };
+function sweepYield() {
+    if (!sweepYieldChannel || pageOverride("sweepyield") === 0)
+        return new Promise(resolve => setTimeout(resolve, 0));
+    return new Promise(resolve => {
+        sweepYieldWaiters.push(resolve);
+        sweepYieldChannel.port2.postMessage(0);
+    });
+}
+
 async function drainSharpRenderer() {
     if (sharpRenderRunning)
         return;
@@ -752,7 +768,7 @@ async function drainSharpRenderer() {
             // mapped Worker for up to ~6 ms at a time; that directly delayed
             // synth admission and live-state requests.  Prefetch depth is now
             // maintained by watermarks on the main thread, not by long bursts.
-            await new Promise(resolve => setTimeout(resolve, 0));
+            await sweepYield();
         }
     } finally {
         sharpRenderRunning = false;
@@ -1376,6 +1392,7 @@ let visualPlanWords = 32 * 1048576;
 // lookAheadMB or ?lookahead=MB, decoded before the MIDI opens), 2 the whole song decoded at load
 // and kept (seeks reuse it), 0 the rev. 92 run-ahead with no prefill.
 let rollMode = 0;
+let visualPrefilling = false;
 const VISUAL_BYTES_PER_WORD = 1.5;
 // The keyboard Worker gets each piece when it is this many words from it.
 const LIVE_FORWARD_WORDS = 32 * 1048576;
@@ -1469,7 +1486,12 @@ function visualPump(Module) {
     jointPlan(Module);
     // Past the roll's target, while the synth feed runs, one helper stays free for it.
     const queueLimit = visualQueueLimit(pool);
-    const aheadLimit = feedStarted && !feedComplete ? Math.max(1, pool.helpers.length - 1) : queueLimit;
+    let aheadLimit = feedStarted && !feedComplete ? Math.max(1, pool.helpers.length - 1) : queueLimit;
+    // Past half the plan, one span at a time: the sweep, the keyboard and the page need the cores
+    // more than the refill (HANDOFF sec. 89). Not while prefilling.
+    if (!visualPrefilling && pageOverride("refillcap") !== 0 && typeof Module._wmp_visual_ahead_words_js === "function" &&
+        Number(Module._wmp_visual_ahead_words_js()) >= visualPlanWords / 2)
+        aheadLimit = 1;
     while (visualQueue.length < (visualPlanned <= sharpRenderTarget ? queueLimit : visualAhead ? aheadLimit : 0)) {
         let end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
         if (end <= visualPlanned) break;
@@ -1539,6 +1561,19 @@ async function visualPrefill(Module) {
             " GiB; using look-ahead");
     };
     report();
+    visualPrefilling = true;
+    try {
+        await visualPrefillRun(Module, report, checkBudget);
+    } finally {
+        visualPrefilling = false;
+    }
+    console.info("[WASMIDI roll] " + (full ? "whole song" : "look-ahead") + " ready: " +
+        (Number(Module._wmp_visual_held_bytes_js()) / 1048576).toFixed(0) + " MiB, to " +
+        (Number(Module._wmp_tick_to_seconds_js(Number(Module._wmp_visual_head_js()))) || 0).toFixed(1) + " s, " +
+        ((performance.now() - started) / 1000).toFixed(1) + " s");
+}
+
+async function visualPrefillRun(Module, report, checkBudget) {
     await feedStartPool().catch(() => {});
     if (feedPool && feedPool.settled) {
         await feedPool.settled;
@@ -1566,10 +1601,6 @@ async function visualPrefill(Module) {
             yielded = performance.now();
         }
     }
-    console.info("[WASMIDI roll] " + (full ? "whole song" : "look-ahead") + " ready: " +
-        (Number(Module._wmp_visual_held_bytes_js()) / 1048576).toFixed(0) + " MiB, to " +
-        (Number(Module._wmp_tick_to_seconds_js(Number(Module._wmp_visual_head_js()))) || 0).toFixed(1) + " s, " +
-        ((performance.now() - started) / 1000).toFixed(1) + " s");
 }
 
 // ---- Joint spans (HANDOFF sec. 85) ----
