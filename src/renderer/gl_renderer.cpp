@@ -970,6 +970,11 @@ void GLRenderer::setBackgroundAlpha(float alpha)
         std::clamp(alpha, 0.0f, 1.0f);
 }
 
+void GLRenderer::setPlayheadColor(float r, float g, float b)
+{
+    playheadColor_ = {r, g, b};
+}
+
 void GLRenderer::renderBackground()
 {
     glDisable(GL_DEPTH_TEST);

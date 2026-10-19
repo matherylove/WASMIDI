@@ -6320,3 +6320,55 @@ antes con sobredibujo, 7% más con notas largas por software.
 
 - Cuadros por segundo con GPU real en las PCs del usuario (la medición de arriba es por software).
 - Colores de las teclas apretadas con MIDIs reales de muchas pistas.
+
+## 94. Revisión 97 — GUI nueva, parte 3: colores, config.xml, acento adaptable y avisos
+
+### Pedido
+
+Parte 3 del mockup aprobado (§91): selector de colores por pista o canal con 16 colores en bucle e
+importación del config.xml; la interfaz se adapta a los colores dominantes de las notas; avisos arriba a
+la derecha de polifonía máxima, NPS máximo y atraso, con los cuellos de botella (teclado, gráficos,
+WasmiSynth, visualizador).
+
+### Cambios
+
+- `ColorsDialog.qml` (diálogo "Note colors" del mockup): Track/Channel, paleta de 16 con la textura de las
+  notas (`NoteSwatch.qml`), editor del color elegido (R, G, B, hex), "Reset palette" (los 16 de fábrica),
+  Import/Export config.xml, la lista de pistas (todas las del MIDI, mínimo 17 para mostrar la vuelta) o de
+  canales con su color, y "Adapt the player to the colors playing most". OK conserva; Cancel devuelve
+  colores, modo y "adapt" a como estaban al abrir. Reemplaza el diálogo de 16 cuadros + `ColorDialog`.
+- config.xml: se lee `Visual/Colors/Color` con `R`, `G`, `B` (el formato de los reproductores tipo Piano From
+  Above; el nombre de la raíz no importa), hasta 16 colores en orden; los que falten quedan como están
+  (`wasmidi_browser_import_color_config`, `wasmidi_browser_colors_imported`). Export escribe el mismo
+  formato con raíz `WebAssemblyMIDIPlayer` y solo los colores (`wasmidi_browser_download_text`).
+- Acento: `MainWindow::accentColor` es el color de la paleta que más suena (el conteo de voces más los
+  próximos 150 ms que ya existía para el tono del fondo), o #6b55d4 con "adapt" apagado (`adaptColors`,
+  guardado). `MainWindow.qml` lo anima 600 ms y lo pone en `Dk.accent`: título, gráfico, NPS del LCD, barra
+  de posición y el cursor del roll (`GLRenderer::setPlayheadColor`). `Dk.mix()` es el `mix()` del mockup;
+  `accentLight` = mix 0,3. Se quitaron `dominantHue`/`neuralActivity` (ya no los leía nadie).
+- Avisos (`Toasts.qml`), revisados una vez por segundo mientras suena:
+  - Polifonía y NPS máximos: aparecen cuando el máximo nuevo lleva 1,5 s sin superarse (y pasados 3 s de
+    canción), con el valor y su momento (`peakPolyphonyTime` nuevo); se van a los 8 s; cerrarlo los calla
+    hasta el próximo MIDI. Son los máximos de lo ya tocado ("the most so far"): no hay un pico de todo el
+    archivo calculado de antemano.
+  - Atraso: cuadros de la ventana por segundo (`FrameAnimation`) y su mejor valor como tasa de la pantalla.
+    ROLL atrasado si sus cuadros < 80% de esa tasa; KEYBOARD si va > 0,25 s detrás del cursor o hace menos
+    de min(80%, 30) cuadros (`takeKeyboardSample`: estados de teclado aplicados y su atraso); GRAPHS si
+    dibuja < 80% de lo que permiten la ventana y el reloj de reproducción (`LiveGraph::takeFrames`; el
+    reloj se mueve cada 16 ms); WASMISYNTH si hubo underruns o carga > 100%. Aparece tras 2 s seguidos con
+    algo atrasado, nombra lo atrasado y se va tras 4 s con todo a tiempo; cerrarlo lo calla 30 s.
+- `DkCheckBox.qml`; `DkCaption.startColor` (el aviso de atraso usa el rojo del mockup); las muestras de la
+  paleta del panel usan `NoteSwatch`; `assets/images/dither-light.png` (2×2, blanco al 13% en diagonal).
+
+### Verificación
+
+- Compilación wasm local y Chromium del contenedor con un MIDI sintético y MatheryLSD: avisos de NPS y
+  polifonía con sus momentos, aviso de atraso (en el contenedor el teclado va a 4-6 cuadros/s por la
+  latencia de ~70 ms del Worker y lo nombra; después "Caught up."), diálogo de colores, importación de un
+  config.xml de 4 colores (los 4 primeros cambian en el roll, el teclado y el panel) y Cancel que los
+  devuelve.
+
+### No verificado
+
+- Export (descarga del navegador) y el config.xml real de BPFA del usuario.
+- Umbrales del aviso de atraso en las PCs del usuario (144 Hz, GPU real).

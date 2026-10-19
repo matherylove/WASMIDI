@@ -60,9 +60,14 @@ qt_add_qml_module(wasmidi
         src/qml/DkReadout.qml
         src/qml/DkSlider.qml
         src/qml/PixelIcon.qml
+        src/qml/DkCheckBox.qml
+        src/qml/NoteSwatch.qml
+        src/qml/ColorsDialog.qml
+        src/qml/Toasts.qml
     RESOURCES
         assets/fonts/VT323-Regular.ttf
         assets/images/dither-face.png
+        assets/images/dither-light.png
 )
 
 target_include_directories(wasmidi PRIVATE src)

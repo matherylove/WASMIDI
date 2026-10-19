@@ -107,6 +107,13 @@ void LiveGraph::clear()
     update();
 }
 
+int LiveGraph::takeFrames()
+{
+    const int frames = frames_;
+    frames_ = 0;
+    return frames;
+}
+
 void LiveGraph::itemChange(ItemChange change, const ItemChangeData& data)
 {
     QQuickItem::itemChange(change, data);
@@ -133,6 +140,7 @@ void LiveGraph::sample()
     }
 
     samples_.push_back({time_, float(nps_), float(polyphony_)});
+    ++frames_;
     while (!samples_.empty() && samples_.front().time < time_ - span_ - 0.5)
         samples_.pop_front();
     update();

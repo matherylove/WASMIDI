@@ -87,6 +87,14 @@ public:
             controller->neuralRoll() *
             0.75f);
 
+        const QColor accent =
+            controller->accentColor();
+
+        renderer_.setPlayheadColor(
+            float(accent.redF()),
+            float(accent.greenF()),
+            float(accent.blueF()));
+
         const auto& colors =
             controller->channelColors();
 

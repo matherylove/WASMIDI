@@ -27,15 +27,24 @@ QtObject {
     readonly property color toggleOn: "#2a194b"
     readonly property color captionA: "#1f175a"
 
-    // Accent of the caption, graphs and playhead. Fixed until the UI follows the
-    // note colors.
+    // Accent of the caption, graphs, readouts and playhead: the color of the
+    // notes playing most when "adapt" is on (MainWindow binds it).
     property color accent: "#6b55d4"
-    readonly property color accentLight: Qt.lighter(accent, 1.45)
+    readonly property color accentLight: mix(accent, 0.3)
 
     readonly property string ui: "Tahoma, Verdana, DejaVu Sans, sans-serif"
     readonly property string term: "VT323"
 
     readonly property string ditherFace: "qrc:/qt/qml/Wasmidi/assets/images/dither-face.png"
+    // White at 13% on every other pixel: the texture of notes and keys.
+    readonly property string ditherLight: "qrc:/qt/qml/Wasmidi/assets/images/dither-light.png"
+
+    // Toward white for f > 0, toward black for f < 0 (the mockup's mix()).
+    function mix(c, f) {
+        if (f >= 0)
+            return Qt.rgba(c.r + (1 - c.r) * f, c.g + (1 - c.g) * f, c.b + (1 - c.b) * f, 1)
+        return Qt.rgba(c.r * (1 + f), c.g * (1 + f), c.b * (1 + f), 1)
+    }
 
     function groupDigits(digits) {
         var out = ""
