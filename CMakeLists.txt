@@ -29,7 +29,14 @@ qt_add_executable(wasmidi
     src/renderer/gl_renderer.hpp
     src/renderer/note_raster_compositor.cpp
     src/renderer/note_raster_compositor.hpp
+    src/neural_background.cpp
+    src/neural_background.hpp
+    src/live_graph.cpp
+    src/live_graph.hpp
 )
+
+set_source_files_properties(src/qml/Dk.qml src/qml/Glyphs.qml
+    PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 
 qt_add_qml_module(wasmidi
     URI Wasmidi
@@ -38,8 +45,24 @@ qt_add_qml_module(wasmidi
         src/qml/MainWindow.qml
         src/qml/PianoRoll.qml
         src/qml/Keyboard.qml
-        src/qml/Controls.qml
-        src/qml/StatsPanel.qml
+        src/qml/Dock.qml
+        src/qml/AdvancedDialog.qml
+        src/qml/Dk.qml
+        src/qml/Glyphs.qml
+        src/qml/DkBevel.qml
+        src/qml/DkButton.qml
+        src/qml/DkCapButton.qml
+        src/qml/DkCaption.qml
+        src/qml/DkCell.qml
+        src/qml/DkDialog.qml
+        src/qml/DkField.qml
+        src/qml/DkGroup.qml
+        src/qml/DkReadout.qml
+        src/qml/DkSlider.qml
+        src/qml/PixelIcon.qml
+    RESOURCES
+        assets/fonts/VT323-Regular.ttf
+        assets/images/dither-face.png
 )
 
 target_include_directories(wasmidi PRIVATE src)

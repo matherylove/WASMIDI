@@ -1,3 +1,4 @@
+#include <QFontDatabase>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
@@ -11,8 +12,10 @@ int main(int argc, char *argv[])
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
 
     QGuiApplication app(argc, argv);
-    app.setApplicationName(QStringLiteral("WASMIDI Player"));
+    app.setApplicationName(QStringLiteral("WebAssembly MIDI Player"));
     app.setOrganizationName(QStringLiteral("Dekxtopia"));
+    QFontDatabase::addApplicationFont(
+        QStringLiteral(":/qt/qml/Wasmidi/assets/fonts/VT323-Regular.ttf"));
 
     QQmlApplicationEngine engine;
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,

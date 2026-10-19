@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§91). Este archivo resume el estado al cierre de la rev. 94 y dice
+`HANDOFF.md` (§1-§92). Este archivo resume el estado al cierre de la rev. 95 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -14,7 +14,7 @@ con `.github/workflows/build-wasm.yml`.
 Partes:
 
 - **App Qt6 compilada a WebAssembly** (`src/`): ventana, controles QML
-  (`src/qml/Controls.qml`), transporte, scheduler del synth (`src/mainwindow.cpp`,
+  (`src/qml/MainWindow.qml`, `Dock.qml`, kit `Dk*`), transporte, scheduler del synth (`src/mainwindow.cpp`,
   mucho JS embebido con `EM_JS`), piano roll **horizontal** en WebGL2
   (`src/renderer/gl_renderer.cpp`), caché de tiles culleados estilo BPFA
   (`src/renderer/note_raster_compositor.*`).
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 94)
+## Estado actual (rev. 95)
 
 Rendimiento medido por el usuario:
 
@@ -271,6 +271,12 @@ Rendimiento medido por el usuario:
   kit de dekx.css, fondo neural de `dekx.js`; falta cablearlo). WasmiSynth carga una carpeta SFZ
   (botón "SFZ", soltar carpeta en Audio): rutas de Windows sin mayúsculas, `#define`/`#include`, sample
   en `<group>`, WAV 8/24/32/float, FLAC/Ogg/Opus decodificados en la página. `tools/sfz_folder_check.c`.
+- Rev. 95 (HANDOFF §92): GUI nueva, parte 1 del mockup aprobado. Ventana con el kit de dekx.cc
+  (componentes `Dk*` en `src/qml/`, singleton `Dk.qml`), LCD, panel `Dock.qml` sin scroll, diálogo
+  `AdvancedDialog.qml` (motor, contadores, archivo), barra de estado; fondo neural de `dekx.js` detrás de
+  toda la página (`NeuralBackground`, C++) y el roll con fondo semitransparente; gráfico NPS/polifonía
+  por cuadro (`LiveGraph`, C++); VT323 en los recursos. Faltan las partes 2-5 (notas y teclado, colores
+  y avisos, cuadros sin tope, celular).
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -308,7 +314,7 @@ Mecanismos activos y cómo desactivarlos:
 | Tope del rellenado: un tramo por vez pasada la mitad del plan (rev. 93) | `?refillcap=0` |
 | Barrido del roll cede con `MessageChannel` (rev. 93) | `?sweepyield=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
-| Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
+| Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | Advanced… → Sharding: Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |
 | WebGPU | botón CPU/GPU |

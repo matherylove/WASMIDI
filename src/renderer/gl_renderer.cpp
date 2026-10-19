@@ -383,10 +383,6 @@ GLRenderer::GLRenderer()
             defaults[i][3]
         };
     }
-    neuralLines_.reserve(95u * 24u);
-    neuralPoints_.reserve(95u);
-
-    initializeNeuralNodes();
 }
 
 GLRenderer::~GLRenderer()
@@ -488,6 +484,7 @@ in vec2 vUv;
 uniform float uHue;
 uniform float uActivity;
 uniform float uAspect;
+uniform float uAlpha;
 
 out vec4 fragColor;
 
@@ -626,132 +623,18 @@ void main()
         (.09 +
          activity * .07);
 
+    // Premultiplied: the page's neural background shows through (HANDOFF sec. 92).
     fragColor =
         vec4(
             clamp(
                 color,
                 0.0,
-                1.0),
-            1.0);
+                1.0) *
+            uAlpha,
+            uAlpha);
 }
 )GLSL";
 
-    static const char* neuralVertex = R"GLSL(#version 300 es
-precision highp float;
-
-layout(location=0) in vec2 aPosition;
-layout(location=1) in float aValue;
-
-uniform int uPointMode;
-
-out float vAlpha;
-
-void main()
-{
-    gl_Position =
-        vec4(
-            aPosition,
-            0.998,
-            1.0);
-
-    vAlpha =
-        uPointMode == 0
-            ? aValue
-            : 0.95;
-
-    if (uPointMode != 0)
-        gl_PointSize = aValue;
-}
-)GLSL";
-
-    static const char* neuralFragment = R"GLSL(#version 300 es
-precision mediump float;
-
-uniform float uHue;
-uniform int uPointMode;
-
-in float vAlpha;
-
-out vec4 fragColor;
-
-vec3 hsv2rgb(vec3 c)
-{
-    vec4 K =
-        vec4(
-            1.0,
-            2.0/3.0,
-            1.0/3.0,
-            3.0);
-
-    vec3 p =
-        abs(
-            fract(
-                c.xxx +
-                K.xyz) *
-            6.0 -
-            K.www);
-
-    return
-        c.z *
-        mix(
-            K.xxx,
-            clamp(
-                p -
-                K.xxx,
-                0.0,
-                1.0),
-            c.y);
-}
-
-void main()
-{
-    float hueOffset =
-        uPointMode == 0
-            ? 25.0
-            : 35.0;
-
-    vec3 color =
-        hsv2rgb(
-            vec3(
-                fract(
-                    (uHue +
-                     hueOffset) /
-                    360.0),
-                uPointMode == 0
-                    ? .70
-                    : .78,
-                uPointMode == 0
-                    ? .65
-                    : .68));
-
-    float alpha = vAlpha;
-
-    if (uPointMode != 0) {
-        vec2 p =
-            gl_PointCoord *
-            2.0 -
-            1.0;
-
-        float d =
-            dot(p,p);
-
-        if (d > 1.0)
-            discard;
-
-        alpha *=
-            (1.0 -
-             smoothstep(
-                 0.0,
-                 1.0,
-                 d));
-    }
-
-    fragColor =
-        vec4(
-            color,
-            alpha);
-}
-)GLSL";
 
     noteProgram_ =
         linkProgram(
@@ -763,13 +646,8 @@ void main()
             backgroundVertex,
             backgroundFragment);
 
-    neuralProgram_ =
-        linkProgram(
-            neuralVertex,
-            neuralFragment);
-
     // The horizontal note program is the only mandatory pipeline.
-    // Background/neural effects are optional accelerations and must never make
+    // Background effects are optional accelerations and must never make
     // the piano roll disappear if a browser/driver rejects one of their shaders.
     if (!noteProgram_)
         return false;
@@ -831,18 +709,11 @@ void main()
             glGetUniformLocation(
                 backgroundProgram_,
                 "uAspect");
-    }
 
-    if (neuralProgram_) {
-        neuralHueUniform_ =
+        backgroundAlphaUniform_ =
             glGetUniformLocation(
-                neuralProgram_,
-                "uHue");
-
-        neuralPointModeUniform_ =
-            glGetUniformLocation(
-                neuralProgram_,
-                "uPointMode");
+                backgroundProgram_,
+                "uAlpha");
     }
 
     return true;
@@ -973,96 +844,6 @@ bool GLRenderer::initialize()
         1,
         &backgroundVao_);
 
-    glGenVertexArrays(
-        1,
-        &neuralLineVao_);
-
-    glGenBuffers(
-        1,
-        &neuralLineVbo_);
-
-    glBindVertexArray(
-        neuralLineVao_);
-
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        neuralLineVbo_);
-
-    // Allocate the maximum neural overlay storage once. Re-specifying these
-    // buffers with glBufferData() every frame can force WebGL buffer orphaning
-    // and browser/GPU synchronization even when the MIDI itself is sparse.
-    // The visible result is identical; only the upload path changes.
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        static_cast<GLsizeiptr>(
-            95u * 94u * sizeof(NeuralLineVertex)),
-        nullptr,
-        GL_STREAM_DRAW);
-
-    glEnableVertexAttribArray(0);
-
-    glVertexAttribPointer(
-        0, 2, GL_FLOAT, GL_FALSE,
-        sizeof(NeuralLineVertex),
-        reinterpret_cast<void*>(
-            offsetof(
-                NeuralLineVertex,
-                x)));
-
-    glEnableVertexAttribArray(1);
-
-    glVertexAttribPointer(
-        1, 1, GL_FLOAT, GL_FALSE,
-        sizeof(NeuralLineVertex),
-        reinterpret_cast<void*>(
-            offsetof(
-                NeuralLineVertex,
-                alpha)));
-
-    glBindVertexArray(0);
-
-    glGenVertexArrays(
-        1,
-        &neuralPointVao_);
-
-    glGenBuffers(
-        1,
-        &neuralPointVbo_);
-
-    glBindVertexArray(
-        neuralPointVao_);
-
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        neuralPointVbo_);
-
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        static_cast<GLsizeiptr>(
-            95u * sizeof(NeuralPointVertex)),
-        nullptr,
-        GL_STREAM_DRAW);
-
-    glEnableVertexAttribArray(0);
-
-    glVertexAttribPointer(
-        0, 2, GL_FLOAT, GL_FALSE,
-        sizeof(NeuralPointVertex),
-        reinterpret_cast<void*>(
-            offsetof(
-                NeuralPointVertex,
-                x)));
-
-    glEnableVertexAttribArray(1);
-
-    glVertexAttribPointer(
-        1, 1, GL_FLOAT, GL_FALSE,
-        sizeof(NeuralPointVertex),
-        reinterpret_cast<void*>(
-            offsetof(
-                NeuralPointVertex,
-                size)));
-
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
@@ -1084,9 +865,7 @@ void GLRenderer::destroy()
     const GLuint buffers[] = {
         noteVbo_,
         carryVbo_,
-        denseVbo_,
-        neuralLineVbo_,
-        neuralPointVbo_
+        denseVbo_
     };
 
     for (GLuint buffer : buffers) {
@@ -1098,9 +877,7 @@ void GLRenderer::destroy()
         noteVao_,
         carryVao_,
         denseVao_,
-        backgroundVao_,
-        neuralLineVao_,
-        neuralPointVao_
+        backgroundVao_
     };
 
     for (GLuint vao : vaos) {
@@ -1110,8 +887,7 @@ void GLRenderer::destroy()
 
     const GLuint programs[] = {
         noteProgram_,
-        backgroundProgram_,
-        neuralProgram_
+        backgroundProgram_
     };
 
     for (GLuint program : programs) {
@@ -1126,8 +902,6 @@ void GLRenderer::destroy()
     noteVbo_ = 0;
     carryVbo_ = 0;
     denseVbo_ = 0;
-    neuralLineVbo_ = 0;
-    neuralPointVbo_ = 0;
 
     noteVao_ = 0;
     carryVao_ = 0;
@@ -1138,12 +912,9 @@ void GLRenderer::destroy()
         cullVao_ = 0;
     }
     backgroundVao_ = 0;
-    neuralLineVao_ = 0;
-    neuralPointVao_ = 0;
 
     noteProgram_ = 0;
     backgroundProgram_ = 0;
-    neuralProgram_ = 0;
 
     ring_.clear();
     carryNotes_.clear();
@@ -1286,55 +1057,7 @@ void GLRenderer::setNeuralVisual(float hue, float activity)
         std::clamp(activity, 0.0f, 1.0f);
 }
 
-void GLRenderer::initializeNeuralNodes()
-{
-    uint32_t state =
-        0x4d595df4u;
-
-    auto random01 =
-        [&state]() {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-
-            return
-                float(
-                    state &
-                    0x00ffffffu) /
-                float(
-                    0x01000000u);
-        };
-
-    for (auto& node :
-         neuralNodes_) {
-        node.x = random01();
-        node.y = random01();
-
-        node.radius =
-            .7f +
-            random01() *
-            1.2f;
-
-        node.pulse =
-            random01() *
-            6.28318530718f;
-
-        node.pulseSpeed =
-            .006f +
-            random01() *
-            .014f;
-
-        node.steer =
-            random01() *
-            6.28318530718f;
-
-        node.steerSpeed =
-            .003f +
-            random01() *
-            .004f;
-    }
-}
-void GLRenderer::updateNeuralNodes()
+void GLRenderer::updateBackgroundHue()
 {
     const auto now =
         std::chrono::steady_clock::now();
@@ -1369,146 +1092,17 @@ void GLRenderer::updateNeuralNodes()
             hueDiff *
             .02f *
             frameScale);
-
-    const float speed =
-        .28f +
-        neuralActivity_ *
-        2.2f;
-
-    neuralPoints_.clear();
-
-    for (auto& node :
-         neuralNodes_) {
-        node.steer +=
-            node.steerSpeed *
-            (1.0f +
-             neuralActivity_ *
-             6.0f) *
-            frameScale;
-
-        node.x +=
-            std::cos(node.steer) *
-            speed /
-            float(width_) *
-            frameScale;
-
-        node.y +=
-            std::sin(node.steer) *
-            speed /
-            float(height_) *
-            frameScale;
-
-        node.pulse +=
-            node.pulseSpeed *
-            frameScale;
-
-        if (node.x < -.04f)
-            node.x = 1.04f;
-
-        if (node.x > 1.04f)
-            node.x = -.04f;
-
-        if (node.y < -.06f)
-            node.y = 1.06f;
-
-        if (node.y > 1.06f)
-            node.y = -.06f;
-
-        const float pointRadius =
-            node.radius *
-            (.8f +
-             .2f *
-             std::sin(
-                 node.pulse)) *
-            (1.0f +
-             neuralActivity_ *
-             .5f);
-
-        neuralPoints_.push_back({
-            node.x * 2.0f - 1.0f,
-            1.0f - node.y * 2.0f,
-            std::max(
-                1.0f,
-                pointRadius *
-                2.6f),
-            .95f
-        });
-    }
-
-    neuralLines_.clear();
-
-    const float threshold =
-        130.0f;
-
-    for (std::size_t i = 0;
-         i < neuralNodes_.size();
-         ++i) {
-        const auto& a =
-            neuralNodes_[i];
-
-        const float ax =
-            a.x *
-            float(width_);
-
-        const float ay =
-            a.y *
-            float(height_);
-
-        for (std::size_t j = i + 1;
-             j < neuralNodes_.size();
-             ++j) {
-            const auto& b =
-                neuralNodes_[j];
-
-            const float dx =
-                ax -
-                b.x *
-                float(width_);
-
-            const float dy =
-                ay -
-                b.y *
-                float(height_);
-
-            const float distance2 =
-                dx * dx +
-                dy * dy;
-
-            if (distance2 >=
-                threshold *
-                threshold) {
-                continue;
-            }
-
-            const float distance =
-                std::sqrt(
-                    distance2);
-
-            const float alpha =
-                (1.0f -
-                 distance /
-                 threshold) *
-                (.28f +
-                 neuralActivity_ *
-                 .22f);
-
-            neuralLines_.push_back({
-                a.x * 2.0f - 1.0f,
-                1.0f - a.y * 2.0f,
-                alpha
-            });
-
-            neuralLines_.push_back({
-                b.x * 2.0f - 1.0f,
-                1.0f - b.y * 2.0f,
-                alpha
-            });
-        }
-    }
 }
+
+void GLRenderer::setBackgroundAlpha(float alpha)
+{
+    backgroundAlpha_ =
+        std::clamp(alpha, 0.0f, 1.0f);
+}
+
 void GLRenderer::renderBackground()
 {
-    updateNeuralNodes();
+    updateBackgroundHue();
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -1531,6 +1125,10 @@ void GLRenderer::renderBackground()
             float(width_) /
             float(std::max(1, height_)));
 
+        glUniform1f(
+            backgroundAlphaUniform_,
+            backgroundAlpha_);
+
         glBindVertexArray(
             backgroundVao_);
 
@@ -1545,92 +1143,14 @@ void GLRenderer::renderBackground()
         // Safe visual fallback: notes remain usable even if the optional
         // background shader is rejected by a WebGL implementation.
         glClearColor(
-            .010f,
-            .010f,
-            .026f,
-            1.0f);
+            .010f * backgroundAlpha_,
+            .010f * backgroundAlpha_,
+            .026f * backgroundAlpha_,
+            backgroundAlpha_);
 
         glClear(
             GL_COLOR_BUFFER_BIT);
     }
-
-    if (!neuralProgram_)
-        return;
-
-    glEnable(GL_BLEND);
-
-    glBlendFunc(
-        GL_SRC_ALPHA,
-        GL_ONE_MINUS_SRC_ALPHA);
-
-    glUseProgram(
-        neuralProgram_);
-
-    glUniform1f(
-        neuralHueUniform_,
-        neuralHue_);
-
-    if (!neuralLines_.empty()) {
-        glBindBuffer(
-            GL_ARRAY_BUFFER,
-            neuralLineVbo_);
-
-        glBufferSubData(
-            GL_ARRAY_BUFFER,
-            0,
-            static_cast<GLsizeiptr>(
-                neuralLines_.size() *
-                sizeof(
-                    NeuralLineVertex)),
-            neuralLines_.data());
-
-        glUniform1i(
-            neuralPointModeUniform_,
-            0);
-
-        glBindVertexArray(
-            neuralLineVao_);
-
-        glDrawArrays(
-            GL_LINES,
-            0,
-            static_cast<GLsizei>(
-                neuralLines_.size()));
-    }
-
-    if (!neuralPoints_.empty()) {
-        glBindBuffer(
-            GL_ARRAY_BUFFER,
-            neuralPointVbo_);
-
-        glBufferSubData(
-            GL_ARRAY_BUFFER,
-            0,
-            static_cast<GLsizeiptr>(
-                neuralPoints_.size() *
-                sizeof(
-                    NeuralPointVertex)),
-            neuralPoints_.data());
-
-        glUniform1i(
-            neuralPointModeUniform_,
-            1);
-
-        glBindVertexArray(
-            neuralPointVao_);
-
-        glDrawArrays(
-            GL_POINTS,
-            0,
-            static_cast<GLsizei>(
-                neuralPoints_.size()));
-    }
-
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glUseProgram(0);
-
-    glDisable(GL_BLEND);
 }
 
 void GLRenderer::resetVisualPageCache(bool reinstallDocument)

@@ -157,12 +157,12 @@ async def main():
                 await page.screenshot(path="/tmp/wasmidi_picker_fail.png")
                 raise RuntimeError("no file picker at %d,%d (screenshot /tmp/wasmidi_picker_fail.png)" % (x, y))
             await page.wait_for_timeout(20000)
-            await choose(268, 580, args[2])
+            await choose(1176, 710, args[2])  # SF2… in the WasmiSynth group
             await page.wait_for_function("() => globalThis.WasmidiSnappyBridge && WasmidiSnappyBridge.state.soundfontLoaded",
                                          timeout=600000)
             voices = next((f.split("=", 1)[1] for f in flags if f.startswith("--voices=")), None)
             if voices:
-                await page.mouse.dblclick(82, 659)
+                await page.mouse.dblclick(1067, 739)  # Voices field
                 await page.keyboard.press("Control+A")
                 await page.keyboard.type(voices)
                 await page.keyboard.press("Enter")
@@ -170,7 +170,7 @@ async def main():
             await choose(800, 400, args[1])
             await page.wait_for_function("() => window.__wb.loaded", timeout=3600000)
             await page.wait_for_timeout(3000)
-            await page.mouse.click(25, 175)  # play, after the file row appears
+            await page.mouse.click(906, 88)  # play
             seek_at = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--seek=")), None)
             profile = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--profile=")), None)
             trace = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--trace=")), None)
@@ -178,9 +178,9 @@ async def main():
             pause = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--pause=")), None)
             for second in range(int(seconds)):
                 if pause and second in (int(pause[0]), int(pause[0]) + int(pause[1])):
-                    await page.mouse.click(25, 175)  # the same button pauses and resumes
+                    await page.mouse.click(943 if second == int(pause[0]) else 906, 88)  # pause, then play
                 if seek_at is not None and second == seek_at:
-                    await page.mouse.click(110, 170)  # position slider, about 18% of the song
+                    await page.mouse.click(963, 60)  # position slider, about 18% of the song
                 if trace and second == int(trace[0]):
                     await browser.start_tracing(page=page, path=trace[2], categories=[
                         "toplevel", "blink", "v8", "gpu", "devtools.timeline", "disabled-by-default-devtools.timeline",

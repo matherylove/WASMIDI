@@ -86,6 +86,11 @@ public:
             controller->dominantHue(),
             controller->neuralActivity());
 
+        renderer_.setBackgroundAlpha(
+            1.0f -
+            controller->neuralRoll() *
+            0.75f);
+
         const auto& colors =
             controller->channelColors();
 

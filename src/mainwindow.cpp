@@ -1450,6 +1450,19 @@ EM_JS(void, wasmidi_snappy_configure,
     });
 });
 
+EM_JS(void, wasmidi_browser_toggle_full_screen, (), {
+    const warn = (e) => console.warn("[WASMIDI] full screen:", e);
+    try {
+        const p = document.fullscreenElement
+            ? document.exitFullscreen()
+            : document.documentElement.requestFullscreen({ navigationUI: "hide" });
+        if (p && p.catch)
+            p.catch(warn);
+    } catch (e) {
+        warn(e);
+    }
+});
+
 EM_JS(void, wasmidi_snappy_set_gpu, (int enabled), {
     const b = globalThis.WasmidiSnappyBridge;
     if (b && b.setGpu)
@@ -1587,6 +1600,8 @@ MainWindow::MainWindow(QObject* parent)
     synthGpu_ = wasmidi_setting_number("synthGpu", synthGpu_ ? 1.0 : 0.0) != 0.0;
     rollMode_ = wasmidi_setting_number("rollMode", rollMode_) == 2.0 ? 2 : 1;
     rollLookAheadMB_ = int(std::clamp(wasmidi_setting_number("rollLookAheadMB", rollLookAheadMB_), 64.0, 16384.0));
+    neuralRoll_ = float(std::clamp(wasmidi_setting_number("neuralRoll", neuralRoll_), 0.0, 1.0));
+    neuralPage_ = float(std::clamp(wasmidi_setting_number("neuralPage", neuralPage_), 0.0, 1.0));
 
     for (int i = 0; i < channelColors_.size(); ++i) {
         const QByteArray key = QByteArray("channelColor.") + QByteArray::number(i);
@@ -1883,6 +1898,13 @@ void MainWindow::openSfzFolderPicker()
 #else
     synthStatus_ = QStringLiteral("The SFZ folder picker is available in the WebAssembly build.");
     emit synthStateChanged();
+#endif
+}
+
+void MainWindow::toggleFullScreen()
+{
+#ifdef __EMSCRIPTEN__
+    wasmidi_browser_toggle_full_screen();
 #endif
 }
 
@@ -2986,6 +3008,26 @@ void MainWindow::setRollMode(int mode)
     rollMode_ = mode;
     WASMIDI_PERSIST_SETTING("rollMode", rollMode_);
     emit rollConfigChanged();
+}
+
+void MainWindow::setNeuralRoll(float amount)
+{
+    amount = std::clamp(amount, 0.0f, 1.0f);
+    if (neuralRoll_ == amount)
+        return;
+    neuralRoll_ = amount;
+    WASMIDI_PERSIST_SETTING("neuralRoll", neuralRoll_);
+    emit neuralBackgroundChanged();
+}
+
+void MainWindow::setNeuralPage(float amount)
+{
+    amount = std::clamp(amount, 0.0f, 1.0f);
+    if (neuralPage_ == amount)
+        return;
+    neuralPage_ = amount;
+    WASMIDI_PERSIST_SETTING("neuralPage", neuralPage_);
+    emit neuralBackgroundChanged();
 }
 
 void MainWindow::setRollLookAheadMB(int megabytes)

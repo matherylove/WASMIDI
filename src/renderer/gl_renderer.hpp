@@ -35,6 +35,7 @@ public:
                          uint8_t g,
                          uint8_t b);
     void setNeuralVisual(float hue, float activity);
+    void setBackgroundAlpha(float alpha);
 
     bool renderRoll();
 
@@ -57,34 +58,10 @@ public:
         bool complete);
 
 private:
-    struct NeuralNode {
-        float x = 0.0f;
-        float y = 0.0f;
-        float radius = 1.0f;
-        float pulse = 0.0f;
-        float pulseSpeed = 0.01f;
-        float steer = 0.0f;
-        float steerSpeed = 0.004f;
-    };
-
-    struct NeuralLineVertex {
-        float x = 0.0f;
-        float y = 0.0f;
-        float alpha = 0.0f;
-    };
-
-    struct NeuralPointVertex {
-        float x = 0.0f;
-        float y = 0.0f;
-        float size = 1.0f;
-        float alpha = 1.0f;
-    };
-
     bool createPrograms();
     void destroy();
 
-    void initializeNeuralNodes();
-    void updateNeuralNodes();
+    void updateBackgroundHue();
     void renderBackground();
 
     void allocateRing(std::size_t capacity);
@@ -191,6 +168,7 @@ private:
     float neuralHue_ = 230.0f;
     float neuralTargetHue_ = 230.0f;
     float neuralActivity_ = 0.0f;
+    float backgroundAlpha_ = 1.0f;
 
     const MidiDocument* document_ = nullptr;
 
@@ -222,14 +200,7 @@ private:
     GLint backgroundHueUniform_ = -1;
     GLint backgroundActivityUniform_ = -1;
     GLint backgroundAspectUniform_ = -1;
-
-    GLuint neuralProgram_ = 0;
-    GLuint neuralLineVao_ = 0;
-    GLuint neuralLineVbo_ = 0;
-    GLuint neuralPointVao_ = 0;
-    GLuint neuralPointVbo_ = 0;
-    GLint neuralHueUniform_ = -1;
-    GLint neuralPointModeUniform_ = -1;
+    GLint backgroundAlphaUniform_ = -1;
 
     std::array<std::array<uint8_t, 4>, 16>
         channelColors_{};
@@ -340,10 +311,6 @@ private:
     std::vector<uint32_t> sharpRemotePendingCloseWords_;
     std::size_t sharpRemotePendingCloseOffset_ = 0;
 
-
-    std::array<NeuralNode, 95> neuralNodes_{};
-    std::vector<NeuralLineVertex> neuralLines_;
-    std::vector<NeuralPointVertex> neuralPoints_;
 
     std::chrono::steady_clock::time_point neuralClock_ =
         std::chrono::steady_clock::now();

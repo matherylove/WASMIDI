@@ -6179,3 +6179,80 @@ hacía fallar todo el instrumento (`ssw_instrument_is_materialized`).
 - Opcodes que el motor no implementa (lorand/hirand, seq_*, sw_*, locc/hicc, curvas, efectos,
   `amp_veltrack`, `pitch_keytrack`…) se ignoran como antes; "soporte total" de opcodes queda pendiente.
 - El botón "SFZ" de WASMIDI no se probó en el navegador (mismo bridge que WASMIDI Audio).
+
+## 92. Revisión 95 — GUI nueva, parte 1: ventana dekx, LCD, panel, barra de estado y fondo neural
+
+**Pedido:** cablear el mockup aprobado en §91 (https://claude.ai/artifact/6Rzqy1QJQrBaJq39comYMd) por
+partes. Esta es la parte 1: la ventana con el kit de dekx.cc, el LCD, el panel de la derecha, la barra
+de estado, el fondo neural de toda la página, el note speed con barra y segundos escritos, el diálogo
+Advanced, el nombre "WebAssembly MIDI Player" y sin letreros innecesarios ni nombres de otros programas.
+Quedan para las partes siguientes: notas y teclado con degradado y textura y teclado vertical (2), los
+16 colores en bucle con el config.xml, la UI que sigue los colores y los avisos de polifonía, NPS y
+lag (3), cuadros sin tope con prioridad (4) y el modo celular vertical (5).
+
+### Cambios
+
+- QML nuevo (`src/qml/`): `Dk.qml` (singleton con los colores de dekx.css, fuentes y formatos de
+  números), `Glyphs.qml` (íconos pixel art del mockup), `DkBevel` (biseles raised/sunken/thin-in como
+  bordes de 1 px), `DkButton` (botón y toggle VT323, presionado con el tramado 2×2 de dekx.css),
+  `DkGroup` (caja con título en el borde), `DkField`, `DkSlider`, `DkReadout`, `DkCell`, `DkCaption`,
+  `DkCapButton`, `DkDialog` (ventana hija), `PixelIcon`, `Dock.qml` (panel) y `AdvancedDialog.qml`.
+  `Controls.qml` y `StatsPanel.qml` se borraron: su contenido quedó en el panel y en Advanced.
+- Ventana: título con degradado y botón de pantalla completa (`MainWindow::toggleFullScreen`, API
+  Fullscreen del navegador). LCD con reloj, total, estado (PLAY/PAUSE/STOP/LOAD), marquesina con
+  archivo, pistas y PPQ, y lecturas Notes, NPS, Polyphony, BPM y FPS. Transporte con íconos pixel art,
+  MIDI…, cerrar MIDI y VOL. Barra de estado: estado, FPS, WasmiSynth (voces, workers, carga), pistas y PPQ.
+- Panel (304 px, sin scroll; solo el gráfico crece): Graphs, Note speed (barra 0,1-10 s y campo de
+  0,1-60 s), Colors (TRACK/CHANNEL, los 16 colores, Edit… abre un diálogo con los 16 que lleva al
+  selector de color), Neural background (Roll y Page), WasmiSynth (SoundFont, SF2…, SFZ…, Voices,
+  CPU/GPU, STACK GAIN, SOFT CLIP, Advanced…, barra de carga) y Roll cache.
+- Advanced: SoundFont (nombre, capas, estado del synth, Clear), Engine (Block, Buffers, Min voices,
+  Workers, Rate, Vel ≥, Sharding, Channels, Bits, RT priority, Steal cache, Fast note-off, Validate,
+  Debug), Live (los contadores de antes; los de diagnóstico solo con Debug), View (notas pasadas, el
+  post-buffer de antes) y File (formato, PPQ, canales, cambios de tempo, CC, rango, picos).
+- Letreros quitados: "Dekxtopia/Home/MIDI Player WebGL2 NEW", "BLACK MIDI PLAYER", "Format 0 / 1 ·
+  Black MIDI ready", el FPS sobre el roll (pasó al LCD), las etiquetas de octava del teclado, "Parsing
+  runs in a background worker / UI stays responsive", "Audio: AudioWorklet", la línea "Worker → original
+  SnappySynthV2…", "Source-only desktop options…". Los cinco gráficos chicos (NPS, polifonía, BPM, CC/s,
+  velocidad saltada) y el NPS LIVE quedaron en un gráfico; la velocidad saltada está en Live ("VEL ≥").
+- Fondo neural (`src/neural_background.{hpp,cpp}`, `NeuralBackground`): el de `dekx.js` con el grafo de
+  escena (líneas y cuadrados de 2 px con color por vértice), detrás de toda la página. Nodos
+  min(80, ancho·alto/18000), velocidad ±0,08 px por cuadro de 60 Hz medida en tiempo (igual a
+  cualquier tasa de cuadros), envolvimiento a 10 px del borde. El roll ya no dibuja su propia red: su
+  fondo (el shader de tono y manchas) sale premultiplicado con alfa 1 − Roll·0,75 y deja ver la red de la
+  página; el panel tiene alfa 1 − Page·0,5 (las mismas fórmulas del mockup). `neuralRoll`/`neuralPage`
+  en `MainWindow`, guardados en localStorage.
+- Gráfico (`src/live_graph.{hpp,cpp}`, `LiveGraph`): NPS relleno con degradado vertical (0,75 → 0,05 del
+  acento) y línea, polifonía punteada (3 px sí, 2 no) y cuadrícula, los últimos 10 s de canción. Toma una
+  muestra por cuadro mostrado (`QQuickWindow::afterAnimating`, como mucho 2048 por ventana) en vez del
+  Timer de 33 ms y los seis Canvas de antes, y lo dibuja el grafo de escena. Un salto de posición
+  empieza la historia de nuevo.
+- Fuente VT323 (SIL OFL 1.1, `assets/fonts/VT323-Regular.ttf` y su licencia `VT323-OFL.txt`) en los
+  recursos del módulo; Tahoma no existe en el wasm y cae en la fuente por defecto de Qt.
+- CI ("Prepare Pages artifact"): `<title>WebAssembly MIDI Player</title>` y la ventana de carga de Qt
+  (logo y "Qt for WebAssembly: wasmidi") cambiada por una ventana de dekx.cc; el paso falla si no la
+  encuentra.
+- `tools/browser_bench.py app`: coordenadas del layout nuevo a 1280×900 (SF2… 1176,710; Voices
+  1067,739; play 906,88; pausa 943,88; barra de posición 963,60).
+
+### Medición
+
+Chromium del contenedor (4 hilos, sin GPU: WebGL por software), `browser_bench.py app` con un MIDI
+sintético de 16 pistas y 60 s (26.880 notas) y MatheryLSD, 40 s con `?visualdebug=1`, la GUI de la
+rev. 94 contra esta: 11,0 contra 10,7 cuadros/s y 991 contra 978 ms/s de tareas largas. El hilo de la
+página está saturado por el WebGL por software en las dos, así que la diferencia es ruido; no sirve
+para decidir entre una y otra. El costo propio del fondo es ≤ 80 nodos (≤ 3160 pares por cuadro) y
+el del gráfico ≤ ~2048 muestras por cuadro.
+
+### Verificación
+
+- Compilación wasm local (Emscripten 3.1.56, Qt 6.8.3) y paso "Prepare Pages artifact" OK.
+- Chromium: la página carga sin errores de QML, el MIDI y la SF2 cargan con los botones nuevos, suena,
+  el roll, el teclado, el LCD, el gráfico y la barra de estado se actualizan; Advanced y Colors abren y
+  cierran.
+
+### No verificado
+
+- Nada en una GPU real: cuadros por segundo y el costo del fondo en las PCs del usuario.
+- Pantalla completa (necesita un clic real del usuario) y el selector de color dentro del diálogo.
+- Ventanas más chicas que 840×600: el panel no tiene scroll y se recorta (el modo celular es la parte 5).
