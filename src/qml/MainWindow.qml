@@ -299,10 +299,16 @@ ApplicationWindow {
 
                     DkBevel { anchors.fill: parent; kind: 1 }
 
-                    ColumnLayout {
+                    RowLayout {
                         anchors.fill: parent
                         anchors.margins: 2
                         spacing: 0
+
+                        Keyboard {
+                            Layout.preferredWidth: 62
+                            Layout.fillHeight: true
+                            mainWindow: mainWindow
+                        }
 
                         PianoRoll {
                             id: roll
@@ -310,12 +316,6 @@ ApplicationWindow {
                             Layout.fillHeight: true
                             mainWindow: mainWindow
                             onOpenRequested: mainWindow.openMidiPicker()
-                        }
-
-                        Keyboard {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: Math.max(64, Math.min(110, window.height * 0.12))
-                            mainWindow: mainWindow
                         }
                     }
                 }

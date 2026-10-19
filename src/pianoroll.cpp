@@ -82,10 +82,6 @@ public:
             controller->
                 perTrackColors());
 
-        renderer_.setNeuralVisual(
-            controller->dominantHue(),
-            controller->neuralActivity());
-
         renderer_.setBackgroundAlpha(
             1.0f -
             controller->neuralRoll() *
@@ -163,8 +159,7 @@ public:
             updateFps();
         }
 
-        // GPU neural background animates even while paused, replacing the old
-        // QML FrameAnimation/Canvas loop with this single scene-graph source.
+        // Redraws every displayed frame, also while paused.
         update();
     }
 

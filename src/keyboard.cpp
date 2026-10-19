@@ -9,14 +9,25 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <vector>
 
 namespace {
 
 struct KeyInstance {
     float x, y, w, h;
-    float r, g, b, active;
+    float r, g, b, pressed;
+    float kind, separator;
 };
+
+// Instance kinds: a key row (white face), a black key's row (white face with
+// the short divider) and the black bar drawn over it.
+constexpr float KindWhiteRow = 0.0f;
+constexpr float KindBlackRow = 1.0f;
+constexpr float KindBlackBar = 2.0f;
+
+// Black bars cover the side next to the roll: 37 of the keyboard's 62 px.
+constexpr float BlackBarShare = 37.0f / 62.0f;
 
 GLuint compileShader(GLenum type, const char* source)
 {
@@ -43,10 +54,14 @@ precision highp float;
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 aRect;
 layout(location=2) in vec4 aColor;
+layout(location=3) in vec2 aKind;
 
-out vec2 vUv;
-out vec4 vColor;
-out float vBlack;
+uniform vec2 uSize;
+
+out vec2 vLocal;
+flat out vec2 vSizePx;
+flat out vec4 vColor;
+flat out vec2 vKind;
 
 void main()
 {
@@ -60,86 +75,66 @@ void main()
             0.0,
             1.0);
 
-    vUv = aCorner;
+    vSizePx = aRect.zw * uSize;
+    vLocal = aCorner * vSizePx;
     vColor = aColor;
-    vBlack = float(aRect.w < 0.8);
+    vKind = aKind;
 }
 )GLSL";
 
+    // Same look as the roll's notes: gradients and the 2 px checker texture
+    // on pressed keys (HANDOFF sec. 93).
     static const char* fragment = R"GLSL(#version 300 es
-precision mediump float;
+precision highp float;
 
-in vec2 vUv;
-in vec4 vColor;
-in float vBlack;
-
-uniform float uHue;
+in vec2 vLocal;
+flat in vec2 vSizePx;
+flat in vec4 vColor;
+flat in vec2 vKind;
 
 out vec4 fragColor;
 
-vec3 hsv2rgb(vec3 c)
+vec3 ramp(vec3 a, vec3 b, vec3 c, float stop, float t)
 {
-    vec4 K =
-        vec4(
-            1.0,
-            2.0 / 3.0,
-            1.0 / 3.0,
-            3.0);
-
-    vec3 p =
-        abs(
-            fract(c.xxx + K.xyz) *
-            6.0 -
-            K.www);
-
-    return
-        c.z *
-        mix(
-            K.xxx,
-            clamp(
-                p - K.xxx,
-                0.0,
-                1.0),
-            c.y);
+    return t < stop
+        ? mix(a, b, t / stop)
+        : mix(b, c, (t - stop) / (1.0 - stop));
 }
 
 void main()
 {
-    float hue =
-        fract(uHue / 360.0);
+    const vec3 divider = vec3(43.0, 32.0, 90.0) / 255.0;
+    float t = vLocal.x / max(1.0, vSizePx.x);
+    bool pressed = vColor.a > 0.5;
+    vec3 pc = vColor.rgb;
+    vec3 color;
 
-    vec3 top =
-        vBlack > 0.5
-            ? hsv2rgb(
-                vec3(hue, .20, .12))
-            : hsv2rgb(
-                vec3(hue, .30, .18));
-
-    vec3 bottom =
-        vBlack > 0.5
-            ? hsv2rgb(
-                vec3(hue, .15, .03))
-            : hsv2rgb(
-                vec3(hue, .22, .07));
-
-    vec3 color =
-        mix(top, bottom, vUv.y);
-
-    if (vColor.a > 0.5) {
-        color =
-            mix(
-                color,
-                vColor.rgb,
-                vBlack > 0.5
-                    ? .94
-                    : .86);
+    if (vKind.x > 1.5) {
+        color = pressed
+            ? ramp(pc * 0.5, pc, pc + (1.0 - pc) * 0.3, 0.75, t)
+            : ramp(vec3(11.0, 9.0, 34.0) / 255.0,
+                   vec3(46.0, 39.0, 104.0) / 255.0,
+                   vec3(62.0, 48.0, 128.0) / 255.0, 0.75, t);
+        if (!pressed && vLocal.y >= vSizePx.y - 1.0)
+            color += (1.0 - color) * 0.18;
+    } else {
+        bool whitePressed = pressed && vKind.x < 0.5;
+        color = whitePressed
+            ? ramp(pc * 0.7, pc, pc + (1.0 - pc) * 0.4, 0.6, t)
+            : ramp(vec3(169.0, 159.0, 214.0) / 255.0,
+                   vec3(239.0, 234.0, 255.0) / 255.0,
+                   vec3(216.0, 208.0, 246.0) / 255.0, 0.55, t);
+        float mid = floor(vSizePx.y * 0.5);
+        if ((vKind.y > 0.5 && vLocal.y >= vSizePx.y - 1.0) ||
+            (vKind.x > 0.5 && vLocal.x < 24.0 &&
+             vLocal.y >= mid - 1.0 && vLocal.y < mid))
+            color = mix(color, divider, 0.75);
+        pressed = whitePressed;
     }
 
-    if (vBlack < 0.5 &&
-        min(vUv.x, 1.0 - vUv.x) <
-            .025) {
-        color *= .58;
-    }
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    if (pressed && ((p.x ^ p.y) & 1) == 1)
+        color += (1.0 - color) * 0.13;
 
     fragColor = vec4(color, 1.0);
 }
@@ -218,12 +213,12 @@ public:
     {
         const QSize cssSize(
             std::max(
-                64,
+                1,
                 qRound(
                     size.width() /
                     dpr_)),
             std::max(
-                64,
+                1,
                 qRound(
                     size.height() /
                     dpr_)));
@@ -262,11 +257,6 @@ public:
             colors_ = nextColors;
             dirty_ = true;
         }
-
-        // Background hue is a shader uniform; changing it does not require a
-        // 128-instance VBO rebuild. This keeps keyboard rendering effectively
-        // pre-cached between actual key/color state changes.
-        hue_ = controller->dominantHue();
     }
 
     void render() override
@@ -303,18 +293,19 @@ public:
         glDisable(GL_BLEND);
 
         glClearColor(
-            .01f,
-            .01f,
-            .025f,
+            11.0f / 255.0f,
+            9.0f / 255.0f,
+            34.0f / 255.0f,
             1.0f);
 
         glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(program_);
 
-        glUniform1f(
-            hueUniform_,
-            hue_);
+        glUniform2f(
+            sizeUniform_,
+            float(width_),
+            float(height_));
 
         glBindVertexArray(vao_);
 
@@ -339,10 +330,10 @@ private:
         if (!program_)
             return;
 
-        hueUniform_ =
+        sizeUniform_ =
             glGetUniformLocation(
                 program_,
-                "uHue");
+                "uSize");
 
         static const float quad[] = {
             0,0, 1,0, 0,1,
@@ -381,30 +372,33 @@ private:
             GL_ARRAY_BUFFER,
             instanceVbo_);
 
-        glEnableVertexAttribArray(1);
+        const struct {
+            GLuint location;
+            GLint size;
+            std::size_t offset;
+        } attributes[] = {
+            {1, 4, offsetof(KeyInstance, x)},
+            {2, 4, offsetof(KeyInstance, r)},
+            {3, 2, offsetof(KeyInstance, kind)}
+        };
 
-        glVertexAttribPointer(
-            1,
-            4,
-            GL_FLOAT,
-            GL_FALSE,
-            sizeof(KeyInstance),
-            reinterpret_cast<void*>(0));
+        for (const auto& attribute : attributes) {
+            glEnableVertexAttribArray(
+                attribute.location);
 
-        glVertexAttribDivisor(1, 1);
+            glVertexAttribPointer(
+                attribute.location,
+                attribute.size,
+                GL_FLOAT,
+                GL_FALSE,
+                sizeof(KeyInstance),
+                reinterpret_cast<void*>(
+                    attribute.offset));
 
-        glEnableVertexAttribArray(2);
-
-        glVertexAttribPointer(
-            2,
-            4,
-            GL_FLOAT,
-            GL_FALSE,
-            sizeof(KeyInstance),
-            reinterpret_cast<void*>(
-                4 * sizeof(float)));
-
-        glVertexAttribDivisor(2, 1);
+            glVertexAttribDivisor(
+                attribute.location,
+                1);
+        }
 
         glBindVertexArray(0);
     }
@@ -439,77 +433,56 @@ private:
         };
 
         keys_.clear();
-        keys_.reserve(128);
+        keys_.reserve(128 + 53);
 
-        int whiteCount = 0;
-
-        for (int note = 0;
-             note < 128;
-             ++note) {
-            if (!black[note % 12])
-                ++whiteCount;
-        }
-
-        const float whiteWidth =
-            1.0f /
-            float(whiteCount);
-
-        const float blackWidth =
-            whiteWidth * .58f;
-
-        int whiteIndex = 0;
+        // One row per key, low notes at the bottom like the roll's rows.
+        const float rowHeight =
+            1.0f / 128.0f;
 
         for (int note = 0;
              note < 128;
              ++note) {
-            if (black[note % 12])
-                continue;
+            const bool isBlack =
+                black[note % 12];
 
             const auto color =
                 activeColor(note);
 
+            // A divider above E and B, where two white keys meet.
+            const float separator =
+                (note % 12 == 4 ||
+                 note % 12 == 11)
+                    ? 1.0f
+                    : 0.0f;
+
             keys_.push_back({
-                whiteIndex *
-                    whiteWidth,
                 0.0f,
-                whiteWidth,
+                note * rowHeight,
                 1.0f,
+                rowHeight,
                 color[0],
                 color[1],
                 color[2],
-                color[3]
+                color[3],
+                isBlack
+                    ? KindBlackRow
+                    : KindWhiteRow,
+                separator
             });
 
-            ++whiteIndex;
-        }
-
-        whiteIndex = 0;
-
-        for (int note = 0;
-             note < 128;
-             ++note) {
-            if (black[note % 12]) {
-                const float x =
-                    whiteIndex *
-                        whiteWidth -
-                    blackWidth *
-                        .5f;
-
-                const auto color =
-                    activeColor(note);
-
+            if (isBlack) {
                 keys_.push_back({
-                    x,
-                    0.0f,
-                    blackWidth,
-                    .62f,
+                    1.0f - BlackBarShare,
+                    note * rowHeight,
+                    BlackBarShare,
+                    rowHeight,
                     color[0],
                     color[1],
                     color[2],
-                    color[3]
+                    color[3],
+                    KindBlackBar,
+                    0.0f
                 });
-            } else {
-                ++whiteIndex;
             }
         }
 
@@ -535,12 +508,11 @@ private:
     GLuint vbo_ = 0;
     GLuint instanceVbo_ = 0;
 
-    GLint hueUniform_ = -1;
+    GLint sizeUniform_ = -1;
 
     int width_ = 1;
     int height_ = 1;
     bool dirty_ = true;
-    float hue_ = 230.0f;
 
     std::array<uint8_t, 128> mask_{};
     std::array<int8_t, 128> colorIndices_{};
@@ -617,12 +589,6 @@ void Keyboard::setController(QObject* controller)
         connect(
             player,
             &MainWindow::channelColorsChanged,
-            this,
-            request);
-
-        connect(
-            player,
-            &MainWindow::neuralVisualChanged,
             this,
             request);
 

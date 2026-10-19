@@ -1,6 +1,7 @@
 import QtQuick
 import Wasmidi
 
+// Vertical keyboard at the left of the roll, one row per key like the roll.
 Item {
     id: root
     required property var mainWindow
@@ -9,13 +10,5 @@ Item {
     KeyboardSurface {
         anchors.fill: parent
         controller: root.mainWindow
-    }
-
-    Rectangle {
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        height: 1
-        color: Dk.light2
     }
 }
