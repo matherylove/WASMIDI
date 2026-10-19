@@ -286,6 +286,7 @@ void BpfaMidiStore::clear()
     ingest_.reset();
     std::vector<TextEvent>().swap(textEvents_);
     std::vector<uint32_t>().swap(density_);
+    std::vector<uint32_t>().swap(offDensity_);
     densityBucketTicks_ = 1;
     chunkBase_ = 0;
     chunkKeys_.clear();
@@ -570,6 +571,9 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                         }
                         --activeCounts[vkey];
                         ++closureOrder;
+                        const uint32_t bucket = d.tick / densityBucketTicks_;
+                        if (bucket >= offDensity_.size()) offDensity_.resize(std::size_t(bucket) + 1024u, 0u);
+                        ++offDensity_[bucket];
                     }
                 }
                 ++order;
@@ -4044,6 +4048,7 @@ void BpfaMidiStore::finalizeIndex(MidiDocument& out, uint64_t totalNotes, uint64
         return a.track < b.track;
     });
     density_.resize(std::size_t(out.maxTick / densityBucketTicks_) + 1u, 0u);
+    offDensity_.resize(density_.size(), 0u);
     metadata_ = out;
     buildColorTables();
     visualCheckpointSpan_ = std::max<uint32_t>(1u, uint32_t((uint64_t(out.maxTick) + 127u) / 128u));
@@ -4184,6 +4189,8 @@ void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uin
     w.put(densityBucketTicks_);
     w.put(uint64_t(density_.size()));
     w.bytes(density_.data(), density_.size() * sizeof(uint32_t));
+    w.put(uint64_t(offDensity_.size()));
+    w.bytes(offDensity_.data(), offDensity_.size() * sizeof(uint32_t));
 }
 
 bool BpfaMidiStore::indexPartial(uint64_t size, MidiReadAt readAt, void* readUser, const PartialPlan& plan,
@@ -4440,6 +4447,16 @@ bool BpfaMidiStore::mergePartial(const uint8_t* data, std::size_t size)
                 uint32_t c;
                 std::memcpy(&c, dp + i * 4, 4);
                 density_[i] += c;
+            }
+        }
+        const uint64_t no = r.get<uint64_t>();
+        const uint8_t* op = r.take(static_cast<std::size_t>(no * sizeof(uint32_t)));
+        if (r.ok && no) {
+            if (offDensity_.size() < no) offDensity_.resize(static_cast<std::size_t>(no), 0u);
+            for (uint64_t i = 0; i < no; ++i) {
+                uint32_t c;
+                std::memcpy(&c, op + i * 4, 4);
+                offDensity_[i] += c;
             }
         }
         if (!r.ok) { error_ = "Truncated partial index"; return false; }

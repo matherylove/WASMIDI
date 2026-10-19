@@ -10,8 +10,12 @@ Item {
     readonly property var mw: mainWindow
     signal advancedRequested()
     signal colorsRequested()
+    // Phone sheet: only one tab's groups ("song", "colors", "synth", "view"); empty shows all.
+    property string section: ""
 
-    function takeGraphFrames() { return graph.takeFrames() }
+    function shows(name) { return section === "" || section === name }
+    // -1 while the graph is hidden: it has nothing to draw.
+    function takeGraphFrames() { return graph.visible ? graph.takeFrames() : -1 }
 
     component Label: Text {
         color: Dk.dim
@@ -25,7 +29,10 @@ Item {
         font.pixelSize: 12
     }
 
+    implicitHeight: dockColumn.implicitHeight + 9
+
     ColumnLayout {
+        id: dockColumn
         anchors.fill: parent
         anchors.topMargin: 9
         anchors.rightMargin: 1
@@ -35,6 +42,7 @@ Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
             title: "Graphs"
+            visible: dock.shows("song")
 
             Rectangle {
                 Layout.fillWidth: true
@@ -90,6 +98,7 @@ Item {
         DkGroup {
             Layout.fillWidth: true
             title: "Note speed"
+            visible: dock.shows("view")
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 7
@@ -125,6 +134,7 @@ Item {
         DkGroup {
             Layout.fillWidth: true
             title: "Colors"
+            visible: dock.shows("colors")
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 3
@@ -177,6 +187,7 @@ Item {
         DkGroup {
             Layout.fillWidth: true
             title: "Neural background"
+            visible: dock.shows("colors")
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 7
@@ -208,6 +219,7 @@ Item {
         DkGroup {
             Layout.fillWidth: true
             title: "WasmiSynth"
+            visible: dock.shows("synth")
 
             RowLayout {
                 Layout.fillWidth: true
@@ -326,6 +338,7 @@ Item {
         DkGroup {
             Layout.fillWidth: true
             title: "Roll cache"
+            visible: dock.shows("view")
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 3

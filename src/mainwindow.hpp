@@ -47,6 +47,11 @@ class MainWindow : public QObject {
     Q_PROPERTY(float peakNpsTime READ peakNpsTime NOTIFY timelineChanged)
     Q_PROPERTY(int peakPolyphony READ peakPolyphony NOTIFY peakPolyphonyChanged)
     Q_PROPERTY(float peakPolyphonyTime READ peakPolyphonyTime NOTIFY timelineChanged)
+    // Peaks of the whole MIDI, from the parser (0 until it answers).
+    Q_PROPERTY(int songPeakNps READ songPeakNps NOTIFY songPeaksChanged)
+    Q_PROPERTY(double songPeakNpsTime READ songPeakNpsTime NOTIFY songPeaksChanged)
+    Q_PROPERTY(int songPeakPolyphony READ songPeakPolyphony NOTIFY songPeaksChanged)
+    Q_PROPERTY(double songPeakPolyphonyTime READ songPeakPolyphonyTime NOTIFY songPeaksChanged)
     Q_PROPERTY(QString pitchRange READ pitchRange NOTIFY pitchRangeChanged)
     Q_PROPERTY(int skippedVelocity READ skippedVelocity NOTIFY skippedVelocityChanged)
     Q_PROPERTY(QVariantList npsTimeline READ npsTimeline NOTIFY timelineChanged)
@@ -148,6 +153,11 @@ public:
     float peakNpsTime() const { return peakNpsTime_; }
     int peakPolyphony() const { return peakPolyphony_; }
     float peakPolyphonyTime() const { return peakPolyphonyTime_; }
+    int songPeakNps() const { return songPeakNps_; }
+    double songPeakNpsTime() const { return songPeakNpsTime_; }
+    int songPeakPolyphony() const { return songPeakPolyphony_; }
+    double songPeakPolyphonyTime() const { return songPeakPolyphonyTime_; }
+    void setSongPeaks(double nps, double npsTime, double polyphony, double polyphonyTime);
     QString pitchRange() const { return pitchRange_; }
     int skippedVelocity() const { return skippedVelocity_; }
     QVariantList npsTimeline() const { return npsTimeline_; }
@@ -321,6 +331,7 @@ signals:
     void controlEventCountChanged();
     void peakNpsChanged();
     void peakPolyphonyChanged();
+    void songPeaksChanged();
     void pitchRangeChanged();
     void skippedVelocityChanged();
     void timelineChanged();
@@ -395,6 +406,10 @@ private:
     qint64 controlEventCount_ = 0;
     int peakNps_ = 0;
     float peakNpsTime_ = 0.0f;
+    int songPeakNps_ = 0;
+    double songPeakNpsTime_ = 0.0;
+    int songPeakPolyphony_ = 0;
+    double songPeakPolyphonyTime_ = 0.0;
     int peakPolyphony_ = 0;
     QString pitchRange_ = QStringLiteral("—");
     int skippedVelocity_ = 0;

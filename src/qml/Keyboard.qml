@@ -1,14 +1,16 @@
 import QtQuick
 import Wasmidi
 
-// Vertical keyboard at the left of the roll, one row per key like the roll.
+// Keyboard beside the roll, one row (portrait: one column) per key like the roll.
 Item {
     id: root
     required property var mainWindow
+    property bool portrait: false
     clip: true
 
     KeyboardSurface {
         anchors.fill: parent
         controller: root.mainWindow
+        portrait: root.portrait
     }
 }

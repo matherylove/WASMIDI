@@ -2066,6 +2066,13 @@ async function handleMessage(event) {
             return;
         }
         // WASMIDI Audio (HANDOFF sec. 64): timeline queries and seconds-based requests.
+        if (message.type === "song-peaks") {
+            const Module = await getModule();
+            const ptr = typeof Module._wmp_song_peaks_js === "function" ? Number(Module._wmp_song_peaks_js()) : 0;
+            const p = ptr ? new Float64Array(Module.HEAPU8.buffer, ptr, 4) : new Float64Array(4);
+            postMessage({ type: "song-peaks", nps: p[0], npsTime: p[1], polyphony: p[2], polyphonyTime: p[3] });
+            return;
+        }
         if (message.type === "doc-info") {
             const Module = await getModule();
             const ptr = Number(Module._wmp_document_info_js());

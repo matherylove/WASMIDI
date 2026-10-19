@@ -57,6 +57,7 @@ layout(location=2) in vec4 aColor;
 layout(location=3) in vec2 aKind;
 
 uniform vec2 uSize;
+uniform int uPortrait;
 
 out vec2 vLocal;
 flat out vec2 vSizePx;
@@ -69,9 +70,10 @@ void main()
         aRect.xy +
         aCorner * aRect.zw;
 
+    // Portrait: pitch runs left to right and the roll is above (HANDOFF sec. 96).
     gl_Position =
         vec4(
-            p * 2.0 - 1.0,
+            (uPortrait == 1 ? p.yx : p) * 2.0 - 1.0,
             0.0,
             1.0);
 
@@ -126,7 +128,7 @@ void main()
                    vec3(216.0, 208.0, 246.0) / 255.0, 0.55, t);
         float mid = floor(vSizePx.y * 0.5);
         if ((vKind.y > 0.5 && vLocal.y >= vSizePx.y - 1.0) ||
-            (vKind.x > 0.5 && vLocal.x < 24.0 &&
+            (vKind.x > 0.5 && vLocal.x < vSizePx.x * (24.0 / 62.0) &&
              vLocal.y >= mid - 1.0 && vLocal.y < mid))
             color = mix(color, divider, 0.75);
         pressed = whitePressed;
@@ -237,6 +239,8 @@ public:
             qobject_cast<MainWindow*>(
                 keyboard->controller());
 
+        portrait_ = keyboard->portrait();
+
         if (!controller)
             return;
 
@@ -304,8 +308,12 @@ public:
 
         glUniform2f(
             sizeUniform_,
-            float(width_),
-            float(height_));
+            float(portrait_ ? height_ : width_),
+            float(portrait_ ? width_ : height_));
+
+        glUniform1i(
+            portraitUniform_,
+            portrait_ ? 1 : 0);
 
         glBindVertexArray(vao_);
 
@@ -334,6 +342,11 @@ private:
             glGetUniformLocation(
                 program_,
                 "uSize");
+
+        portraitUniform_ =
+            glGetUniformLocation(
+                program_,
+                "uPortrait");
 
         static const float quad[] = {
             0,0, 1,0, 0,1,
@@ -509,6 +522,8 @@ private:
     GLuint instanceVbo_ = 0;
 
     GLint sizeUniform_ = -1;
+    GLint portraitUniform_ = -1;
+    bool portrait_ = false;
 
     int width_ = 1;
     int height_ = 1;
@@ -554,6 +569,15 @@ void Keyboard::geometryChange(
 
     setTextureFollowsItemSize(false);
     resizeSettleTimer_.start();
+    update();
+}
+
+void Keyboard::setPortrait(bool portrait)
+{
+    if (portrait_ == portrait)
+        return;
+    portrait_ = portrait;
+    emit portraitChanged();
     update();
 }
 

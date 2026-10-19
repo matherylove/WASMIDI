@@ -349,12 +349,15 @@ public:
     const std::vector<TextEvent>& textEvents() const { return textEvents_; }
     // Note-ons per `densityBucketTicks()` ticks, for the NPS graph of WASMIDI Audio.
     const std::vector<uint32_t>& noteDensity() const { return density_; }
+    // Note-offs that close a sounding note, per bucket: with noteDensity, the polyphony.
+    const std::vector<uint32_t>& noteOffDensity() const { return offDensity_; }
     uint32_t densityBucketTicks() const { return densityBucketTicks_; }
 private:
     static constexpr std::size_t MaxTextEvents = 200000;
     static constexpr std::size_t MaxTextBytes = 256;
     std::vector<TextEvent> textEvents_;
     std::vector<uint32_t> density_;
+    std::vector<uint32_t> offDensity_;
     uint32_t densityBucketTicks_ = 1;
     PartialPlan partial_;
     bool partialActive_ = false;

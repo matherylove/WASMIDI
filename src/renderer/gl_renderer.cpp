@@ -398,6 +398,7 @@ uniform int uPerTrack;
 uniform sampler2D uPalette;
 uniform int uGlowEnabled;
 uniform int uTransparencyEnabled;
+uniform int uPortrait;
 
 // Per note: its gradient stops and, interpolated, the distance in pixels to
 // each side and the position across the row.
@@ -444,7 +445,7 @@ void main() {
         widthPx >= 3.0 ? vec2(px, widthPx - px) : vec2(2.0),
         rowPx >= 3.0 ? vec2(py, rowPx - py) : vec2(2.0));
     vT = 1.0 - float(isTop);
-    gl_Position = vec4(x, y, z, 1.0);
+    gl_Position = uPortrait == 1 ? vec4(y, x, z, 1.0) : vec4(x, y, z, 1.0);
 }
 )GLSL";
 
@@ -502,6 +503,7 @@ precision highp float;
 
 uniform float uHeight;
 uniform float uAlpha;
+uniform int uPortrait;
 
 out vec4 fragColor;
 
@@ -509,9 +511,10 @@ void main()
 {
     // Flat well with a line at every C, premultiplied so the page's neural
     // background shows through (HANDOFF sec. 92-93).
-    float c = floor(gl_FragCoord.y * 128.0 / uHeight / 12.0 + 0.5) * 12.0;
+    float k = uPortrait == 1 ? gl_FragCoord.x : gl_FragCoord.y;
+    float c = floor(k * 128.0 / uHeight / 12.0 + 0.5) * 12.0;
     bool line = c >= 12.0 && c <= 120.0 &&
-        floor(gl_FragCoord.y) == floor(c * uHeight / 128.0);
+        floor(k) == floor(c * uHeight / 128.0);
     vec4 well = vec4(vec3(10.0, 9.0, 32.0) / 255.0 * uAlpha, uAlpha);
     vec4 grid = vec4(vec3(46.0, 39.0, 104.0) / 255.0, 1.0) * 0.45;
     fragColor = line ? grid + well * (1.0 - grid.a) : well;
@@ -524,12 +527,14 @@ precision highp float;
 
 uniform float uCenter;
 uniform vec3 uColor;
+uniform int uPortrait;
 
 out vec4 fragColor;
 
 void main()
 {
-    float d = max(0.0, abs(gl_FragCoord.x - uCenter) - 1.0);
+    float t = uPortrait == 1 ? gl_FragCoord.y : gl_FragCoord.x;
+    float d = max(0.0, abs(t - uCenter) - 1.0);
     float a = d <= 0.0 ? 1.0 : 0.55 * exp(-d * d / 50.0);
     fragColor = vec4(uColor * a, a);
 }
@@ -584,6 +589,11 @@ void main()
             noteProgram_,
             "uRollSize");
 
+    notePortraitUniform_ =
+        glGetUniformLocation(
+            noteProgram_,
+            "uPortrait");
+
     perTrackUniform_ =
         glGetUniformLocation(
             noteProgram_,
@@ -614,6 +624,11 @@ void main()
             glGetUniformLocation(
                 backgroundProgram_,
                 "uAlpha");
+
+        backgroundPortraitUniform_ =
+            glGetUniformLocation(
+                backgroundProgram_,
+                "uPortrait");
     }
 
     if (playheadProgram_) {
@@ -626,6 +641,11 @@ void main()
             glGetUniformLocation(
                 playheadProgram_,
                 "uColor");
+
+        playheadPortraitUniform_ =
+            glGetUniformLocation(
+                playheadProgram_,
+                "uPortrait");
     }
 
     return true;
@@ -975,6 +995,19 @@ void GLRenderer::setPlayheadColor(float r, float g, float b)
     playheadColor_ = {r, g, b};
 }
 
+void GLRenderer::setPortrait(bool portrait)
+{
+    portrait_ = portrait;
+}
+
+void GLRenderer::scissorRoll(int t, int k, int tLength, int kLength) const
+{
+    if (portrait_)
+        glScissor(k, t, kLength, tLength);
+    else
+        glScissor(t, k, tLength, kLength);
+}
+
 void GLRenderer::renderBackground()
 {
     glDisable(GL_DEPTH_TEST);
@@ -987,7 +1020,11 @@ void GLRenderer::renderBackground()
 
         glUniform1f(
             backgroundHeightUniform_,
-            float(height_));
+            float(keyPx()));
+
+        glUniform1i(
+            backgroundPortraitUniform_,
+            portrait_ ? 1 : 0);
 
         glUniform1f(
             backgroundAlphaUniform_,
@@ -1471,7 +1508,7 @@ bool GLRenderer::buildDenseDrawList(
     if (denseSourceScratch_.empty())
         return false;
 
-    const int columns = std::max(1, width_ - 1);
+    const int columns = std::max(1, timePx() - 1);
     const std::size_t wordsPerPitch =
         (std::size_t(columns) + 63u) / 64u;
     denseCoverage_.assign(
@@ -2680,7 +2717,8 @@ void GLRenderer::drawSharpRing(
         2.0f / float(std::max<uint32_t>(1u, windowTicks)),
         -1.0f,
         2.0f / 128.0f);
-    glUniform2f(rollSizeUniform_, float(width_), float(height_));
+    glUniform2f(rollSizeUniform_, float(timePx()), float(keyPx()));
+    glUniform1i(notePortraitUniform_, portrait_ ? 1 : 0);
     glUniform1i(viewStartUniform_, static_cast<GLint>(viewStart));
     glUniform1i(viewEndUniform_, static_cast<GLint>(viewEnd));
     glUniform1i(currentTickUniform_, static_cast<GLint>(currentTick));
@@ -2702,7 +2740,7 @@ void GLRenderer::drawSharpRing(
 
     bool drewTiles = false;
     double drawn = 0.0, raw = 0.0;
-    if (!cullTiles_.empty() && windowTicks != 0 && width_ > 0) {
+    if (!cullTiles_.empty() && windowTicks != 0 && timePx() > 0) {
         const uint32_t firstTile = viewStart / windowTicks;
         const uint32_t lastTile = viewEnd / windowTicks;
         // A tile is drawn from its own buffer once it holds every note of its visible part.
@@ -2714,17 +2752,18 @@ void GLRenderer::drawSharpRing(
         for (uint32_t k = firstTile; k <= lastTile; ++k)
             if (usable(findCullTile(k))) anyUsable = true;
         if (anyUsable) {
-            const double pixelsPerTick = double(width_) / double(windowTicks);
+            const int timeLength = timePx();
+            const double pixelsPerTick = double(timeLength) / double(windowTicks);
             glEnable(GL_SCISSOR_TEST);
             for (uint32_t k = firstTile; k <= lastTile; ++k) {
                 const double tileStart = double(uint64_t(k) * windowTicks);
                 // A pixel column belongs to the tile its centre falls in.
                 const int px0 = std::clamp(static_cast<int>(std::ceil(
-                    (tileStart - double(viewStart)) * pixelsPerTick - 0.5)), 0, width_);
+                    (tileStart - double(viewStart)) * pixelsPerTick - 0.5)), 0, timeLength);
                 const int px1 = std::clamp(static_cast<int>(std::ceil(
-                    (tileStart + double(windowTicks) - double(viewStart)) * pixelsPerTick - 0.5)), 0, width_);
+                    (tileStart + double(windowTicks) - double(viewStart)) * pixelsPerTick - 0.5)), 0, timeLength);
                 if (px1 <= px0) continue;
-                glScissor(px0, 0, px1 - px0, height_);
+                scissorRoll(px0, 0, px1 - px0, keyPx());
                 const CullTile* tile = findCullTile(k);
                 if (usable(tile)) {
                     if (tile->count == 0) continue;
@@ -2759,21 +2798,23 @@ void GLRenderer::drawSharpRing(
     // Exact SharpMIDI playhead behavior: it moves from the left edge to the
     // center during the first half-window and then remains centered.
     const float pixelsPerTick = 2.0f / float(std::max<uint32_t>(1u, windowTicks));
+    const int timeLength = timePx();
     const int lineX = std::clamp(
         static_cast<int>(std::min(
-            float(currentTick) * pixelsPerTick * float(width_) * 0.5f,
-            float(width_) * 0.5f)),
+            float(currentTick) * pixelsPerTick * float(timeLength) * 0.5f,
+            float(timeLength) * 0.5f)),
         0,
-        std::max(0, width_ - 1));
+        std::max(0, timeLength - 1));
 
     if (playheadProgram_) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_SCISSOR_TEST);
         const int glowLeft = std::max(0, lineX - 15);
-        glScissor(glowLeft, 0, std::min(width_, lineX + 17) - glowLeft, height_);
+        scissorRoll(glowLeft, 0, std::min(timeLength, lineX + 17) - glowLeft, keyPx());
         glUseProgram(playheadProgram_);
         glUniform1f(playheadCenterUniform_, float(lineX) + 1.0f);
+        glUniform1i(playheadPortraitUniform_, portrait_ ? 1 : 0);
         glUniform3f(playheadColorUniform_,
             playheadColor_[0], playheadColor_[1], playheadColor_[2]);
         glBindVertexArray(backgroundVao_);
@@ -2784,7 +2825,7 @@ void GLRenderer::drawSharpRing(
         glDisable(GL_BLEND);
     } else {
         glEnable(GL_SCISSOR_TEST);
-        glScissor(lineX, 0, std::min(2, width_ - lineX), height_);
+        scissorRoll(lineX, 0, std::min(2, timeLength - lineX), keyPx());
         glClearColor(playheadColor_[0], playheadColor_[1], playheadColor_[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
@@ -3129,7 +3170,7 @@ void GLRenderer::releaseCullTiles()
 void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady)
 {
     static const bool tilesDisabled = wasmidi_tiles_disabled() != 0;
-    if (tilesDisabled || !document_ || !document_->remoteIndexed || windowTicks == 0 || width_ <= 0 ||
+    if (tilesDisabled || !document_ || !document_->remoteIndexed || windowTicks == 0 || timePx() <= 0 ||
         ringCapacity_ == 0) {
         releaseCullTiles();
         return;
@@ -3140,7 +3181,8 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
         signature *= 1099511628211ull;
     };
     mix(windowTicks);
-    mix(uint64_t(width_));
+    mix(uint64_t(timePx()));
+    mix(portrait_ ? 1u : 0u);
     mix(sharpModePerTrack_ ? 1u : 0u);
     mix(sharpRingEpoch_);
     mix(uint64_t(reinterpret_cast<uintptr_t>(document_)));
@@ -3277,7 +3319,7 @@ void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
     CompositorSettings settings;
     settings.startTick = tileStart;
     settings.spanTicks = windowTicks;
-    settings.rasterWidth = width_;
+    settings.rasterWidth = timePx();
     settings.firstKey = 0;
     settings.keyCount = 128;
     settings.viewEndTick = coverage;
@@ -3340,7 +3382,7 @@ bool GLRenderer::stepCullJob(double budgetMs)
         CompositorSettings settings;
         settings.startTick = tileStart;
         settings.spanTicks = job.windowTicks;
-        settings.rasterWidth = width_;
+        settings.rasterWidth = timePx();
         settings.firstKey = 0;
         settings.keyCount = 128;
         settings.viewEndTick = job.coverage;

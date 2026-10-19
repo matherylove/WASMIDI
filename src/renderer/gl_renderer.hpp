@@ -36,6 +36,8 @@ public:
                          uint8_t b);
     void setBackgroundAlpha(float alpha);
     void setPlayheadColor(float r, float g, float b);
+    // Phone layout: time runs up the screen and pitch across it (HANDOFF sec. 96).
+    void setPortrait(bool portrait);
 
     bool renderRoll();
 
@@ -164,6 +166,10 @@ private:
 
     int width_ = 1;
     int height_ = 1;
+    bool portrait_ = false;
+    int timePx() const { return portrait_ ? height_ : width_; }
+    int keyPx() const { return portrait_ ? width_ : height_; }
+    void scissorRoll(int t, int k, int tLength, int kLength) const;
 
     float currentTime_ = 0.0f;
     float noteSpeed_ = 1.0f;
@@ -198,15 +204,18 @@ private:
     GLint glowUniform_ = -1;
     GLint transparencyUniform_ = -1;
     GLint rollSizeUniform_ = -1;
+    GLint notePortraitUniform_ = -1;
 
     GLuint backgroundProgram_ = 0;
     GLuint backgroundVao_ = 0;
     GLint backgroundHeightUniform_ = -1;
     GLint backgroundAlphaUniform_ = -1;
+    GLint backgroundPortraitUniform_ = -1;
 
     GLuint playheadProgram_ = 0;
     GLint playheadCenterUniform_ = -1;
     GLint playheadColorUniform_ = -1;
+    GLint playheadPortraitUniform_ = -1;
 
     std::array<std::array<uint8_t, 4>, 16>
         channelColors_{};

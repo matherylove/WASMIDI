@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§95). Este archivo resume el estado al cierre de la rev. 98 y dice
+`HANDOFF.md` (§1-§96). Este archivo resume el estado al cierre de la rev. 99 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 98)
+## Estado actual (rev. 99)
 
 Rendimiento medido por el usuario:
 
@@ -290,6 +290,10 @@ Rendimiento medido por el usuario:
   repetía posiciones. Ahora avanza en cada cuadro (`advanceFrame` desde un `FrameAnimation`; el temporizador
   de 16 ms solo sin cuadros) y el pedazo de tiles por cuadro es 36%/18% del período de la pantalla. Sin
   medir en una pantalla de más de 60 Hz.
+- Rev. 99 (HANDOFF §96): GUI parte 5. Modo celular vertical (`phone` en `MainWindow.qml`): roll con el tiempo
+  hacia arriba (`setPortrait`, mismo culling), teclado abajo, LCD, transporte y pestañas Song/Colors/Synth/View.
+  Avisos en la esquina del roll con los picos de NPS y polifonía de todo el MIDI (`wmp_song_peaks_js`,
+  `noteOffDensity`) y contador de CC/s en el LCD. Sin probar en un celular real.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -328,6 +332,7 @@ Mecanismos activos y cómo desactivarlos:
 | Barrido del roll cede con `MessageChannel` (rev. 93) | `?sweepyield=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Reloj en cada cuadro mostrado y pedazo de tiles según la pantalla (rev. 98) | sin interruptor (`advanceFrame`, `framePeriodMs_`) |
+| Modo celular vertical (rev. 99) | sale solo con ventana más ancha que alta o de 760 px o más |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | Advanced… → Sharding: Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |

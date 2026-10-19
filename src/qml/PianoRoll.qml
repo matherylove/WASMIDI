@@ -8,6 +8,7 @@ Item {
     clip: true
 
     property bool dragActive: false
+    property bool portrait: false
     property int fps: 0
 
     // Clears to the "Roll" share of its background, so the page's neural field
@@ -16,12 +17,13 @@ Item {
         id: surface
         anchors.fill: parent
         controller: root.mainWindow
+        portrait: root.portrait
     }
 
     Text {
         anchors.centerIn: parent
         visible: !root.mainWindow.hasMidi && !root.dragActive
-        text: "Drop a MIDI here or click to open"
+        text: root.portrait ? "Tap to open a MIDI" : "Drop a MIDI here or click to open"
         color: Dk.dim
         font.family: Dk.term
         font.pixelSize: 22

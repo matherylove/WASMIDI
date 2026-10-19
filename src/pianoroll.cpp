@@ -72,6 +72,8 @@ public:
 
         controller_ = controller;
 
+        renderer_.setPortrait(roll->portrait());
+
         renderer_.setNoteSpeed(
             controller->noteSpeed());
 
@@ -260,6 +262,15 @@ void PianoRoll::geometryChange(
 
     setTextureFollowsItemSize(false);
     resizeSettleTimer_.start();
+    update();
+}
+
+void PianoRoll::setPortrait(bool portrait)
+{
+    if (portrait_ == portrait)
+        return;
+    portrait_ = portrait;
+    emit portraitChanged();
     update();
 }
 

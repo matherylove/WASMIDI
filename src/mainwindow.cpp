@@ -60,6 +60,13 @@ void wasmidi_browser_file_selected(
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_song_peaks(double nps, double npsTime, double polyphony, double polyphonyTime)
+{
+    if (g_browserMainWindow)
+        g_browserMainWindow->setSongPeaks(nps, npsTime, polyphony, polyphonyTime);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
 void wasmidi_browser_colors_imported(const uint32_t* rgb, int count)
 {
     if (g_browserMainWindow && rgb && count > 0)
@@ -553,6 +560,14 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         return;
                     }
 
+                    if (message.type === 'song-peaks') {
+                        const mapped = globalThis.__wasmidiMappedMidi;
+                        if (mapped && mapped.worker === parserWorker)
+                            _wasmidi_song_peaks(Number(message.nps) || 0, Number(message.npsTime) || 0,
+                                Number(message.polyphony) || 0, Number(message.polyphonyTime) || 0);
+                        return;
+                    }
+
                     if (message.type === 'live-state') {
                         const mapped = globalThis.__wasmidiMappedMidi;
                         if (mapped && mapped.worker === parserWorker &&
@@ -924,6 +939,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         globalThis.__wasmidiMappedMidi = mappedState;
                         worker = null;
                         installComplete = true;
+                        primaryWorker.postMessage({ type: 'song-peaks' });
                         const synthBridge = globalThis.WasmidiSnappyBridge;
                         if (synthBridge && typeof synthBridge.setLocalMidiSource === 'function')
                             synthBridge.setLocalMidiSource(file, primaryWorker);
@@ -2270,6 +2286,7 @@ void MainWindow::clearFile()
     peakNpsTime_ = 0.0f;
     peakPolyphony_ = 0;
     peakPolyphonyTime_ = 0.0f;
+    setSongPeaks(0.0, 0.0, 0.0, 0.0);
     pitchRange_ = QStringLiteral("—");
     synthEffectiveVelocityFloor_ = synthVelocityFloor_;
     skippedVelocity_ = synthEffectiveVelocityFloor_;
@@ -2392,6 +2409,7 @@ void MainWindow::rebuildDerivedStats()
     peakNpsTime_ = 0.0f;
     peakPolyphony_ = 0;
     peakPolyphonyTime_ = 0.0f;
+    setSongPeaks(0.0, 0.0, 0.0, 0.0);
 
     if (document_.tempoMap.empty()) {
         tempoTimes_.push_back(0.0f);
@@ -3879,6 +3897,20 @@ void MainWindow::updateLiveStats()
     }
 
     updateDominantColor();
+}
+
+void MainWindow::setSongPeaks(double nps, double npsTime, double polyphony, double polyphonyTime)
+{
+    const int newNps = int(std::lround(std::max(0.0, nps)));
+    const int newPolyphony = int(std::lround(std::max(0.0, polyphony)));
+    if (newNps == songPeakNps_ && newPolyphony == songPeakPolyphony_ &&
+        npsTime == songPeakNpsTime_ && polyphonyTime == songPeakPolyphonyTime_)
+        return;
+    songPeakNps_ = newNps;
+    songPeakNpsTime_ = npsTime;
+    songPeakPolyphony_ = newPolyphony;
+    songPeakPolyphonyTime_ = polyphonyTime;
+    emit songPeaksChanged();
 }
 
 void MainWindow::advanceFrame()
