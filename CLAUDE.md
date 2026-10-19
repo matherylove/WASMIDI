@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§96). Este archivo resume el estado al cierre de la rev. 99 y dice
+`HANDOFF.md` (§1-§97). Este archivo resume el estado al cierre de la rev. 100 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 99)
+## Estado actual (rev. 100)
 
 Rendimiento medido por el usuario:
 
@@ -294,6 +294,9 @@ Rendimiento medido por el usuario:
   hacia arriba (`setPortrait`, mismo culling), teclado abajo, LCD, transporte y pestañas Song/Colors/Synth/View.
   Avisos en la esquina del roll con los picos de NPS y polifonía de todo el MIDI (`wmp_song_peaks_js`,
   `noteOffDensity`) y contador de CC/s en el LCD. Sin probar en un celular real.
+- Rev. 100 (HANDOFF §97): celular acostado o ventana baja (`compact`: menos de 540 px de alto o 860 de ancho)
+  usa el encabezado, el panel por pestañas y una fila de transporte del celular con el roll horizontal. En
+  vertical las notas caen hacia el teclado como Synthesia (cursor sobre el teclado, eje del tiempo invertido).
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -332,7 +335,8 @@ Mecanismos activos y cómo desactivarlos:
 | Barrido del roll cede con `MessageChannel` (rev. 93) | `?sweepyield=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Reloj en cada cuadro mostrado y pedazo de tiles según la pantalla (rev. 98) | sin interruptor (`advanceFrame`, `framePeriodMs_`) |
-| Modo celular vertical (rev. 99) | sale solo con ventana más ancha que alta o de 760 px o más |
+| Modo celular vertical (rev. 99), notas que caen (rev. 100) | sale solo con ventana más ancha que alta o de 760 px o más |
+| Diseño compacto para ventanas bajas o angostas (rev. 100) | sale solo con 540 px de alto y 860 de ancho o más |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | Advanced… → Sharding: Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |
