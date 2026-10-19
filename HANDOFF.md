@@ -6256,3 +6256,67 @@ el del gráfico ≤ ~2048 muestras por cuadro.
 - Nada en una GPU real: cuadros por segundo y el costo del fondo en las PCs del usuario.
 - Pantalla completa (necesita un clic real del usuario) y el selector de color dentro del diálogo.
 - Ventanas más chicas que 840×600: el panel no tiene scroll y se recorta (el modo celular es la parte 5).
+
+## 93. Revisión 96 — GUI nueva, parte 2: notas y teclado con degradado y textura, teclado vertical
+
+### Pedido
+
+Parte 2 del mockup aprobado (§91-§92): notas con degradado y textura de mapa de bits que rindan igual o
+mejor que las de antes, el teclado optimizado y con el mismo estilo, a la izquierda del roll como en el
+mockup.
+
+### Cambios
+
+- Notas (`noteVertex`/`noteFragment` en `gl_renderer.cpp`, el mismo programa para el anillo y los tiles
+  culleados): degradado vertical a lo alto de la fila de la tecla (arriba el color aclarado 45%, al 45% el
+  color, abajo oscurecido 45%), borde de 1 px con el color al 30% y textura de damero de 2 px (blanco al
+  13%, alineada a la pantalla) por dentro, como el CSS del mockup. El borde solo se dibuja en un lado
+  donde la nota mide ≥ 3 px (ancho o alto de fila); en las notas más chicas queda el relleno, para que las
+  notas cortas del Black MIDI no se vuelvan solo borde. Los colores de cada nota (base con el brillo de
+  nota sonando, aclarado, oscurecido, opacidad) se calculan una vez por vértice y llegan planos; por
+  fragmento quedan las distancias a los bordes (interpoladas), un `mix` y el damero. La regla de capas no
+  cambia (mismo orden de dibujo, sin profundidad ni mezcla).
+- Fondo del roll: plano rgb(10,9,32) con una línea rgba(46,39,104,.45) en cada do, como el mockup, en
+  vez del shader de tono y manchas (`hsl2rgb` y dos manchas por píxel). Sigue premultiplicado con alfa
+  1 − Roll·0,75. `setNeuralVisual`/`updateBackgroundHue` se quitaron del renderer (el tono dominante
+  sigue en `MainWindow` para la parte 3).
+- Cursor de reproducción: barra de 2 px del acento (#6b55d4) con brillo suave (±15 px) en vez de la línea
+  roja de 1 px; programa propio sobre el VAO vacío del fondo, mezcla premultiplicada, recortado con
+  scissor. Misma posición que antes.
+- Teclado (`src/keyboard.cpp`, `Keyboard.qml`): vertical, 62 px a la izquierda del roll, una fila por
+  tecla con la misma altura y orden que las filas del roll (grave abajo). Filas blancas con degradado
+  horizontal #a99fd6 → #efeaff → #d8d0f6, separador arriba de mi y si, barra negra de 37 px del lado del
+  roll (#0b0922 → #2e2768 → #3e3080 con luz de 1 px arriba) y la raya corta de 24 px en las filas negras.
+  Teclas apretadas con el color de la nota en degradado y el mismo damero. 181 instancias, se rearman
+  solo cuando cambian las teclas o los colores; ya no depende del tono de fondo. El FBO ya no tiene un
+  mínimo de 64 px (estiraba el teclado de 62 px).
+
+### Medición
+
+Chromium del contenedor (SwiftShader: WebGL por software, 4 hilos), página aparte con los shaders
+reales de `origin/main` contra los nuevos, 1218×760, mediana de tres corridas alternadas. Por software el
+costo por fragmento pesa mucho más que en una GPU, así que esto es el peor caso:
+
+| Caso | Notas solas, antes → ahora | Cuadro entero (fondo + notas + cursor) |
+|---|---|---|
+| 750 k notas cortas (tope de un tile) | 14.617 → 14.435 ms (0,99×) | — |
+| 200 k notas cortas | 3.921 → 3.937 ms (1,00×) | 3.946 → 3.913 ms (0,99×) |
+| 20 k notas largas | 442 → 462 ms (1,05×) | 456 → 490 ms (1,07×) |
+| 2 k notas a lo largo de toda la pantalla (sobredibujo máximo) | 67,5 → 76,6 ms (1,13×) | 78,0 → 64,9 ms (0,83×) |
+
+La primera versión (colores calculados por fragmento) costaba 1,21× en el caso de sobredibujo; pasarlos
+al shader de vértices la bajó a 1,13×. Con muchas notas (lo normal en Black MIDI) cuesta lo mismo: manda
+el número de instancias, no el fragmento. En el cuadro entero el fondo plano compensa: más barato que
+antes con sobredibujo, 7% más con notas largas por software.
+
+### Verificación
+
+- Compilación wasm local; captura en Chromium con un MIDI sintético sonando: notas, teclado, líneas de do
+  y cursor como en el mockup, sin errores de shader.
+- El primer intento usaba `active` como nombre de variable, palabra reservada en GLSL ES 3.00: el
+  programa de notas no compilaba. Lo encontró la página de medición; corregido antes del PR.
+
+### No verificado
+
+- Cuadros por segundo con GPU real en las PCs del usuario (la medición de arriba es por software).
+- Colores de las teclas apretadas con MIDIs reales de muchas pistas.
