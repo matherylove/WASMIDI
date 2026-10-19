@@ -1688,6 +1688,19 @@ void wmp_visual_config_js(int enabled, int autoDecode)
 #endif
 }
 
+// How many words the visual stream may hold past the roll sweep and the keyboard (HANDOFF sec. 88).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_visual_plan_js(double planWords)
+{
+#if WASMIDI_PARSER_BPFA
+    if (planWords >= 1.0) g_mappedStore.setVisualPlan(static_cast<std::size_t>(std::min(planWords, 1.0e10)));
+#else
+    (void)planWords;
+#endif
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif

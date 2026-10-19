@@ -147,10 +147,12 @@ static Run playJump(BpfaMidiStore& store, double start, double duration, double 
 
 // The keyboard Worker (HANDOFF sec. 83): helper spans are appended to the coordinator and to a
 // keyboard store made from exportLiveImage; the live snapshots run there and the coordinator
-// only rebuilds the keys on a reset. With jump > 0 the sweep restarts as in playJump.
+// only rebuilds the keys on a reset. With jump > 0 the sweep restarts as in playJump. With a plan
+// (HANDOFF sec. 88) the helper spans run ahead of the roll up to that many words.
 static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start, double duration, double lookahead,
-                      std::size_t budget, double jump, double& longest, std::size_t& rebuilds) {
+                      std::size_t budget, double jump, double& longest, std::size_t& rebuilds, std::size_t plan = 0) {
     Run run;
+    store.setVisualPlan(plan ? plan : std::size_t(32) << 20);
     store.setVisualStreamEnabled(true);
     store.setVisualAutoDecode(false);
     std::vector<uint8_t> image, request, result, rebuild;
@@ -159,6 +161,7 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
         fprintf(stderr, "keyboard image failed: %s %s\n", store.error(), keys.error());
         exit(1);
     }
+    keys.setVisualPlan(plan ? plan : std::size_t(32) << 20);
     store.setLiveExternal(true);
     const MidiDocument& md = store.metadata();
     store.resetRenderCursor(uint32_t(md.secondsToTick(start)), false);
@@ -194,7 +197,8 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
         }
         const uint32_t target = uint32_t(std::min<double>(md.maxTick, md.secondsToTick(std::max(t, sweepFrom) + lookahead)));
         for (;;) {
-            if (!store.visualStreamDone() && store.visualStreamHead() <= target && store.visualRoomAhead()) {
+            for (int spans = 0; spans < (plan ? 4 : 1); ++spans) {
+                if (store.visualStreamDone() || (!plan && store.visualStreamHead() > target) || !store.visualRoomAhead()) break;
                 const uint32_t a = store.visualStreamHead(), b = store.visualSpanEnd(a, budget * 4);
                 if (!store.buildVisualRequest(a, b, request) ||
                     !helper.decodeVisualRequest(request.data(), request.size(), result) ||
@@ -206,6 +210,11 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
             }
             uint32_t base = 0, next = 0; bool complete = false, hasNext = false;
             if (!store.buildRenderSweep(target, budget, app, cl, base, complete, next, hasNext)) { fprintf(stderr, "sweep failed\n"); exit(1); }
+            if (jump <= 0.0) {
+                if (base != run.appends.size() + 1) { fprintf(stderr, "append base %u vs %zu\n", base, run.appends.size() + 1); exit(1); }
+                run.appends.insert(run.appends.end(), app.begin(), app.end());
+                for (const RenderClose& c : cl) run.closes.emplace_back(c.noteId, c.endTick);
+            }
             if (complete || (!store.visualStreamDone() && store.visualStreamHead() <= next && !store.visualRoomAhead())) break;
         }
         const double tick = md.secondsToTick(t);
@@ -222,6 +231,8 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
         }
     }
     store.setLiveExternal(false);
+    store.setVisualPlan(std::size_t(32) << 20);
+    std::sort(run.closes.begin(), run.closes.end());
     return run;
 }
 
@@ -293,6 +304,8 @@ int main(int argc, char** argv) {
         printf("keyjump live in the keyboard Worker after a %.1f s roll jump: %zu compared, %s, %zu rebuilds | longest request %.3f s\n",
                jump, compared, differ ? "DIFFER" : "IDENTICAL", rebuilds, longest);
         failures += differ != 0 || compared == 0;
+        Run ahead = playWorker(store, helper, start, duration, lookahead, budget, 0.0, longest, rebuilds, std::size_t(256) << 20);
+        compare("ahead", ahead);
     }
     {
         const double jump = 1.0;

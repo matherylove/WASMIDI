@@ -1364,6 +1364,18 @@ let visualSpanMax = VISUAL_SPAN_WORDS;
 let visualSpanWords = VISUAL_SPAN_WORDS;
 let visualPoolActive = false;
 let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
+// The compact stream lets the helpers run ahead of the roll up to the plan, in words past the
+// sweep and the keyboard (HANDOFF sec. 88). ?visualplan=M sets it in millions of words;
+// ?visualahead=0 plans only up to the roll's target, with the old 32 M words.
+let visualAhead = true;
+let visualPlanWords = 32 * 1048576;
+function visualPlanDefault() {
+    const forced = pageOverride("visualplan");
+    if (forced) return Math.max(1, forced) * 1048576;
+    if (!visualAhead) return 32 * 1048576;
+    const deviceGiB = Number(self.navigator && self.navigator.deviceMemory);
+    return (!Number.isFinite(deviceGiB) || deviceGiB <= 0 || deviceGiB >= 8 ? 256 : 96) * 1048576;
+}
 // ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
 const visualStats = { at: 0, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0,
     starved: 0, local: 0, keyMs: 0, keys: 0, joints: 0, helperMs: 0, handlers: {} };
@@ -1410,6 +1422,7 @@ function visualPump(Module) {
     if (!visualPoolActive) {
         if (!pool || !pool.ready) return;
         Module._wmp_visual_config_js(1, 0);
+        if (typeof Module._wmp_visual_plan_js === "function") Module._wmp_visual_plan_js(visualPlanWords);
         visualPoolActive = true;
         visualRestart(Module);
         liveStart(Module);
@@ -1433,7 +1446,7 @@ function visualPump(Module) {
     visualStats.appendMs += performance.now() - appendStart;
     jointPlan(Module);
     const queueLimit = visualQueueLimit(pool);
-    while (visualQueue.length < queueLimit && visualPlanned <= sharpRenderTarget) {
+    while (visualQueue.length < queueLimit && (visualAhead || visualPlanned <= sharpRenderTarget)) {
         let end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
         if (end <= visualPlanned) break;
         if (jointActive()) {
@@ -1512,7 +1525,8 @@ function jointPlan(Module) {
         const natural = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
         if (natural <= visualPlanned) return;
         const feedWants = feedQueue.length < pool.helpers.length * 2 && feedPlanned * blockSeconds < horizon;
-        const visualWants = visualQueue.length < visualQueueLimit(pool) && visualPlanned <= sharpRenderTarget &&
+        const visualWants = visualQueue.length < visualQueueLimit(pool) &&
+            (visualAhead || visualPlanned <= sharpRenderTarget) &&
             feedQueue.length < JOINT_FEED_QUEUE_MAX;
         if (!feedWants && !visualWants) return;
         let chunks = visualWants
@@ -1587,7 +1601,7 @@ function liveStart(Module) {
     worker.onerror = event => liveFailed(keys, new Error((event && event.message) || "Keyboard Worker crashed"));
     worker.postMessage({
         type: "live-init", baseUrl: WASMIDI_MIDI_PARSER_BASE_URL, version: WASMIDI_MIDI_PARSER_BOOTSTRAP,
-        image: image.buffer, stream: stream.buffer, gen: liveStreamGen
+        image: image.buffer, stream: stream.buffer, gen: liveStreamGen, plan: visualPlanWords
     }, [image.buffer, stream.buffer]);
 }
 
@@ -2049,7 +2063,11 @@ async function handleMessage(event) {
         if (typeof Module._wmp_set_raw_source_limit_js === "function")
             Module._wmp_set_raw_source_limit_js(rawLimit);
         visualStreamOn = pageOverride("visualstream") !== 0;
-        jointOn = pageOverride("jointdecode") !== 0;
+        visualAhead = pageOverride("visualahead") !== 0;
+        visualPlanWords = visualPlanDefault();
+        // Running ahead, the visual head is far from the synth feed: joint spans would make the
+        // feed chase it. ?jointdecode=1 keeps them.
+        jointOn = pageOverride("jointdecode") === 1 || (!visualAhead && pageOverride("jointdecode") !== 0);
         Module._wmp_visual_config_js(visualStreamOn ? 1 : 0, 1);
         const ok = await parallelParse(Module, file, total, total > rawLimit) ||
             Module._wmp_parse_file_js(total);

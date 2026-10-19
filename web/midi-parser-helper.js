@@ -123,6 +123,7 @@ async function liveHandle(m) {
             throw new Error(errorText(Module, "Invalid keyboard image"));
         if (m.stream && !Module._wmp_live_stream_import_js(liveCopyIn(Module, m.stream)))
             throw new Error(errorText(Module, "Invalid visual stream"));
+        if (m.plan && typeof Module._wmp_visual_plan_js === "function") Module._wmp_visual_plan_js(Number(m.plan));
         liveGen = m.gen >>> 0;
         postMessage({ type: "live-ready" });
         return;

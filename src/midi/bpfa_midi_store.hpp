@@ -143,8 +143,10 @@ public:
     void setVisualAutoDecode(bool enabled) { visualAutoDecode_ = enabled; }
     uint32_t visualStreamHead() const { return visHead_; }
     bool visualStreamDone() const { return visDone_; }
-    // False while the stream holds VisualPlanWords past the live snapshot: no new span.
+    // False while the stream holds the plan's words past the roll sweep and the keyboard:
+    // no new span (HANDOFF sec. 88).
     bool visualRoomAhead() const;
+    void setVisualPlan(std::size_t planWords);
     // End tick of a span from startTick that holds about sourceEvents events (from the density).
     uint32_t visualSpanEnd(uint32_t startTick, uint64_t sourceEvents) const;
     bool decodeVisualLocal(uint32_t endTick);
@@ -500,20 +502,41 @@ private:
                           std::vector<uint16_t>& tracks, bool& anyLeft);
     void visualOrderRaw(std::vector<EventWord>& events, std::vector<uint16_t>& tracks);
     void putVisualResult(std::vector<uint8_t>& result, uint32_t startTick, uint32_t endTick, bool anyLeft) const;
-    void visualAppend(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t endTick,
-                      bool anyLeft);
     void visualTrim();
     bool visualEnabled_ = true;
     bool visualAutoDecode_ = true;
     bool visValid_ = false;
     bool visDone_ = false;
     // The stream in appended pieces: appending never moves the words held and trimming drops
-    // whole pieces (HANDOFF sec. 87).
-    struct VisualPiece { uint64_t base = 0; std::vector<EventWord> events; std::vector<uint16_t> tracks; };
+    // whole pieces (HANDOFF sec. 87). Each piece is run-encoded: a header per (tick, track)
+    // group, then runs of words sharing status, data 2 and copy count, one byte per word, with
+    // a mark every VisualMarkWords words for seeking (HANDOFF sec. 88).
+    struct VisualMark { uint64_t word; uint32_t byte, tick, track; };
+    struct VisualPiece {
+        uint64_t base = 0, words = 0;   // absolute index of its first word, word count
+        uint32_t startTick = 0, lastTick = 0;
+        std::vector<uint8_t> bytes;
+        std::vector<VisualMark> marks;
+    };
+    struct VisualCursor {
+        uint64_t pos = 0;               // absolute index of the next word
+        uint64_t piece = ~uint64_t(0);  // serial of its piece (visPopped_ + index)
+        uint32_t byte = 0, tick = 0, track = 0, message = 0;
+        bool inRun = false;
+    };
     std::deque<VisualPiece> visPieces_;
+    uint64_t visPopped_ = 0;        // pieces dropped from the front since the reset
     uint64_t visBase_ = 0;          // absolute index of the first word held
     uint64_t visEnd_ = 0;           // absolute index past the last word held
+    VisualCursor visRenderAt_, visLiveAt_;
+    static void visualEncode(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t startTick,
+                             std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks);
+    void visualAddPiece(VisualPiece&& piece);
+    void visualAppend(VisualPiece&& piece, uint32_t endTick, bool anyLeft);
     std::size_t visualPieceAt(uint64_t position) const;
+    void visualSeek(VisualCursor& c, uint64_t position) const;
+    template <typename Fn> std::size_t visualScan(VisualCursor& c, std::size_t maxWords, uint32_t through, Fn&& fn) const;
+    inline uint32_t visualPeekTick(const VisualCursor& c) const;
     uint64_t visualLowerBound(uint32_t tick) const;
     void visualClearWords(uint64_t base);
     uint32_t visStart_ = 0;         // the stream holds every event in [visStart_, visHead_)
@@ -559,6 +582,7 @@ private:
     bool liveOnly_ = false;               // keyboard Worker instance
     bool liveExternal_ = false;           // coordinator with a keyboard Worker
     int64_t liveExternalPos_ = -1;
+    std::size_t visualPlanWords_ = std::size_t(32) << 20;
     struct LiveRequest { double tick = 0, npsStartTick = 0, ccStartTick = 0; uint32_t wholeTick = 0; bool exactTick = false; };
     enum class LiveAction { Hold, Reset, Advance, Stay };
     bool liveRequest(double tick, double npsStartTick, double ccStartTick, LiveRequest& r) const;
