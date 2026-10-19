@@ -110,6 +110,8 @@ class MainWindow : public QObject {
     // Roll modes for the next MIDI (HANDOFF sec. 89): 1 look-ahead with a RAM limit, 2 whole song.
     Q_PROPERTY(int rollMode READ rollMode WRITE setRollMode NOTIFY rollConfigChanged)
     Q_PROPERTY(int rollLookAheadMB READ rollLookAheadMB WRITE setRollLookAheadMB NOTIFY rollConfigChanged)
+    Q_PROPERTY(float neuralRoll READ neuralRoll WRITE setNeuralRoll NOTIFY neuralBackgroundChanged)
+    Q_PROPERTY(float neuralPage READ neuralPage WRITE setNeuralPage NOTIFY neuralBackgroundChanged)
 
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
     Q_PROPERTY(float dominantHue READ dominantHue NOTIFY neuralVisualChanged)
@@ -206,6 +208,8 @@ public:
     bool synthOverlapGain() const { return synthOverlapGain_; }
     bool synthGpu() const { return synthGpu_; }
     int rollMode() const { return rollMode_; }
+    float neuralRoll() const { return neuralRoll_; }
+    float neuralPage() const { return neuralPage_; }
     int rollLookAheadMB() const { return rollLookAheadMB_; }
 
     QVariantList channelColorList() const;
@@ -243,6 +247,7 @@ public:
     Q_INVOKABLE void openMidiPicker();
     Q_INVOKABLE void openSoundfontPicker();
     Q_INVOKABLE void openSfzFolderPicker();
+    Q_INVOKABLE void toggleFullScreen();
     Q_INVOKABLE void clearSoundfonts();
     Q_INVOKABLE void clearFile();
     Q_INVOKABLE void notifyVisualizerFramePresented();
@@ -276,6 +281,8 @@ public:
     void setSynthOverlapGain(bool enabled);
     void setSynthGpu(bool enabled);
     void setRollMode(int mode);
+    void setNeuralRoll(float amount);
+    void setNeuralPage(float amount);
     void setRollLookAheadMB(int megabytes);
 
 signals:
@@ -310,6 +317,7 @@ signals:
     void synthStateChanged();
     void synthConfigChanged();
     void rollConfigChanged();
+    void neuralBackgroundChanged();
     void channelColorsChanged();
     void activePitchesChanged();
     void neuralVisualChanged();
@@ -528,6 +536,8 @@ private:
     bool synthOverlapGain_ = true;
     bool synthGpu_ = false;
     int rollMode_ = 1;
+    float neuralRoll_ = 0.55f;
+    float neuralPage_ = 0.7f;
     int rollLookAheadMB_ = 1024;
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;

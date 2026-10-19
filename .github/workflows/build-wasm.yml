@@ -214,6 +214,21 @@ jobs:
               f'wasmidi.js?v={version}',
               html)
 
+          # Page title and loading window in the dekx.cc style (HANDOFF sec. 92).
+          html = html.replace("<title>wasmidi</title>", "<title>WebAssembly MIDI Player</title>", 1)
+          loading = """<figure id="qtspinner" style="margin:0">
+                <div style="position:fixed;inset:0;display:grid;place-items:center;background:#07071a;font:12px Tahoma,Verdana,'Segoe UI',Geneva,sans-serif;color:#dcd8f0">
+                  <div style="width:min(420px,calc(100% - 32px));background:#16132f;padding:4px;box-shadow:inset -1px -1px #000,inset 1px 1px #5a4cb5,inset -2px -2px #0b0922,inset 2px 2px #2e2768">
+                    <div style="height:20px;display:flex;align-items:center;padding:0 4px;background:linear-gradient(90deg,#1f175a,#6b55d4);color:#fff;font-weight:bold">WebAssembly MIDI Player</div>
+                    <div id="qtstatus" style="padding:12px 8px 10px"></div>
+                    <noscript>JavaScript is disabled. Please enable JavaScript to use this application.</noscript>
+                  </div>
+                </div>
+              </figure>"""
+          html, spinners = re.subn(r'<figure[^>]*id="qtspinner".*?</figure>', loading, html, count=1, flags=re.S)
+          if spinners != 1:
+              raise SystemExit("Qt loading window not found in index.html")
+          html = html.replace("</head>", "<style>html,body{background:#07071a}</style>\n</head>", 1)
           p.write_text(html, encoding="utf-8")
           # WASMIDI Audio (HANDOFF sec. 64): same fingerprint on its assets.
           audio = Path("site/audio.html")
@@ -254,6 +269,7 @@ jobs:
           grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.11.0"' site/midi-parser-worker.js
           grep -q 'mappedStore: true' site/midi-parser-worker.js
           grep -q 'wasmidi.js?v=' site/index.html
+          grep -q '<title>WebAssembly MIDI Player</title>' site/index.html
           grep -q 'coi-serviceworker.js?v=' site/index.html
 
           echo "SnappySynthV2 deployment validation:"
