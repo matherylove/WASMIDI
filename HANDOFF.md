@@ -6372,3 +6372,47 @@ WasmiSynth, visualizador).
 
 - Export (descarga del navegador) y el config.xml real de BPFA del usuario.
 - Umbrales del aviso de atraso en las PCs del usuario (144 Hz, GPU real).
+
+## 95. Revisión 98 — GUI nueva, parte 4: cuadros sin tope
+
+**Pedido (raíz de §92):** que el framebuffer no se limite a 60 cuadros por segundo, sino que haga todos
+los cuadros posibles, priorizando por orden lo que más le cuesta a la CPU.
+
+### Causa
+
+El roll ya pedía un cuadro en cada `requestAnimationFrame` (Qt para wasm dibuja con rAF, a la tasa de la
+pantalla), pero la posición que dibujaba venía de `currentTime`, que movía un `QTimer` de 16 ms. En una
+pantalla de 144 Hz el roll dibujaba 144 cuadros, pero solo ~60 posiciones distintas: el resto repetía la
+anterior. Lo mismo el teclado, los gráficos y el LCD, que siguen a `currentTime`. Además, los tiles
+culleados se armaban con un presupuesto fijo de 6 ms por cuadro (3 ms fuera de pantalla), pensado para
+16,7 ms: a 144 Hz (6,9 ms por cuadro) ese pedazo solo ya llenaba el cuadro.
+
+### Cambios
+
+- `MainWindow::advanceFrame()` (Q_INVOKABLE): mueve el reloj en cada cuadro mostrado. Lo llama un
+  `FrameAnimation` de `MainWindow.qml` mientras suena, antes de que la escena se sincronice, así que roll,
+  teclado, gráficos y LCD ven una posición nueva en cada cuadro de la pantalla. El `QTimer` de 16 ms queda
+  solo para cuando no hay cuadros (más de 40 ms sin uno): pestaña oculta, ventana minimizada o cuadros
+  muy lentos; sigue haciendo el fin de canción y la sincronía con WasmiSynth.
+- Presupuesto de los tiles por cuadro según la pantalla: `GLRenderer` toma el intervalo más corto entre
+  cuadros de cada segundo como período de la pantalla (entre 4 y 16,7 ms) y le da al pedazo el 36% en
+  pantalla y el 18% fuera (6 y 3 ms a 60 Hz, como antes; 2,5 y 1,25 ms a 144 Hz). El trabajo más caro, los
+  tiles densos, recibe la misma parte de la CPU por segundo a cualquier tasa, y sigue el orden de
+  siempre: primero los tiles en pantalla, después el que viene.
+- `tools/browser_bench.py --uncapped`: Chromium con `--disable-frame-rate-limit --disable-gpu-vsync`.
+
+Una página web no puede mostrar más cuadros que la tasa de la pantalla: rAF va atado al vsync y un cuadro
+de más nunca llega al monitor. "Sin tope" es entonces la tasa del monitor (144, 165, 240 Hz…) en vez de 60.
+
+### Verificación
+
+- Compilación wasm local (Emscripten 3.1.56, Qt 6.8.3) OK.
+- Chromium del contenedor (sin GPU, roll por software a ~13 cuadros/s) con `--uncapped`, un MIDI
+  sintético y MatheryLSD: suena, el roll y el teclado avanzan; con cuadros más lentos que 40 ms el
+  temporizador de respaldo sigue moviendo el reloj.
+
+### No verificado
+
+- Cuadros por segundo en las PCs del usuario con pantalla de más de 60 Hz (el contenedor no tiene GPU).
+- Si a 144-240 Hz mover el reloj en cada cuadro (un pedido de teclado por cuadro al Worker) le pesa al
+  Worker del teclado con The Nuker 3.

@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§94). Este archivo resume el estado al cierre de la rev. 97 y dice
+`HANDOFF.md` (§1-§95). Este archivo resume el estado al cierre de la rev. 98 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 97)
+## Estado actual (rev. 98)
 
 Rendimiento medido por el usuario:
 
@@ -285,8 +285,11 @@ Rendimiento medido por el usuario:
 - Rev. 97 (HANDOFF §94): GUI parte 3. Diálogo "Note colors" (paleta de 16 en bucle por pista o canal,
   R/G/B/hex, import/export de config.xml `Visual/Colors/Color`), acento de la interfaz y del cursor con el
   color que más suena (`adaptColors`), avisos arriba a la derecha de polifonía y NPS máximos (de lo ya
-  tocado) y de atraso con ROLL/KEYBOARD/GRAPHS/WASMISYNTH. Faltan las partes 4 (cuadros sin tope) y 5
-  (celular).
+  tocado) y de atraso con ROLL/KEYBOARD/GRAPHS/WASMISYNTH. Falta la parte 5 (celular).
+- Rev. 98 (HANDOFF §95): GUI parte 4. El reloj de reproducción se movía cada 16 ms: a 144 Hz el roll
+  repetía posiciones. Ahora avanza en cada cuadro (`advanceFrame` desde un `FrameAnimation`; el temporizador
+  de 16 ms solo sin cuadros) y el pedazo de tiles por cuadro es 36%/18% del período de la pantalla. Sin
+  medir en una pantalla de más de 60 Hz.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -324,6 +327,7 @@ Mecanismos activos y cómo desactivarlos:
 | Tope del rellenado: un tramo por vez pasada la mitad del plan (rev. 93) | `?refillcap=0` |
 | Barrido del roll cede con `MessageChannel` (rev. 93) | `?sweepyield=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
+| Reloj en cada cuadro mostrado y pedazo de tiles según la pantalla (rev. 98) | sin interruptor (`advanceFrame`, `framePeriodMs_`) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | Advanced… → Sharding: Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |

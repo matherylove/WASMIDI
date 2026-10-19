@@ -22,6 +22,7 @@ Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
                    Function names in wasmidi.wasm need cmake -DWASMIDI_PROFILE_FUNCS=ON)
          --trace=S:D:OUT (app: Chromium trace from second S for D seconds, saved to OUT for
                    chrome://tracing; prints the main thread's top-level tasks by total time)
+         --uncapped (Chromium draws frames as fast as it can, without vsync)
          --hide=S (audio: from second S on, the page reports itself hidden, like a tab in
                    the background; the clock on the page must stop while the audio goes on)
 Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
@@ -41,6 +42,7 @@ headed = "--headed" in flags
 log_all = "--log" in flags
 query = next((f.split("=", 1)[1] for f in flags if f.startswith("--query=")), "")
 qs = ("?" + query) if query else ""
+uncapped = ["--disable-frame-rate-limit", "--disable-gpu-vsync"] if "--uncapped" in flags else []
 chromium = os.environ.get("WASMIDI_CHROMIUM") or (
     "/opt/pw-browsers/chromium" if os.path.exists("/opt/pw-browsers/chromium") else None)
 
@@ -53,7 +55,7 @@ async def main():
         browser = await p.chromium.launch(
             headless=not headed, executable_path=chromium,
             # The Vulkan flag breaks the app's WebGL2 roll in headless Chromium; WebGPU needs it.
-            args=(["--autoplay-policy=no-user-gesture-required"] if mode == "app" else
+            args=uncapped + (["--autoplay-policy=no-user-gesture-required"] if mode == "app" else
                   ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--autoplay-policy=no-user-gesture-required"]))
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
         page.on("console", lambda m: print("[console]", m.type, m.text) if log_all or m.type in ("error", "warning") else None)

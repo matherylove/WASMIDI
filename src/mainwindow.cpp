@@ -1674,11 +1674,12 @@ MainWindow::MainWindow(QObject* parent)
     auto* frameTimer = new QTimer(this);
     frameTimer->setTimerType(Qt::PreciseTimer);
 
-    connect(
-        frameTimer,
-        &QTimer::timeout,
-        this,
-        &MainWindow::updateCurrentTime);
+    // The clock moves on every displayed frame (advanceFrame); the timer only keeps it
+    // going while no frames are drawn.
+    connect(frameTimer, &QTimer::timeout, this, [this] {
+        if (!frameClock_.isValid() || frameClock_.elapsed() > 40)
+            updateCurrentTime();
+    });
 
     frameTimer->start(16);
 
@@ -3878,6 +3879,12 @@ void MainWindow::updateLiveStats()
     }
 
     updateDominantColor();
+}
+
+void MainWindow::advanceFrame()
+{
+    frameClock_.restart();
+    updateCurrentTime();
 }
 
 void MainWindow::updateCurrentTime()

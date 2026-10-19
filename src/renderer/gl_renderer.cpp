@@ -3149,6 +3149,21 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
         cullSignature_ = signature;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (framePeriodLast_ != std::chrono::steady_clock::time_point{}) {
+        framePeriodCandidateMs_ = std::min(framePeriodCandidateMs_,
+            std::chrono::duration<double, std::milli>(now - framePeriodLast_).count());
+        if (now - framePeriodWindow_ >= std::chrono::seconds(1)) {
+            if (framePeriodCandidateMs_ < 1.0e9)
+                framePeriodMs_ = std::clamp(framePeriodCandidateMs_, 4.0, 1000.0 / 60.0);
+            framePeriodCandidateMs_ = 1.0e9;
+            framePeriodWindow_ = now;
+        }
+    } else {
+        framePeriodWindow_ = now;
+    }
+    framePeriodLast_ = now;
+
     const uint32_t firstTile = viewStart / windowTicks;
     const uint32_t lastTile = viewEnd / windowTicks;
     for (std::size_t i = 0; i < cullTiles_.size();) {
@@ -3211,7 +3226,8 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
         const auto started = std::chrono::steady_clock::now();
         static const bool sliceDisabled = wasmidi_tile_slice_disabled() != 0;
         const bool visible = cullJob_.index <= lastTile;
-        const bool finished = stepCullJob(sliceDisabled ? 1.0e9 : (visible ? 6.0 : 3.0));
+        const double budget = framePeriodMs_ * (visible ? 0.36 : 0.18);
+        const bool finished = stepCullJob(sliceDisabled ? 1.0e9 : budget);
         wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count(), finished ? 1 : 0);
     }
