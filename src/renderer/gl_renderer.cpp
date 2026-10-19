@@ -396,13 +396,16 @@ uniform int uViewEnd;
 uniform int uCurrentTick;
 uniform int uPerTrack;
 uniform sampler2D uPalette;
+uniform int uGlowEnabled;
+uniform int uTransparencyEnabled;
 
-flat out vec4 vColor;
-flat out int vIsActive;
-flat out float opacity;
-flat out float vWidthPx;
-out float vX;
-out float vY;
+// Per note: its gradient stops and, interpolated, the distance in pixels to
+// each side and the position across the row.
+flat out vec4 vBase;
+flat out vec3 vLight;
+flat out vec3 vDark;
+out vec4 vDist;
+out float vT;
 
 void main() {
     int endTick = aEndTick > 0u ? int(aEndTick) : uViewEnd;
@@ -420,58 +423,56 @@ void main() {
         float(((aPackedData >> 8u) & 0xffu) + isTop) * uMetrics.z;
     float z = float(endTick - int(aStartTick)) / 16777216.0;
 
-    vColor = texelFetch(uPalette, ivec2(int(colorIndex), 0), 0);
-    vIsActive =
-        (uCurrentTick >= int(aStartTick) && uCurrentTick <= endTick) ? 1 : 0;
-    opacity = float((aPackedData & 0xffu) + 1u) / 128.0;
-    vWidthPx = (endX - startX) * 0.5 * uRollSize.x;
-    vX = float(isEnd) * vWidthPx;
-    vY = float(isTop);
+    vec3 base = texelFetch(uPalette, ivec2(int(colorIndex), 0), 0).rgb;
+    bool active = uCurrentTick >= int(aStartTick) && uCurrentTick <= endTick;
+    if (uGlowEnabled == 1 && active)
+        base = min(base * 2.0 + vec3(0.1), vec3(1.0));
+    float opacity = uTransparencyEnabled == 1
+        ? float((aPackedData & 0xffu) + 1u) / 128.0
+        : 1.0;
+    vBase = vec4(base, opacity);
+    vLight = base + (1.0 - base) * 0.45;
+    vDark = base * 0.55;
+
+    // The 1 px edge only where the note has room for it: on a side too
+    // small, both distances stay at 2 px.
+    float widthPx = (endX - startX) * 0.5 * uRollSize.x;
+    float rowPx = uRollSize.y / 128.0;
+    float px = float(isEnd) * widthPx;
+    float py = float(isTop) * rowPx;
+    vDist = vec4(
+        widthPx >= 3.0 ? vec2(px, widthPx - px) : vec2(2.0),
+        rowPx >= 3.0 ? vec2(py, rowPx - py) : vec2(2.0));
+    vT = 1.0 - float(isTop);
     gl_Position = vec4(x, y, z, 1.0);
 }
 )GLSL";
 
-    // Gradient across the key row, 1 px darker edge where the note has room
-    // for it, 2 px checker texture inside (HANDOFF sec. 93).
+    // Gradient across the key row, 1 px darker edge, 2 px checker texture
+    // inside (HANDOFF sec. 93).
     static const char* noteFragment = R"GLSL(#version 300 es
 precision highp float;
 
-flat in vec4 vColor;
-flat in int vIsActive;
-flat in float opacity;
-flat in float vWidthPx;
-in float vX;
-in float vY;
-uniform int uGlowEnabled;
-uniform int uTransparencyEnabled;
-uniform vec2 uRollSize;
+flat in vec4 vBase;
+flat in vec3 vLight;
+flat in vec3 vDark;
+in vec4 vDist;
+in float vT;
 out vec4 fragColor;
 
 void main() {
-    float noteOpacity = uTransparencyEnabled == 1 ? opacity : 1.0;
-    vec3 base = vColor.rgb;
-    base = (uGlowEnabled == 1 && vIsActive == 1)
-        ? min(base * 2.0 + vec3(0.1), vec3(1.0))
-        : base;
-
-    float t = 1.0 - vY;
-    vec3 color = t < 0.45
-        ? mix(base + (1.0 - base) * 0.45, base, t / 0.45)
-        : mix(base, base * 0.55, (t - 0.45) / 0.55);
-
-    float rowPx = uRollSize.y / 128.0;
-    float yPx = vY * rowPx;
-    bool edge =
-        (rowPx >= 3.0 && (yPx < 1.0 || yPx > rowPx - 1.0)) ||
-        (vWidthPx >= 3.0 && (vX < 1.0 || vX > vWidthPx - 1.0));
-    if (edge) {
-        color = base * 0.3;
+    vec3 color;
+    if (any(lessThan(vDist, vec4(1.0)))) {
+        color = vBase.rgb * 0.3;
     } else {
+        color = vT < 0.45
+            ? mix(vLight, vBase.rgb, vT * (1.0 / 0.45))
+            : mix(vBase.rgb, vDark, (vT - 0.45) * (1.0 / 0.55));
         ivec2 p = ivec2(gl_FragCoord.xy);
         if (((p.x ^ p.y) & 1) == 1)
             color += (1.0 - color) * 0.13;
     }
-    fragColor = vec4(color, noteOpacity);
+    fragColor = vec4(color, vBase.a);
 }
 )GLSL";
 
