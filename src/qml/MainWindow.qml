@@ -364,6 +364,11 @@ ApplicationWindow {
         mainWindow: mainWindow
     }
 
+    FrameAnimation {
+        running: mainWindow.isPlaying
+        onTriggered: mainWindow.advanceFrame()
+    }
+
     Toasts {
         anchors.top: parent.top
         anchors.topMargin: 30

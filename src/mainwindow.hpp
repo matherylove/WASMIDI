@@ -267,6 +267,7 @@ public:
     // Keyboard frames since the last call and how far its keys trail the
     // playhead, in seconds; read once per second by the lag warning.
     Q_INVOKABLE QVariantMap takeKeyboardSample();
+    Q_INVOKABLE void advanceFrame();
     void applyImportedColors(const uint32_t* rgb, int count);
 
     void setNoteSpeed(float speed);
@@ -406,6 +407,7 @@ private:
 
     QVector<QColor> channelColors_;
     QElapsedTimer playbackClock_;
+    QElapsedTimer frameClock_;
     float playbackAnchorSeconds_ = 0.0f;
     qint64 playbackLastElapsedMs_ = 0;
     // Wall clock leads; audio only re-anchors it (HANDOFF sec. 48).

@@ -122,6 +122,12 @@ private:
     };
     void startCullJob(uint32_t index, uint32_t windowTicks, uint32_t coverage);
     bool stepCullJob(double budgetMs);
+    // Shortest gap between frames in the last second (the display period), sizes the
+    // per-frame slice (HANDOFF sec. 95).
+    double framePeriodMs_ = 1000.0 / 60.0;
+    double framePeriodCandidateMs_ = 1.0e9;
+    std::chrono::steady_clock::time_point framePeriodLast_{};
+    std::chrono::steady_clock::time_point framePeriodWindow_{};
     void uploadCullTile(uint32_t index, uint32_t coverage, const CompositorNote* notes, std::size_t count);
     CullJob cullJob_;
     CullTile* findCullTileMutable(uint32_t index);
