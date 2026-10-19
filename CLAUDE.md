@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§87). Este archivo resume el estado al cierre de la rev. 91 y dice
+`HANDOFF.md` (§1-§88). Este archivo resume el estado al cierre de la rev. 92 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 91)
+## Estado actual (rev. 92)
 
 Rendimiento medido por el usuario:
 
@@ -247,6 +247,14 @@ Rendimiento medido por el usuario:
   recortar (anexar hasta 1,1 s por segundo en el Worker del parser). Ahora es una lista de pedazos,
   uno por tramo: nada se mueve. Chromium 118-137 s: roll atrasado 293 → 200 cuadros, teclado
   40 → 47/s. Más tramos en vuelo o tramos más chicos no ayudan (los helpers no son el límite).
+- Rev. 92 (HANDOFF §88): el flujo visual se guarda codificado como el RSB de sharkmidi (grupos
+  tick/pista, corridas de estado, 1 byte por palabra): The Nuker 3 entero 32,6 → 4,78 GB. Barrido y
+  teclado leen corridas enteras (`visualScanRuns`, `renderRun`). Los helpers decodifican por
+  adelantado hasta un plan (32 M palabras por GiB de `deviceMemory`, máx. 1024 M), sin esperar al
+  objetivo del roll. Chromium: desde 118 s roll atrasado 200 → 143 cuadros; desde 105 s, 0 en
+  127-130 s (sin adelanto 61); teclado en 128 s 17 → 47/s. Revisión del código de BPFA (modo normal
+  con tabla de notas de 8 B, modo look-ahead con tope de RAM y prellenado) en §88. El usuario pidió
+  después dos modos separados como BPFA.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -273,9 +281,11 @@ Mecanismos activos y cómo desactivarlos:
 | Teclado en casillas planas por (pista, canal), snapshots cada 4096 eventos (rev. 86) | sin interruptor (`LiveSnapshotEventInterval`) |
 | Teclado en su propio Worker con helpers (rev. 87) | `?keyworker=0` |
 | Tiles culleados armados de a pedazos por cuadro (rev. 88) | `?tileslice=0` |
-| Feed del synth y flujo visual en tramos conjuntos (rev. 89) | `?jointdecode=0` |
+| Feed del synth y flujo visual en tramos conjuntos (rev. 89; apagados con el adelanto de la rev. 92) | `?jointdecode=1` los fuerza, `?jointdecode=0` |
 | Cada pista guarda su bloque descomprimido entre pedidos a helpers (rev. 90) | sin interruptor |
 | Flujo visual en pedazos, uno por tramo anexado (rev. 91) | sin interruptor |
+| Flujo visual codificado en corridas, leído por corridas (rev. 92) | sin interruptor |
+| Helpers decodifican el flujo visual por adelantado hasta el plan (rev. 92) | `?visualahead=0`; `?visualplan=M` (millones de palabras) |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
@@ -285,7 +295,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§87)
+## Pendientes abiertos (ver HANDOFF §67-§88)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -297,7 +307,8 @@ Mecanismos activos y cómo desactivarlos:
    = 1024 × 24 workers) y el roll se atrasaba en 830-858 s con 8 helpers (arreglado en la
    rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
-   Falta: The Nuker 3 en WASMIDI con la rev. 91 y 12288 voces (`helpers N% busy` de
+   Falta: dos modos como BPFA, pedidos por el usuario (canción entera decodificada al cargar /
+   look-ahead con tope de RAM y prellenado); The Nuker 3 en WASMIDI con la rev. 92 y 12288 voces (`helpers N% busy` de
    `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
    log de consola del cierre de WasmiSynth en pausa;
    la ráfaga de 830 s de The Nuker 3 (~121 M palabras/s: anexar + barrer no alcanzan, rev. 87);

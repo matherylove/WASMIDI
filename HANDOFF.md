@@ -5816,3 +5816,95 @@ merge, también con tramos de helper y con el teclado en su Worker): `many9679.m
 completo, con la prueba del contrato del parser.
 
 **No verificado / pendiente:** en las PCs del usuario y en WASMIDI con el synth.
+
+## 88. Revisión 92 — Flujo visual compacto, leído por corridas y decodificado por adelantado
+
+**Pedido:** seguir con el atraso del roll en 127-130 s de The Nuker 3 (el usuario: "continua"). En
+el mismo hilo preguntó por qué sharkmidi y BPFA cargan y reproducen más rápido, si pasar código a C
+ayudaría y cómo hace BPFA para usar zstd sin problemas al reproducir; mandó el código de BPFA
+(revisión al final de esta sección).
+
+**Causa:** después de la rev. 91 el flujo visual seguía guardando 10 bytes por palabra (anexar
+cientos de MiB por segundo en el Worker del parser y en el del teclado) y los helpers solo
+planeaban tramos hasta el objetivo del roll, así que la zona densa se decodificaba justo cuando
+hacía falta. Medido en host sobre la canción entera (contador propio fuera del repo con los helpers de
+`decodeVisualRequest`, 4 hilos): 3.259 M
+palabras plegadas, 141 M grupos (tick, pista) y 383 M corridas; decodificarlas cuesta 126 s de hilo
+nativo (34 s de pared con 4 hilos) y ocupan 32,6 GB como palabras de 10 bytes.
+
+**Cambios:**
+
+- `BpfaMidiStore`: cada pedazo del flujo (`VisualPiece`) se guarda codificado como el RSB de
+  sharkmidi (§86): cabecera de grupo `0xf1` (delta de tick y pista, LEB128) o `0xf0` (mismo tick,
+  delta de pista); cabecera de corrida con estado y data 2 (bit 7: sigue un byte de copias de eco);
+  un byte de data 1 por palabra, con el bit 7 en la última de la corrida. Una marca cada 65536
+  palabras (`VisualMark`: palabra, byte, tick y pista antes de la cabecera) para buscar.
+  The Nuker 3 entero: 4,78 GB (1,47 bytes por palabra) contra 32,6 GB.
+- Lectores: cursores (`VisualCursor`) con posición absoluta y serie de pedazo; `visualSeek` sigue
+  desde donde estaba o parte de la última marca; `visualLowerBound` busca por pedazo, por marca y
+  después lee. Leer palabra por palabra costaba 2,5× más que el vector de la rev. 91 en wasm (barrido
+  ~580 ms/s contra ~200 en la zona densa), así que `visualScanRuns` entrega corridas enteras: el
+  tick se prueba una vez por grupo y los bytes de data 1 van directo al consumidor.
+  `renderRun` (barrido del roll) y `liveStreamRun` (teclado) procesan cada corrida de una vez:
+  estado, colores y par (pista, canal) se buscan una vez por corrida; las densidades suman la
+  corrida entera en un punto (mismo resultado: los puntos del mismo tick se juntan).
+- Resultado de helper `WVS2` y exportación al Worker del teclado `WVT2` con los bytes codificados.
+- Decodificar por adelantado: `setVisualPlan` / `wmp_visual_plan_js` fija cuántas palabras puede
+  tener el flujo delante del barrido y del teclado (`visualRoomAhead`); el recorte solo cuenta las
+  palabras detrás del lector. En `midi-parser-worker.js` los tramos visuales ya no esperan al
+  objetivo del roll: 32 M palabras (~47 MB por copia) por GiB de `deviceMemory`, entre 32 M y
+  1024 M (`?visualplan=M` en millones; `?visualahead=0` vuelve a planear solo hasta el objetivo con
+  32 M). Mientras suena el feed del synth y el plan va pasado el objetivo, un helper queda libre para
+  el feed. Con adelanto los tramos conjuntos de la rev. 89 se apagan (el feed tendría que perseguir
+  la cabeza visual; `?jointdecode=1` los fuerza). El Worker del teclado recibe el plan en
+  `live-init`.
+
+**Medición (Chromium del contenedor, 4 hilos, `browser_bench.py visual "The Nuker 3 Ultimate
+F4.mid" START DUR --query=helpers=3&visualdebug=1`, cuadros con el roll atrasado):**
+
+| | rev. 91 | compacto, palabra por palabra | + corridas, con adelanto | + corridas, sin adelanto | final (teclado y barrido por corridas) |
+|---|---|---|---|---|---|
+| 118-137 s | 200 | 435 | 164 | 150 | 143 |
+| 105-136 s | — | — | 34 (todos en 105 s) | 99 (61 en 128-129 s) | 39 (todos en 105 s) |
+
+- Anexar en el Worker del parser: ~137 → ~25-60 ms/s; los helpers entregan ~55 MiB/s con
+  adelanto (230 MiB/s eran palabras de 10 bytes).
+- Desde 118 s el adelanto no alcanza a juntar ventaja: los 3 helpers decodifican al 100% desde el
+  arranque y comparten los 4 hilos con el barrido, el teclado y la página. Desde 105 s llegan al
+  tope del plan antes de 127 s y en 127-130 s el roll no se atrasa ni un cuadro (sin adelanto: 61).
+- Teclado en 128 s (corrida desde 105 s): 17 → 47 actualizaciones/s, latencia promedio 48 → 11 ms;
+  Worker del teclado 793 → 521 ms en ese segundo.
+
+**Verificación:** `tools/host_bench/visual_check.cpp` ahora también corre el Worker del teclado con
+adelanto (plan de 256 M palabras, 4 tramos por cuadro sin esperar al objetivo) y compara notas,
+cierres y teclado contra el merge: `many9679.mid` 0-20 s, `many30.mid` 0-30 s y `nuker4_553.mid`
+0-8 s (1,23 M notas), todo IDENTICAL. `tools/local_build.sh` completo (ALL CHECKS PASSED, con la
+prueba del contrato del parser).
+WASMIDI con synth (`browser_bench.py app "The Nuker 3 Ultimate F4.mid" MatheryLSD.sf2 140 --voices=1024
+--query=helpers=3&visualdebug=1`, desde 0 s): sin adelanto 0 underruns; con adelanto una corrida dio 7
+underruns en un solo segundo (78 s) y la repetición 0 underruns y 0 notas tardías, con los helpers
+ocupados 79% en promedio. En el contenedor de 4 hilos corren a la vez 3 helpers y 4 workers del synth,
+así que ese segundo suelto no alcanza para culpar al adelanto; en las PCs los helpers tienen hilos
+reservados (rev. 81). Una corrida anterior falló porque el servidor de prueba se cerró al crear los
+helpers ("Synth feed helper crashed"): no es un error del código.
+
+**No verificado / pendiente:** en las PCs del usuario y la ráfaga de 830 s (con 5-8 helpers el plan
+de 1024 M palabras cubre ~8 s de déficit). Siguiente paso propuesto: armar el flujo de toda la
+canción después de la carga, guardado en el Worker del parser, y pasarle al teclado solo lo cercano.
+
+### Revisión de BPFA (código del usuario, permiso del autor; ver §43)
+
+- **Modo normal** (`PreprocessedMidi::Load`): lee el archivo entero, escanea, comprime y deduplica
+  los bloques (`BuildDeduplicatedSource`; en Windows con XPRESS_HUFF de la API de compresión de
+  Windows, zstd solo con `BPFA_HAVE_ZSTD`) y después empareja todas las notas en paralelo en una
+  tabla de `PackedNote` (8 bytes por nota, bloques de 1024 por pista). El renderizador lee esa tabla;
+  la fuente comprimida solo alimenta el audio (cursores por pista con caché de bloques por hilo) y el
+  salto rápido usa la tabla. The Nuker 3: 2.079 M notas × 8 B = 16,6 GB, más que el heap wasm de
+  16 GiB de una pestaña.
+- **Modo look-ahead** (`LoadLookAhead`, tope `LookAheadMemoryMB`, 1024 por defecto): mapea el
+  archivo; un solo hilo (`LookAheadProducer`) mezcla las pistas con un heap y empareja notas en
+  pedazos de 65536 hasta el tope, liberando los que ya sonaron; la carga espera a llenar el tope
+  ("Prefilling look-ahead note cache"). Un seek fuera de lo armado reinicia el productor.
+- Lo útil para WASMIDI: pagar la decodificación antes de reproducir. El flujo compacto es el
+  equivalente de la tabla, 3,5× más chico (4,78 GB contra 16,6 GB para The Nuker 3), y lo arman
+  varios helpers en vez de un hilo.
