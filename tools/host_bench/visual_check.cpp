@@ -148,7 +148,8 @@ static Run playJump(BpfaMidiStore& store, double start, double duration, double 
 // The keyboard Worker (HANDOFF sec. 83): helper spans are appended to the coordinator and to a
 // keyboard store made from exportLiveImage; the live snapshots run there and the coordinator
 // only rebuilds the keys on a reset. With jump > 0 the sweep restarts as in playJump. With a plan
-// (HANDOFF sec. 88) the helper spans run ahead of the roll up to that many words.
+// (HANDOFF sec. 88) the helper spans run ahead of the roll up to that many words. The keyboard
+// gets the pieces forwarded as it nears them (HANDOFF sec. 89).
 static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start, double duration, double lookahead,
                       std::size_t budget, double jump, double& longest, std::size_t& rebuilds, std::size_t plan = 0) {
     Run run;
@@ -161,11 +162,22 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
         fprintf(stderr, "keyboard image failed: %s %s\n", store.error(), keys.error());
         exit(1);
     }
-    keys.setVisualPlan(plan ? plan : std::size_t(32) << 20);
+    keys.setVisualPlan(std::size_t(64) << 20);
     store.setLiveExternal(true);
     const MidiDocument& md = store.metadata();
     store.resetRenderCursor(uint32_t(md.secondsToTick(start)), false);
-    keys.restartVisualStream(uint32_t(md.secondsToTick(start)));
+    std::vector<uint8_t> forwarded;
+    if (!store.beginLiveForward(forwarded) || !keys.importVisualStream(forwarded.data(), forwarded.size())) {
+        fprintf(stderr, "forward start failed: %s %s\n", store.error(), keys.error());
+        exit(1);
+    }
+    auto forward = [&] {
+        while (store.liveForward(std::size_t(32) << 20, forwarded))
+            if (!keys.appendVisualResult(forwarded.data(), forwarded.size())) {
+                fprintf(stderr, "forwarded piece failed: %s\n", keys.error());
+                exit(1);
+            }
+    };
     std::vector<VisualNote> app; std::vector<RenderClose> cl;
     bool first = true, jumped = jump <= 0.0;
     double sweepFrom = start;
@@ -193,7 +205,7 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
             jumped = true;
             sweepFrom = t + jump;
             store.resetRenderCursor(uint32_t(md.secondsToTick(sweepFrom)), false);
-            keys.restartVisualStream(uint32_t(md.secondsToTick(sweepFrom)));
+            keys.restartVisualStream(store.liveForwardTick(), store.liveForwardBase());
         }
         const uint32_t target = uint32_t(std::min<double>(md.maxTick, md.secondsToTick(std::max(t, sweepFrom) + lookahead)));
         for (;;) {
@@ -202,8 +214,7 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
                 const uint32_t a = store.visualStreamHead(), b = store.visualSpanEnd(a, budget * 4);
                 if (!store.buildVisualRequest(a, b, request) ||
                     !helper.decodeVisualRequest(request.data(), request.size(), result) ||
-                    !store.appendVisualResult(result.data(), result.size()) ||
-                    !keys.appendVisualResult(result.data(), result.size())) {
+                    !store.appendVisualResult(result.data(), result.size())) {
                     fprintf(stderr, "helper span failed: %s %s %s\n", store.error(), helper.error(), keys.error());
                     exit(1);
                 }
@@ -219,12 +230,14 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
         }
         const double tick = md.secondsToTick(t);
         LiveSnapshot snap;
+        forward();
         const double took = live(tick, md.secondsToTick(std::max(0.0, t - 0.25)), md.secondsToTick(std::max(0.0, t - 1.0)), snap, first);
         longest = std::max(longest, took);
         (first ? run.resetSeconds : run.liveSeconds) += took;
         first = false;
         run.frameLive.push_back(run.live.size());
         run.live.push_back(snap);
+        forward();
         if (jump <= 0.0 && run.live.size() % 7 == 0) {
             live(std::ceil(tick), md.secondsToTick(std::max(0.0, t - 0.25)), md.secondsToTick(std::max(0.0, t - 1.0)), snap, false);
             run.live.push_back(snap);
@@ -234,6 +247,78 @@ static Run playWorker(BpfaMidiStore& store, BpfaMidiStore& helper, double start,
     store.setVisualPlan(std::size_t(32) << 20);
     std::sort(run.closes.begin(), run.closes.end());
     return run;
+}
+
+// Kept resets (HANDOFF sec. 89): with the stream held (full mode), a reset inside it reuses the
+// words. The sweep from there must equal the sweep from a stream started at that tick.
+static bool keptCheck(BpfaMidiStore& store, BpfaMidiStore& helper, double start, double duration, std::size_t budget) {
+    const MidiDocument& md = store.metadata();
+    const uint32_t from = uint32_t(md.secondsToTick(start)), mid = uint32_t(md.secondsToTick(start + duration / 2.0));
+    const uint32_t end = uint32_t(std::min<double>(md.maxTick, md.secondsToTick(start + duration)));
+    store.setVisualStreamEnabled(true);
+    store.setVisualAutoDecode(false);
+    std::vector<uint8_t> request, result;
+    auto decodeTo = [&](uint32_t through) {
+        while (!store.visualStreamDone() && store.visualStreamHead() <= through) {
+            const uint32_t a = store.visualStreamHead(), b = store.visualSpanEnd(a, budget * 4);
+            if (!store.buildVisualRequest(a, b, request) || !helper.decodeVisualRequest(request.data(), request.size(), result) ||
+                !store.appendVisualResult(result.data(), result.size())) {
+                fprintf(stderr, "kept: helper span failed: %s %s\n", store.error(), helper.error());
+                exit(1);
+            }
+        }
+    };
+    auto sweep = [&](uint32_t through, Run* run) {
+        std::vector<VisualNote> app; std::vector<RenderClose> cl;
+        for (;;) {
+            decodeTo(through);
+            uint32_t base = 0, next = 0; bool complete = false, hasNext = false;
+            if (!store.buildRenderSweep(through, budget, app, cl, base, complete, next, hasNext)) { fprintf(stderr, "kept: sweep failed\n"); exit(1); }
+            if (run) {
+                run->appends.insert(run->appends.end(), app.begin(), app.end());
+                for (const RenderClose& c : cl) run->closes.emplace_back(c.noteId, c.endTick);
+            }
+            if (complete) break;
+        }
+        if (run) std::sort(run->closes.begin(), run->closes.end());
+    };
+    auto same = [](const Run& a, const Run& b) {
+        return a.closes == b.closes && a.appends.size() == b.appends.size() &&
+            std::equal(a.appends.begin(), a.appends.end(), b.appends.begin(), [](const VisualNote& x, const VisualNote& y) {
+                return x.startTick == y.startTick && x.endTick == y.endTick && x.packedData == y.packedData; });
+    };
+    Run reference, back, ahead, merged;
+    store.setVisualStreamEnabled(false);
+    store.resetRenderCursor(mid, false);
+    sweep(end, &merged);
+    store.setVisualStreamEnabled(true);
+    store.setVisualKeepAll(false);
+    store.restartVisualStream(mid);
+    store.resetRenderCursor(mid, false);
+    const bool plainKept = store.visualKeptOnReset();
+    sweep(end, &reference);
+    store.setVisualKeepAll(true);
+    store.restartVisualStream(from);
+    store.resetRenderCursor(from, false);
+    decodeTo(end);
+    sweep(std::min(end, uint32_t(md.secondsToTick(start + duration * 0.75))), nullptr);
+    store.resetRenderCursor(mid, false);
+    const bool backKept = store.visualKeptOnReset();
+    sweep(end, &back);
+    store.resetRenderCursor(from, false);
+    sweep(std::min(end, uint32_t(md.secondsToTick(start + duration * 0.1))), nullptr);
+    store.resetRenderCursor(mid, false);
+    const bool aheadKept = store.visualKeptOnReset();
+    sweep(end, &ahead);
+    const uint64_t held = store.visualHeldBytes();
+    store.setVisualKeepAll(false);
+    const bool ok = !plainKept && backKept && aheadKept && same(reference, back) && same(reference, ahead) &&
+        same(reference, merged);
+    printf("kept    reset back %s, reset ahead %s: appends %zu/%zu/%zu (merge %zu), closes %zu/%zu/%zu %s | %.1f MB held\n",
+           backKept ? "kept" : "NOT KEPT", aheadKept ? "kept" : "NOT KEPT", reference.appends.size(), back.appends.size(),
+           ahead.appends.size(), merged.appends.size(), reference.closes.size(), back.closes.size(), ahead.closes.size(),
+           ok ? "IDENTICAL" : "DIFFER", held / 1048576.0);
+    return ok;
 }
 
 int main(int argc, char** argv) {
@@ -306,6 +391,7 @@ int main(int argc, char** argv) {
         failures += differ != 0 || compared == 0;
         Run ahead = playWorker(store, helper, start, duration, lookahead, budget, 0.0, longest, rebuilds, std::size_t(256) << 20);
         compare("ahead", ahead);
+        failures += !keptCheck(store, helper, start, duration, budget);
     }
     {
         const double jump = 1.0;

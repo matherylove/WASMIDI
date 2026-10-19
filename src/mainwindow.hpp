@@ -107,6 +107,9 @@ class MainWindow : public QObject {
     Q_PROPERTY(bool synthSoftClip READ synthSoftClip WRITE setSynthSoftClip NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthOverlapGain READ synthOverlapGain WRITE setSynthOverlapGain NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthGpu READ synthGpu WRITE setSynthGpu NOTIFY synthConfigChanged)
+    // Roll modes for the next MIDI (HANDOFF sec. 89): 1 look-ahead with a RAM limit, 2 whole song.
+    Q_PROPERTY(int rollMode READ rollMode WRITE setRollMode NOTIFY rollConfigChanged)
+    Q_PROPERTY(int rollLookAheadMB READ rollLookAheadMB WRITE setRollLookAheadMB NOTIFY rollConfigChanged)
 
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
     Q_PROPERTY(float dominantHue READ dominantHue NOTIFY neuralVisualChanged)
@@ -202,6 +205,8 @@ public:
     bool synthSoftClip() const { return synthSoftClip_; }
     bool synthOverlapGain() const { return synthOverlapGain_; }
     bool synthGpu() const { return synthGpu_; }
+    int rollMode() const { return rollMode_; }
+    int rollLookAheadMB() const { return rollLookAheadMB_; }
 
     QVariantList channelColorList() const;
     float dominantHue() const { return dominantHue_; }
@@ -269,6 +274,8 @@ public:
     void setSynthSoftClip(bool enabled);
     void setSynthOverlapGain(bool enabled);
     void setSynthGpu(bool enabled);
+    void setRollMode(int mode);
+    void setRollLookAheadMB(int megabytes);
 
 signals:
     void playingChanged();
@@ -301,6 +308,7 @@ signals:
     void midiLoadingChanged();
     void synthStateChanged();
     void synthConfigChanged();
+    void rollConfigChanged();
     void channelColorsChanged();
     void activePitchesChanged();
     void neuralVisualChanged();
@@ -518,6 +526,8 @@ private:
     bool synthSoftClip_ = true;
     bool synthOverlapGain_ = true;
     bool synthGpu_ = false;
+    int rollMode_ = 1;
+    int rollLookAheadMB_ = 1024;
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;
     bool synthWasStarved_ = false;

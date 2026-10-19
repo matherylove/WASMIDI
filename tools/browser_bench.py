@@ -157,12 +157,12 @@ async def main():
                 await page.screenshot(path="/tmp/wasmidi_picker_fail.png")
                 raise RuntimeError("no file picker at %d,%d (screenshot /tmp/wasmidi_picker_fail.png)" % (x, y))
             await page.wait_for_timeout(20000)
-            await choose(268, 551, args[2])
+            await choose(268, 580, args[2])
             await page.wait_for_function("() => globalThis.WasmidiSnappyBridge && WasmidiSnappyBridge.state.soundfontLoaded",
                                          timeout=600000)
             voices = next((f.split("=", 1)[1] for f in flags if f.startswith("--voices=")), None)
             if voices:
-                await page.mouse.dblclick(82, 630)
+                await page.mouse.dblclick(82, 659)
                 await page.keyboard.press("Control+A")
                 await page.keyboard.type(voices)
                 await page.keyboard.press("Enter")

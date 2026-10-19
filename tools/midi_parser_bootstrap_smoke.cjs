@@ -418,8 +418,10 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     };
     const Spans = await helper();
 
+    // A reset inside the held stream keeps it (HANDOFF sec. 89): these checks restart it first.
     const sweep = (stream, spans) => {
         Module._wmp_visual_config_js(stream ? 1 : 0, spans ? 0 : 1);
+        Module._wmp_live_restart_js(0);
         Module._wmp_reset_render_cursor_js(0, 0);
         const appends = [], closes = [];
         for (let guard = 0; guard < 100000; ++guard) {
@@ -462,6 +464,7 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     }
     const jointSweep = () => {
         Module._wmp_visual_config_js(1, 0);
+        Module._wmp_live_restart_js(0);
         Module._wmp_reset_render_cursor_js(0, 0);
         Module._wmp_feed_config_js(1024, 25, 48000, 512, 0, 4);
         Module._wmp_feed_reset_js(0);
@@ -517,6 +520,7 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     for (let t = 1000; t < maxTick - 100; t += 333) ticks.push(t);
     const snapshots = (stream) => {
         Module._wmp_visual_config_js(stream ? 1 : 0, stream ? 0 : 1);
+        Module._wmp_live_restart_js(0);
         Module._wmp_reset_render_cursor_js(0, 0);
         return ticks.map((t, i) => {
             while (stream && !Module._wmp_visual_done_js() && Number(Module._wmp_visual_head_js()) <= t + 500) {
@@ -542,11 +546,15 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     }
 
     // Keyboard Worker (HANDOFF sec. 83): the same snapshots on a third instance that gets the
-    // spans and the keys rebuilt by the coordinator on a reset.
+    // pieces the coordinator forwards as it nears them (HANDOFF sec. 89) and the keys it rebuilds
+    // on a reset.
     for (const name of ["_wmp_live_buffer_js", "_wmp_live_buffer_ptr_js", "_wmp_live_buffer_size_js",
         "_wmp_live_image_js", "_wmp_live_stream_export_js", "_wmp_live_rebuild_js", "_wmp_live_external_js",
         "_wmp_live_external_position_js", "_wmp_live_init_js", "_wmp_live_stream_import_js", "_wmp_live_restart_js",
-        "_wmp_live_step_js", "_wmp_live_resume_js", "_wmp_live_position_js"]) {
+        "_wmp_live_step_js", "_wmp_live_resume_js", "_wmp_live_position_js", "_wmp_live_restart_at_js",
+        "_wmp_live_forward_begin_js", "_wmp_live_forward_js", "_wmp_live_forward_tick_js", "_wmp_live_forward_base_js",
+        "_wmp_visual_kept_js", "_wmp_visual_keep_all_js", "_wmp_visual_held_bytes_js", "_wmp_visual_ahead_words_js",
+        "_wmp_visual_prefill_local_js", "_wmp_heap_used_js"]) {
         if (typeof Module[name] !== "function")
             throw new Error("Missing generated export " + name);
     }
@@ -557,6 +565,7 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     const putLive = (M, bytes) => M.HEAPU8.set(bytes, sizeNumber(M._wmp_live_buffer_js(bytes.length)));
     const Keys = await createParser({ noInitialRun: true, noExitRuntime: true, print() {}, printErr() {} });
     Module._wmp_visual_config_js(1, 0);
+    Module._wmp_live_restart_js(0);
     Module._wmp_reset_render_cursor_js(0, 0);
     if (!Module._wmp_live_image_js())
         throw new Error("Keyboard image failed: " + parserErrorText(Module, "?"));
@@ -564,30 +573,27 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     putLive(Keys, keysImage);
     if (!Keys._wmp_live_init_js(keysImage.length))
         throw new Error("Keyboard init failed: " + parserErrorText(Keys, "?"));
-    if (!Module._wmp_live_stream_export_js())
-        throw new Error("Visual stream export failed: " + parserErrorText(Module, "?"));
+    if (!Module._wmp_live_forward_begin_js())
+        throw new Error("Visual stream forward start failed: " + parserErrorText(Module, "?"));
     const keysStream = liveBytes(Module);
     putLive(Keys, keysStream);
     if (!Keys._wmp_live_stream_import_js(keysStream.length))
         throw new Error("Visual stream import failed: " + parserErrorText(Keys, "?"));
     Module._wmp_live_external_js(1);
-    let rebuilds = 0;
-    const keysLive = ticks.map((t, i) => {
-        while (!Module._wmp_visual_done_js() && Number(Module._wmp_visual_head_js()) <= t + 500) {
-            const head = Number(Module._wmp_visual_head_js());
-            if (!Module._wmp_visual_request_js(head, Number(Module._wmp_visual_span_end_js(head, 3000))))
-                throw new Error("Visual request failed: " + parserErrorText(Module, "?"));
-            putBuffer(Spans, bufferBytes(Module));
-            if (!Spans._wmp_visual_decode_js(sizeNumber(Module._wmp_feed_buffer_size_js())))
-                throw new Error("Visual decode failed: " + parserErrorText(Spans, "?"));
-            const result = bufferBytes(Spans);
-            putBuffer(Module, result);
-            putBuffer(Keys, result);
-            if (!Module._wmp_visual_append_js(result.length) || !Keys._wmp_visual_append_js(result.length))
-                throw new Error("Visual append failed: " + parserErrorText(Module, "?") + " " + parserErrorText(Keys, "?"));
+    let rebuilds = 0, forwarded = 0;
+    const forward = () => {
+        while (Module._wmp_live_forward_js(4096)) {
+            const piece = liveBytes(Module);
+            putBuffer(Keys, piece);
+            if (!Keys._wmp_visual_append_js(piece.length))
+                throw new Error("Forwarded piece failed: " + parserErrorText(Keys, "?"));
+            ++forwarded;
         }
+    };
+    const keyStep = (t, reset) => {
+        forward();
         const nps = Math.max(0, t - 120), cc = Math.max(0, t - 480);
-        let step = Keys._wmp_live_step_js(t, nps, cc, i === 0 ? 1 : 0);
+        let step = Keys._wmp_live_step_js(t, nps, cc, reset ? 1 : 0);
         if (step === 2 || step === 3) {
             ++rebuilds;
             if (!Module._wmp_live_rebuild_js(t, nps, cc, step === 3 ? 1 : 0))
@@ -599,15 +605,81 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
         if (step !== 1)
             throw new Error("Keyboard step failed: " + parserErrorText(Keys, "?"));
         Module._wmp_live_external_position_js(Number(Keys._wmp_live_position_js()));
+        forward();
         return liveWords(Keys);
+    };
+    const keysLive = ticks.map((t, i) => {
+        while (!Module._wmp_visual_done_js() && Number(Module._wmp_visual_head_js()) <= t + 500) {
+            const head = Number(Module._wmp_visual_head_js());
+            if (!Module._wmp_visual_request_js(head, Number(Module._wmp_visual_span_end_js(head, 3000))))
+                throw new Error("Visual request failed: " + parserErrorText(Module, "?"));
+            putBuffer(Spans, bufferBytes(Module));
+            if (!Spans._wmp_visual_decode_js(sizeNumber(Module._wmp_feed_buffer_size_js())))
+                throw new Error("Visual decode failed: " + parserErrorText(Spans, "?"));
+            const result = bufferBytes(Spans);
+            putBuffer(Module, result);
+            if (!Module._wmp_visual_append_js(result.length))
+                throw new Error("Visual append failed: " + parserErrorText(Module, "?"));
+        }
+        return keyStep(t, i === 0);
     });
-    Module._wmp_live_external_js(0);
-    if (!rebuilds)
-        throw new Error("Keyboard Worker smoke never rebuilt the keys");
+    if (!rebuilds || !forwarded)
+        throw new Error("Keyboard Worker smoke never rebuilt the keys or forwarded a piece");
     for (let i = 0; i < ticks.length; ++i) {
         if (!same(keysLive[i], mergeLive[i]))
             throw new Error("Keyboard Worker state differs from the merge path at tick " + ticks[i]);
     }
+    // A reset inside the held stream keeps it; the keyboard restarts where forwarding does.
+    const back = Math.floor(ticks.length / 2);
+    Module._wmp_reset_render_cursor_js(Math.max(0, ticks[back] - 200), 0);
+    if (Module._wmp_visual_kept_js() !== 1)
+        throw new Error("A reset inside the held visual stream did not keep it");
+    Keys._wmp_live_restart_at_js(Number(Module._wmp_live_forward_tick_js()), Number(Module._wmp_live_forward_base_js()));
+    for (let i = back; i < ticks.length; ++i) {
+        if (!same(keyStep(ticks[i], i === back), mergeLive[i]))
+            throw new Error("Keyboard Worker state after a kept reset differs at tick " + ticks[i]);
+    }
+    Module._wmp_live_external_js(0);
+
+    // Whole-song roll mode (HANDOFF sec. 89): the prefill decodes the song on this instance, the
+    // stream keeps every word and a reset anywhere reuses it.
+    const sweepAt = (stream, tick) => {
+        Module._wmp_visual_config_js(stream ? 1 : 0, 1);
+        Module._wmp_reset_render_cursor_js(tick, 0);
+        const kept = Module._wmp_visual_kept_js() === 1;
+        const appends = [], closes = [];
+        for (let guard = 0; guard < 100000; ++guard) {
+            if (!Module._wmp_build_render_sweep_js(maxTick, 2048))
+                throw new Error("Visual sweep failed: " + parserErrorText(Module, "?"));
+            const na = sizeNumber(Module._wmp_render_append_count_js());
+            const nc = sizeNumber(Module._wmp_render_close_count_js());
+            if (na) for (const w of new Uint32Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_render_append_ptr_js()), na * 3)) appends.push(w);
+            if (nc) for (const w of new Uint32Array(Module.HEAPU8.buffer, sizeNumber(Module._wmp_render_close_ptr_js()), nc * 2)) closes.push(w);
+            if (Module._wmp_render_batch_complete_js()) return { appends, closes, kept };
+        }
+        throw new Error("Visual sweep did not finish");
+    };
+    Module._wmp_live_restart_js(0);
+    Module._wmp_visual_keep_all_js(1);
+    Module._wmp_visual_plan_js(1e10);
+    Module._wmp_visual_config_js(1, 1);
+    Module._wmp_reset_render_cursor_js(0, 0);
+    if (Module._wmp_visual_kept_js())
+        throw new Error("A fresh visual stream was kept");
+    while (Module._wmp_visual_prefill_local_js(3000)) {}
+    if (!Module._wmp_visual_done_js() || !(Number(Module._wmp_visual_held_bytes_js()) > 0) ||
+        !(Number(Module._wmp_heap_used_js()) > 0))
+        throw new Error("The whole-song prefill did not reach the end: " + parserErrorText(Module, "?"));
+    const whole = sweepAt(true, 0), middle = Math.max(0, ticks[back] - 200);
+    const keptMiddle = sweepAt(true, middle), mergeMiddle = sweepAt(false, middle);
+    if (!whole.kept || !keptMiddle.kept)
+        throw new Error("Whole-song mode did not keep the stream on a reset");
+    if (!same(whole.appends, merge.appends) || !same(whole.closes, merge.closes) ||
+        !same(keptMiddle.appends, mergeMiddle.appends) || !same(keptMiddle.closes, mergeMiddle.closes))
+        throw new Error("The sweep after a kept reset differs from the merge sweep: " +
+            keptMiddle.appends.length / 3 + "/" + mergeMiddle.appends.length / 3 + " notes");
+    Module._wmp_visual_keep_all_js(0);
+    Module._wmp_visual_plan_js(32 * 1048576);
     Module._wmp_visual_config_js(1, 1);
     Module._wmp_set_raw_source_limit_js(512 * 1024 * 1024);
     // The checks after this one use the dense file.

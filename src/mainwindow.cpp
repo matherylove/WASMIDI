@@ -941,10 +941,22 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                     cleanup();
                 };
 
+            // Roll mode and look-ahead limit (HANDOFF sec. 89), as the controls saved them.
+            const rollSetting = (key, fallback) => {
+                try {
+                    const raw = localStorage.getItem('wasmidi.settings.v1.' + key);
+                    const value = Number(raw);
+                    return raw != null && Number.isFinite(value) ? value : fallback;
+                } catch (_) {
+                    return fallback;
+                }
+            };
             worker.postMessage({
                 type: 'parse',
                 file,
-                name: file.name || 'browser.mid'
+                name: file.name || 'browser.mid',
+                rollMode: rollSetting('rollMode', 1) === 2 ? 2 : 1,
+                lookAheadMB: rollSetting('rollLookAheadMB', 1024)
             });
         } catch (error) {
             failLoading(
@@ -1563,6 +1575,8 @@ MainWindow::MainWindow(QObject* parent)
     synthOverlapGain_ = wasmidi_setting_number(
         "synthStackGain", synthOverlapGain_ ? 1.0 : 0.0) != 0.0;
     synthGpu_ = wasmidi_setting_number("synthGpu", synthGpu_ ? 1.0 : 0.0) != 0.0;
+    rollMode_ = wasmidi_setting_number("rollMode", rollMode_) == 2.0 ? 2 : 1;
+    rollLookAheadMB_ = int(std::clamp(wasmidi_setting_number("rollLookAheadMB", rollLookAheadMB_), 64.0, 16384.0));
 
     for (int i = 0; i < channelColors_.size(); ++i) {
         const QByteArray key = QByteArray("channelColor.") + QByteArray::number(i);
@@ -2942,6 +2956,26 @@ void MainWindow::setSynthGpu(bool enabled)
 #ifdef __EMSCRIPTEN__
     wasmidi_snappy_set_gpu(synthGpu_ ? 1 : 0);
 #endif
+}
+
+void MainWindow::setRollMode(int mode)
+{
+    mode = mode == 2 ? 2 : 1;
+    if (rollMode_ == mode)
+        return;
+    rollMode_ = mode;
+    WASMIDI_PERSIST_SETTING("rollMode", rollMode_);
+    emit rollConfigChanged();
+}
+
+void MainWindow::setRollLookAheadMB(int megabytes)
+{
+    megabytes = std::clamp(megabytes, 64, 16384);
+    if (rollLookAheadMB_ == megabytes)
+        return;
+    rollLookAheadMB_ = megabytes;
+    WASMIDI_PERSIST_SETTING("rollLookAheadMB", rollLookAheadMB_);
+    emit rollConfigChanged();
 }
 
 void MainWindow::setSynthOverlapGain(bool enabled)

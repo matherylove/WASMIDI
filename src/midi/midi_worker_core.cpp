@@ -17,6 +17,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <malloc.h>
 #endif
 
 namespace {
@@ -1265,6 +1266,19 @@ int wmp_merge_finish_js()
 #endif
 }
 
+// Bytes the parser heap has in use (the roll modes' memory budget, HANDOFF sec. 89).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_heap_used_js()
+{
+#ifdef __EMSCRIPTEN__
+    return static_cast<double>(mallinfo().uordblks);
+#else
+    return 0.0;
+#endif
+}
+
 // CI probe for Memory64 heap growth, now that the BPFA store keeps the heap small
 // (HANDOFF sec. 49).
 #ifdef __EMSCRIPTEN__
@@ -1701,6 +1715,75 @@ void wmp_visual_plan_js(double planWords)
 #endif
 }
 
+// 1 when the last wmp_reset_render_cursor_js kept the stream (HANDOFF sec. 89).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_visual_kept_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return g_mappedStore.visualKeptOnReset() ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+// Full roll mode: the stream keeps every word.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_visual_keep_all_js(int keepAll)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.setVisualKeepAll(keepAll != 0);
+#else
+    (void)keepAll;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_visual_held_bytes_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.visualHeldBytes());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_visual_ahead_words_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.visualAheadWords());
+#else
+    return 0.0;
+#endif
+}
+
+// Prefill without helpers: 1 = one more span decoded here, 0 = done or the plan is full.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_visual_prefill_local_js(double sourceEvents)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        return g_mappedStore.decodeVisualAhead(static_cast<std::size_t>(std::clamp(sourceEvents, 1.0, 1.0e12))) ? 1 : 0;
+    } catch (...) {
+        g_error = "Could not decode the visual stream";
+        return 0;
+    }
+#else
+    (void)sourceEvents;
+    return 0;
+#endif
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif
@@ -2019,6 +2102,77 @@ void wmp_live_restart_js(double startTick)
     g_mappedStore.restartVisualStream(static_cast<uint32_t>(std::clamp(startTick, 0.0, 4294967295.0)));
 #else
     (void)startTick;
+#endif
+}
+
+// Keyboard Worker: restart at the coordinator's forwarding position (HANDOFF sec. 89).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_live_restart_at_js(double startTick, double base)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.restartVisualStream(static_cast<uint32_t>(std::clamp(startTick, 0.0, 4294967295.0)),
+                                      static_cast<uint64_t>(std::max(0.0, base)));
+#else
+    (void)startTick; (void)base;
+#endif
+}
+
+// Coordinator: an empty stream where forwarding starts, into the live buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_forward_begin_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return liveBufferCall("Could not start forwarding the visual stream",
+        [](std::vector<uint8_t>& out) { return g_mappedStore.beginLiveForward(out); });
+#else
+    return 0;
+#endif
+}
+
+// Coordinator: 1 = the next piece (or the head) is in the live buffer, 0 = nothing to send.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_live_forward_js(double windowWords)
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        return g_mappedStore.liveForward(static_cast<std::size_t>(std::clamp(windowWords, 1.0, 1.0e12)), g_liveBuffer) ? 1 : 0;
+    } catch (...) {
+        g_error = "Could not forward the visual stream";
+        return 0;
+    }
+#else
+    (void)windowWords;
+    return 0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_live_forward_tick_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.liveForwardTick());
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_live_forward_base_js()
+{
+#if WASMIDI_PARSER_BPFA
+    return static_cast<double>(g_mappedStore.liveForwardBase());
+#else
+    return 0.0;
 #endif
 }
 

@@ -191,7 +191,9 @@ runButton.addEventListener("click", () => {
       statusBox.textContent = "Preparando el roll…";
       worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
         endTick: Math.floor(tickAt(start)), urgentThrough: Math.floor(tickAt(start)), perTrack: false, reset: true });
-      helpersTimer = setTimeout(() => { helpersTimer = 0; play(); }, 8000);
+      // With a roll mode that prefills (HANDOFF sec. 89) the helpers started while loading.
+      if (helpers) play();
+      else helpersTimer = setTimeout(() => { helpersTimer = 0; play(); }, 8000);
     } else if (m.type === "helpers-ready") {
       helpers = m.helpers;
       if (helpersTimer) { clearTimeout(helpersTimer); helpersTimer = 0; play(); }

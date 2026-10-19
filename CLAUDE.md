@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§88). Este archivo resume el estado al cierre de la rev. 92 y dice
+`HANDOFF.md` (§1-§89). Este archivo resume el estado al cierre de la rev. 93 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 92)
+## Estado actual (rev. 93)
 
 Rendimiento medido por el usuario:
 
@@ -255,6 +255,17 @@ Rendimiento medido por el usuario:
   127-130 s (sin adelanto 61); teclado en 128 s 17 → 47/s. Revisión del código de BPFA (modo normal
   con tabla de notas de 8 B, modo look-ahead con tope de RAM y prellenado) en §88. El usuario pidió
   después dos modos separados como BPFA.
+- Rev. 93 (HANDOFF §89): dos modos del roll, fila "Roll cache" en WASMIDI (se aplica al próximo MIDI):
+  **Look-ahead** (por defecto, 1024 MB) prellena el flujo visual desde 0 s antes de abrir el MIDI y
+  después lo rellena; **Full song** decodifica la canción entera al cargar y no recorta nada (si no
+  entra en el heap ni en la mitad de `deviceMemory`, queda como look-ahead). Un salto dentro de lo
+  guardado conserva el flujo. El Worker del teclado recibe cada pedazo cuando está a menos de 32 M
+  palabras de él (antes, una copia de todo el plan). Tope del rellenado (un tramo por vez pasada la
+  mitad del plan) y el barrido cede con `MessageChannel` en vez de `setTimeout(0)` (Chromium lo
+  frenaba a ~250 pasadas/s). Chromium, The Nuker 3 0-140 s, 3 helpers: roll atrasado 15 (rev. 92)
+  → 0 cuadros, adelanto mínimo -0,17 → 1,78 s, teclado en 128 s 11 → 44/s; prellenado de 1024 MB
+  (hasta 278 s) en 17-20 s. The Nuker 3 entero: 4173 MiB en 95 s con 3 helpers (no entró en el tope
+  de 4 GiB del contenedor y quedó como look-ahead).
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -286,6 +297,11 @@ Mecanismos activos y cómo desactivarlos:
 | Flujo visual en pedazos, uno por tramo anexado (rev. 91) | sin interruptor |
 | Flujo visual codificado en corridas, leído por corridas (rev. 92) | sin interruptor |
 | Helpers decodifican el flujo visual por adelantado hasta el plan (rev. 92) | `?visualahead=0`; `?visualplan=M` (millones de palabras) |
+| Modo del roll: look-ahead con prellenado / canción entera (rev. 93) | botón "Roll cache" (Look-ahead / Full song) y MB; `?rollmode=1/2`, `?rollmode=0` = rev. 92 sin prellenado; `?lookahead=MB` |
+| Reset del roll dentro del flujo guardado lo conserva (rev. 93) | sin interruptor (`visualKeptOnReset`) |
+| Teclado recibe pedazos por demanda (rev. 93) | sin interruptor (`liveForward`) |
+| Tope del rellenado: un tramo por vez pasada la mitad del plan (rev. 93) | `?refillcap=0` |
+| Barrido del roll cede con `MessageChannel` (rev. 93) | `?sweepyield=0` |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Reparto Auto: Single hasta 4096 voces, Hash arriba (rev. 80) | botón Sharding → Channel/Hash/Single |
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
@@ -295,7 +311,7 @@ Mecanismos activos y cómo desactivarlos:
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
 
-## Pendientes abiertos (ver HANDOFF §67-§88)
+## Pendientes abiertos (ver HANDOFF §67-§89)
 
 1. **Meta del usuario: The Nuker 4 (y 3) en tiempo real de principio a fin a 1024
    voces por worker** en el Ryzen 9 5900X + RX 9070XT y el Ryzen 7 7435HS + RTX 2050,
@@ -307,8 +323,9 @@ Mecanismos activos y cómo desactivarlos:
    = 1024 × 24 workers) y el roll se atrasaba en 830-858 s con 8 helpers (arreglado en la
    rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
-   Falta: dos modos como BPFA, pedidos por el usuario (canción entera decodificada al cargar /
-   look-ahead con tope de RAM y prellenado); The Nuker 3 en WASMIDI con la rev. 92 y 12288 voces (`helpers N% busy` de
+   Rev. 93: modos look-ahead y canción entera (como BPFA).
+   Falta: los dos modos de la rev. 93 en las PCs (canción entera de The Nuker 3 con 32 GB);
+   el tiempo de carga (el usuario: sharkmidi abre mucho más rápido); The Nuker 3 en WASMIDI con 12288 voces (`helpers N% busy` de
    `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
    log de consola del cierre de WasmiSynth en pausa;
    la ráfaga de 830 s de The Nuker 3 (~121 M palabras/s: anexar + barrer no alcanzan, rev. 87);

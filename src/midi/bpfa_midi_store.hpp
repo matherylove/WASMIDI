@@ -147,15 +147,27 @@ public:
     // no new span (HANDOFF sec. 88).
     bool visualRoomAhead() const;
     void setVisualPlan(std::size_t planWords);
+    // Full mode (HANDOFF sec. 89): the stream keeps every word, behind the readers too.
+    void setVisualKeepAll(bool keepAll) { visualKeepAll_ = keepAll; }
+    uint64_t visualHeldWords() const { return visEnd_ - visBase_; }
+    uint64_t visualHeldBytes() const { return visHeldBytes_; }
+    // One span decoded on this thread past the head while the plan has room (the prefill
+    // without helpers); false when done or full.
+    bool decodeVisualAhead(std::size_t sourceEvents);
+    // Words held past the roll sweep (the look-ahead the plan bounds).
+    uint64_t visualAheadWords() const { return visEnd_ > renderPos_ ? visEnd_ - renderPos_ : 0; }
     // End tick of a span from startTick that holds about sourceEvents events (from the density).
     uint32_t visualSpanEnd(uint32_t startTick, uint64_t sourceEvents) const;
     bool decodeVisualLocal(uint32_t endTick);
     bool buildVisualRequest(uint32_t startTick, uint32_t endTick, std::vector<uint8_t>& request) const;
     bool decodeVisualRequest(const uint8_t* request, std::size_t size, std::vector<uint8_t>& result);
-    // Results must arrive in order: each one starts where the stream ends.
+    // Results must arrive in order: each one starts where the stream ends (on the keyboard
+    // Worker a later start is allowed: the pieces forwarded skip the spans with no words).
     bool appendVisualResult(const uint8_t* result, std::size_t size);
 
+    // A start inside the held stream keeps it (visualKeptOnReset, HANDOFF sec. 89).
     void resetRenderCursor(uint32_t startTick, bool perTrackColors);
+    bool visualKeptOnReset() const { return visualKept_; }
     bool buildRenderSweep(uint32_t endTick, std::size_t maxSourceEvents, std::vector<VisualNote>& appends,
                           std::vector<RenderClose>& closes, uint32_t& appendBase, bool& complete,
                           uint32_t& nextTick, bool& hasNextTick);
@@ -173,7 +185,15 @@ public:
     bool importLiveImage(const uint8_t* blob, std::size_t size);
     bool exportVisualStream(std::vector<uint8_t>& blob) const;
     bool importVisualStream(const uint8_t* blob, std::size_t size);
-    void restartVisualStream(uint32_t startTick);
+    void restartVisualStream(uint32_t startTick, uint64_t base = 0);
+    // The keyboard Worker gets the coordinator's pieces as it nears them (HANDOFF sec. 89):
+    // beginLiveForward exports an empty stream where forwarding starts, liveForward the next
+    // piece within windowWords of the keyboard (or behind the sweep), or the head past the
+    // last piece. liveForwardTick/Base: where a keyboard restart starts after a reset.
+    bool beginLiveForward(std::vector<uint8_t>& blob);
+    bool liveForward(std::size_t windowWords, std::vector<uint8_t>& blob);
+    uint32_t liveForwardTick() const { return liveFwdHead_; }
+    uint64_t liveForwardBase() const { return liveFwdPos_; }
     // density: also the density window decoded from the checkpoints (RebuildDensity).
     bool exportLiveRebuild(double tick, double npsStartTick, double ccStartTick, bool density,
                            std::vector<uint8_t>& blob);
@@ -514,7 +534,7 @@ private:
     struct VisualMark { uint64_t word; uint32_t byte, tick, track; };
     struct VisualPiece {
         uint64_t base = 0, words = 0;   // absolute index of its first word, word count
-        uint32_t startTick = 0, lastTick = 0;
+        uint32_t startTick = 0, lastTick = 0, endTick = 0;
         std::vector<uint8_t> bytes;
         std::vector<VisualMark> marks;
     };
@@ -540,6 +560,14 @@ private:
     inline uint32_t visualPeekTick(const VisualCursor& c) const;
     uint64_t visualLowerBound(uint32_t tick) const;
     void visualClearWords(uint64_t base);
+    void liveForwardFrom(uint64_t position, uint32_t tick);
+    bool visualKeepAll_ = false;
+    bool visualKept_ = false;
+    uint64_t liveFwdPos_ = 0;       // pieces before this word went to the keyboard Worker
+    uint64_t liveFwdStart_ = 0;     // where forwarding last started (window while no position)
+    uint32_t liveFwdHead_ = 0;      // the keyboard Worker's stream head
+    bool liveForwarding_ = false;   // visualTrim keeps the pieces not yet forwarded
+    uint64_t visHeldBytes_ = 0;
     uint32_t visStart_ = 0;         // the stream holds every event in [visStart_, visHead_)
     uint32_t visHead_ = 0;
     MergeCursor visCursor_;

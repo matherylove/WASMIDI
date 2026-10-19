@@ -5908,3 +5908,110 @@ canción después de la carga, guardado en el Worker del parser, y pasarle al te
 - Lo útil para WASMIDI: pagar la decodificación antes de reproducir. El flujo compacto es el
   equivalente de la tabla, 3,5× más chico (4,78 GB contra 16,6 GB para The Nuker 3), y lo arman
   varios helpers en vez de un hilo.
+
+## 89. Revisión 93 — Dos modos del roll como BPFA: look-ahead con tope de RAM y canción entera
+
+**Pedido:** después de la revisión del código de BPFA (§88) el usuario pidió "sacar lo mejor de cada
+uno en modos separados": un modo que decodifica toda la canción al cargar (como el modo normal de
+BPFA) y otro con tope de RAM y prellenado al cargar (como el look-ahead de BPFA).
+
+**Causa / diseño:** el modo normal de BPFA guarda una tabla de notas de 8 bytes por nota (16,6 GB
+para The Nuker 3, más que los 16 GiB del heap del parser); el flujo visual compacto de la rev. 92
+guarda la misma información en 1,47 bytes por palabra (4,78 GB para The Nuker 3 entero), así que el
+"modo normal" de WASMIDI es ese flujo decodificado entero y guardado. Hasta la rev. 92 el flujo se
+llenaba solo mientras sonaba (los helpers compiten con el feed del synth en las zonas densas), cada
+reset del roll lo tiraba y el Worker del teclado recibía una copia de cada pedazo apenas llegaba
+(con adelanto, el plan entero dos veces en memoria).
+
+**Cambios:**
+
+- `BpfaMidiStore::resetRenderCursor`: si el tick de inicio cae dentro del flujo guardado
+  (`visStart_ <= tick < visHead_`), el flujo se conserva: el barrido vuelve a empezar en
+  `visualLowerBound(tick)` con el estado de notas vacío (mismo resultado que un flujo nuevo desde
+  ese tick: los tramos no parten ticks y el plegado es por (pista, tick)). `visualKeptOnReset` /
+  `wmp_visual_kept_js` lo informa; en `requestSharpRenderer` un reset conservado no llama a
+  `visualRestart`, así que los tramos en vuelo siguen sirviendo.
+- `setVisualKeepAll` / `wmp_visual_keep_all_js`: en el modo canción entera `visualTrim` no recorta
+  nada (todo seek se conserva).
+- Envío por demanda al Worker del teclado: `beginLiveForward` (`wmp_live_forward_begin_js`) exporta
+  un flujo vacío donde empieza el envío y `liveForward` (`wmp_live_forward_js`) arma el próximo
+  pedazo como resultado `WVS2` cuando el teclado está a menos de 32 M palabras de él (o el pedazo
+  quedó más de 48 M palabras detrás del barrido), o la cabeza cuando ya no hay pedazos. El teclado
+  acepta resultados que empiezan más adelante que su cabeza (los tramos sin palabras no se envían).
+  En un reset el teclado reinicia en el pedazo del tick (`wmp_live_restart_at_js` con tick y base
+  de `wmp_live_forward_tick_js` / `wmp_live_forward_base_js`). El recorte del coordinador no tira
+  pedazos sin enviar. `VisualPiece` guarda `endTick`.
+- `midi-parser-worker.js`: modo del roll desde el mensaje `parse` (`rollMode`, `lookAheadMB`) o
+  `?rollmode=` (`1` look-ahead, `2` canción entera, `0` la rev. 92 sin prellenado) y
+  `?lookahead=MB`. Antes de empaquetar el resultado, `visualPrefill` arranca los helpers y llena el
+  plan desde el tick 0 (look-ahead: MB / 1,5 bytes por palabra; canción entera: todo, con
+  `keepAll`) mostrando "Prefilling the roll look-ahead N%" / "Decoding the whole roll N%". Sin
+  helpers (fuente cruda o pocos núcleos) decodifica en el Worker del parser
+  (`wmp_visual_prefill_local_js`). Tope de memoria: lo que queda del heap (14,5 GiB menos lo que el
+  heap tiene en uso, `wmp_heap_used_js` con `mallinfo`) y la mitad de `deviceMemory`; si la canción
+  entera no entra, lo decodificado pasa a ser el look-ahead (aviso en consola). Al terminar escribe
+  `[WASMIDI roll] … ready: N MiB, to S s, T s`. WASMIDI Audio y parser-bench no mandan modo: 0.
+- WASMIDI: fila "Roll cache" en los controles (botón Look-ahead / Full song y campo de MB), guardada
+  en `localStorage` (`rollMode`, `rollLookAheadMB`); se aplica al próximo MIDI. Por defecto
+  look-ahead con 1024 MB.
+- Tope del rellenado: con más de la mitad del plan ya decodificado por delante del barrido, los
+  helpers rellenan de a un tramo por vez (`?refillcap=0` lo apaga; no se aplica durante el
+  prellenado). Sin él, el look-ahead atrasaba el roll más que la rev. 92 en 128 s de The Nuker 3
+  (35 cuadros contra 15); la causa es inferida: el Worker del parser anexaba los tramos del
+  rellenado, más allá de 278 s, mientras barría la zona densa.
+- El barrido del roll (`drainSharpRenderer`) volvía al bucle de eventos con `setTimeout(0)`, que
+  Chromium frena a 4 ms después de unas pocas llamadas anidadas: como mucho ~250 pasadas por segundo
+  en un Worker que no hace otra cosa. Ahora cede con un mensaje a sí mismo (`MessageChannel`), sin
+  ese freno (`?sweepyield=0` vuelve a `setTimeout`). La pausa que deja lugar al synth no cambió.
+- `visual-bench.html` no espera 8 s a los helpers si ya arrancaron al cargar.
+- `browser_bench.py app`: los clics en "Load SF2" y en el campo de voces bajan 28 píxeles por la
+  fila nueva.
+
+**Medición:**
+
+Chromium del contenedor (4 hilos, sin GPU), visual-bench de The Nuker 3 desde 0 s
+(`browser_bench.py visual "The Nuker 3 Ultimate F4.mid" 0 140 "--query=helpers=3&visualdebug=1&rollmode=N"`):
+
+| | rev. 92 (`rollmode=0`) | look-ahead 1024 MB | + tope del rellenado | + barrido sin el freno de 4 ms |
+|---|---|---|---|---|
+| cuadros con el roll atrasado (0-140 s) | 15 | 35 | 0 | 0 |
+| adelanto mínimo del roll | -0,17 s | -0,37 s | 0,39 s | 1,78 s |
+| adelanto mínimo en 126-128 s | -0,17 s | -0,31 s | 0,39 s | 1,96 s |
+| teclado en 128 s (respuestas/s, latencia media) | 11/s, 86 ms | 13/s, 70 ms | 43/s, 14 ms | 44/s, 12,5 ms |
+
+La tercera columna es la cuarta con `?sweepyield=0`. El prellenado de 1024 MB llenó 975 MiB, hasta
+277,9 s de canción, en 17-20 s con 3 helpers. La carga total varió entre corridas por la caché de
+páginas del contenedor (188-330 s para el mismo archivo), así que no se compara.
+
+Canción entera (`rollmode=2`): `nuker4_553.mid` (5,9 s, el pico de The Nuker 4) 9 MiB en 0,9 s, roll
+atrasado 0; `nuker4_830.mid` (10 s, 10,8 M notas) 79 MiB en 5,1 s; `many30.mid` (120 s) 8 MiB en 0,4 s.
+WASMIDI con synth y un salto (`browser_bench.py app many30.mid MatheryLSD.sf2 30 --voices=1024
+--seek=12`): mismos cuadros y latencias con `rollmode=2` que con `rollmode=0` (2-3 cuadros/s, el
+SwiftShader del contenedor; el Worker del teclado responde en 0-1 ms), 0 underruns.
+
+The Nuker 3 con `rollmode=2` en el contenedor (`deviceMemory` 8, tope 4,0 GiB; visual-bench desde
+120 s): el prellenado llegó al final de la canción (867,1 s) con 4173 MiB en 95 s con 3 helpers y
+avisó que no entra en 4,0 GiB, así que lo decodificado quedó como look-ahead (§88 estimaba 4,78 GB
+para el flujo entero). Roll atrasado 45 cuadros solo en el primer segundo (el reset del teclado tardó
+0,9 s); después 0 cuadros con adelanto de 1,98 s y teclado a 53-61/s, también en 126-129 s.
+
+**Verificación:**
+
+- `tools/host_bench/visual_check.cpp`: el Worker del teclado ahora recibe los pedazos por
+  `liveForward` (keys, keyjump y ahead IDENTICAL) y una prueba nueva `kept` compara el barrido tras
+  un reset conservado hacia atrás y hacia adelante con un flujo nuevo y con el camino de mezcla:
+  `many9679.mid` 2-8 s y `nuker4_830.mid` 2-8 s (10,8 M notas) IDENTICAL.
+- `tools/midi_parser_bootstrap_smoke.cjs` (CI): el Worker del teclado por envío por demanda, un reset
+  conservado con reinicio del teclado, y el modo canción entera (prellenado local, reset al medio
+  contra la mezcla). Las comprobaciones que querían un flujo nuevo lo reinician antes.
+- `tools/feeder_check/check.sh`: todo IDENTICAL. `tools/local_build.sh` completo en verde; después
+  del tope del rellenado y del cambio del barrido, `node --check` y la prueba del contrato del parser.
+
+**No verificado:** en las PCs del usuario; la canción entera de The Nuker 3 guardada (unos 4,1 GiB en el
+Worker del parser: con `deviceMemory` 32 el tope es lo que queda del heap de 14,5 GiB; que la pestaña
+aguante esa memoria no está probado); el prellenado con 5-8 helpers; WASMIDI con synth en las zonas
+densas con GPU real (el contenedor dibuja con SwiftShader). El bucle del Worker del synth también
+vuelve con `setTimeout(pump, 0)` después de cada tramo de 12 ms. Probado con `MessageChannel` en una
+copia del sitio (`browser_bench.py audio nuker4_553.mid MatheryLSD.sf2 7`): a 2048 voces (carga
+~70%) 19 contra 28 underruns, todos en el primer segundo, y a 6144 voces (carga 204%) igual de
+saturado; no se distingue del ruido entre corridas, así que no se cambió.
