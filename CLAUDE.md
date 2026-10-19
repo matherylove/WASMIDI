@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§92). Este archivo resume el estado al cierre de la rev. 95 y dice
+`HANDOFF.md` (§1-§93). Este archivo resume el estado al cierre de la rev. 96 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 95)
+## Estado actual (rev. 96)
 
 Rendimiento medido por el usuario:
 
@@ -277,6 +277,11 @@ Rendimiento medido por el usuario:
   toda la página (`NeuralBackground`, C++) y el roll con fondo semitransparente; gráfico NPS/polifonía
   por cuadro (`LiveGraph`, C++); VT323 en los recursos. Faltan las partes 2-5 (notas y teclado, colores
   y avisos, cuadros sin tope, celular).
+- Rev. 96 (HANDOFF §93): GUI parte 2. Notas con degradado por fila, borde de 1 px (solo si la nota
+  mide ≥ 3 px) y damero de 2 px en la misma pasada; colores por vértice. Fondo del roll plano con líneas
+  de do; cursor de 2 px del acento con brillo. Teclado vertical de 62 px a la izquierda del roll, una fila
+  por tecla. Por software (peor caso): igual con muchas notas, 1,05-1,13× con notas largas superpuestas
+  (cuadro entero 0,83-1,07×). Faltan las partes 3-5.
 
 Mecanismos activos y cómo desactivarlos:
 

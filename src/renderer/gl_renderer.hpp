@@ -34,7 +34,6 @@ public:
                          uint8_t r,
                          uint8_t g,
                          uint8_t b);
-    void setNeuralVisual(float hue, float activity);
     void setBackgroundAlpha(float alpha);
 
     bool renderRoll();
@@ -61,7 +60,6 @@ private:
     bool createPrograms();
     void destroy();
 
-    void updateBackgroundHue();
     void renderBackground();
 
     void allocateRing(std::size_t capacity);
@@ -165,10 +163,8 @@ private:
     float postBuffer_ = 0.0f;
     bool perTrackColors_ = false;
 
-    float neuralHue_ = 230.0f;
-    float neuralTargetHue_ = 230.0f;
-    float neuralActivity_ = 0.0f;
     float backgroundAlpha_ = 1.0f;
+    std::array<float, 3> playheadColor_ = {0x6b / 255.0f, 0x55 / 255.0f, 0xd4 / 255.0f};
 
     const MidiDocument* document_ = nullptr;
 
@@ -194,13 +190,16 @@ private:
     GLint metricsUniform_ = -1;
     GLint glowUniform_ = -1;
     GLint transparencyUniform_ = -1;
+    GLint rollSizeUniform_ = -1;
 
     GLuint backgroundProgram_ = 0;
     GLuint backgroundVao_ = 0;
-    GLint backgroundHueUniform_ = -1;
-    GLint backgroundActivityUniform_ = -1;
-    GLint backgroundAspectUniform_ = -1;
+    GLint backgroundHeightUniform_ = -1;
     GLint backgroundAlphaUniform_ = -1;
+
+    GLuint playheadProgram_ = 0;
+    GLint playheadCenterUniform_ = -1;
+    GLint playheadColorUniform_ = -1;
 
     std::array<std::array<uint8_t, 4>, 16>
         channelColors_{};
@@ -311,9 +310,6 @@ private:
     std::vector<uint32_t> sharpRemotePendingCloseWords_;
     std::size_t sharpRemotePendingCloseOffset_ = 0;
 
-
-    std::chrono::steady_clock::time_point neuralClock_ =
-        std::chrono::steady_clock::now();
 };
 
 } // namespace wasmidi

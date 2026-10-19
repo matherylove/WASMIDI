@@ -349,17 +349,6 @@ constexpr std::size_t InitialRingCapacity =
     std::size_t(1) << 18;
 
 
-float wrapHue(float value)
-{
-    while (value < 0.0f)
-        value += 360.0f;
-
-    while (value >= 360.0f)
-        value -= 360.0f;
-
-    return value;
-}
-
 } // namespace
 
 GLRenderer::GLRenderer()
@@ -401,15 +390,22 @@ layout(location=1) in uint aEndTick;
 layout(location=2) in uint aPackedData;
 
 uniform vec3 uMetrics;
+uniform vec2 uRollSize;
 uniform int uViewStart;
 uniform int uViewEnd;
 uniform int uCurrentTick;
 uniform int uPerTrack;
 uniform sampler2D uPalette;
+uniform int uGlowEnabled;
+uniform int uTransparencyEnabled;
 
-flat out vec4 vColor;
-flat out int vIsActive;
-flat out float opacity;
+// Per note: its gradient stops and, interpolated, the distance in pixels to
+// each side and the position across the row.
+flat out vec4 vBase;
+flat out vec3 vLight;
+flat out vec3 vDark;
+out vec4 vDist;
+out float vT;
 
 void main() {
     int endTick = aEndTick > 0u ? int(aEndTick) : uViewEnd;
@@ -427,31 +423,56 @@ void main() {
         float(((aPackedData >> 8u) & 0xffu) + isTop) * uMetrics.z;
     float z = float(endTick - int(aStartTick)) / 16777216.0;
 
-    vColor = texelFetch(uPalette, ivec2(int(colorIndex), 0), 0);
-    vIsActive =
-        (uCurrentTick >= int(aStartTick) && uCurrentTick <= endTick) ? 1 : 0;
-    opacity = float((aPackedData & 0xffu) + 1u) / 128.0;
+    vec3 base = texelFetch(uPalette, ivec2(int(colorIndex), 0), 0).rgb;
+    bool sounding = uCurrentTick >= int(aStartTick) && uCurrentTick <= endTick;
+    if (uGlowEnabled == 1 && sounding)
+        base = min(base * 2.0 + vec3(0.1), vec3(1.0));
+    float opacity = uTransparencyEnabled == 1
+        ? float((aPackedData & 0xffu) + 1u) / 128.0
+        : 1.0;
+    vBase = vec4(base, opacity);
+    vLight = base + (1.0 - base) * 0.45;
+    vDark = base * 0.55;
+
+    // The 1 px edge only where the note has room for it: on a side too
+    // small, both distances stay at 2 px.
+    float widthPx = (endX - startX) * 0.5 * uRollSize.x;
+    float rowPx = uRollSize.y / 128.0;
+    float px = float(isEnd) * widthPx;
+    float py = float(isTop) * rowPx;
+    vDist = vec4(
+        widthPx >= 3.0 ? vec2(px, widthPx - px) : vec2(2.0),
+        rowPx >= 3.0 ? vec2(py, rowPx - py) : vec2(2.0));
+    vT = 1.0 - float(isTop);
     gl_Position = vec4(x, y, z, 1.0);
 }
 )GLSL";
 
+    // Gradient across the key row, 1 px darker edge, 2 px checker texture
+    // inside (HANDOFF sec. 93).
     static const char* noteFragment = R"GLSL(#version 300 es
-precision mediump float;
+precision highp float;
 
-flat in vec4 vColor;
-flat in int vIsActive;
-flat in float opacity;
-uniform int uGlowEnabled;
-uniform int uTransparencyEnabled;
+flat in vec4 vBase;
+flat in vec3 vLight;
+flat in vec3 vDark;
+in vec4 vDist;
+in float vT;
 out vec4 fragColor;
 
 void main() {
-    float noteOpacity = uTransparencyEnabled == 1 ? opacity : 1.0;
-    vec3 color = vColor.rgb;
-    color = (uGlowEnabled == 1 && vIsActive == 1)
-        ? min(color * 2.0 + vec3(0.1), vec3(1.0))
-        : color;
-    fragColor = vec4(color, noteOpacity);
+    vec3 color;
+    if (any(lessThan(vDist, vec4(1.0)))) {
+        color = vBase.rgb * 0.3;
+    } else {
+        color = vT < 0.45
+            ? mix(vLight, vBase.rgb, vT * (1.0 / 0.45))
+            : mix(vBase.rgb, vDark, (vT - 0.45) * (1.0 / 0.55));
+        ivec2 p = ivec2(gl_FragCoord.xy);
+        if (((p.x ^ p.y) & 1) == 1)
+            color += (1.0 - color) * 0.13;
+    }
+    fragColor = vec4(color, vBase.a);
 }
 )GLSL";
 
@@ -477,161 +498,40 @@ void main()
 )GLSL";
 
     static const char* backgroundFragment = R"GLSL(#version 300 es
-precision mediump float;
+precision highp float;
 
-in vec2 vUv;
-
-uniform float uHue;
-uniform float uActivity;
-uniform float uAspect;
+uniform float uHeight;
 uniform float uAlpha;
 
 out vec4 fragColor;
 
-vec3 hsl2rgb(float h, float s, float l)
+void main()
 {
-    h = fract(h);
-    s = clamp(s, 0.0, 1.0);
-    l = clamp(l, 0.0, 1.0);
-
-    float c =
-        (1.0 -
-         abs(2.0 * l - 1.0)) *
-        s;
-
-    float hp = h * 6.0;
-    float x =
-        c *
-        (1.0 -
-         abs(
-             mod(hp, 2.0) -
-             1.0));
-
-    vec3 rgb;
-
-    if (hp < 1.0)
-        rgb = vec3(c,x,0);
-    else if (hp < 2.0)
-        rgb = vec3(x,c,0);
-    else if (hp < 3.0)
-        rgb = vec3(0,c,x);
-    else if (hp < 4.0)
-        rgb = vec3(0,x,c);
-    else if (hp < 5.0)
-        rgb = vec3(x,0,c);
-    else
-        rgb = vec3(c,0,x);
-
-    float m = l - c * 0.5;
-    return rgb + vec3(m);
+    // Flat well with a line at every C, premultiplied so the page's neural
+    // background shows through (HANDOFF sec. 92-93).
+    float c = floor(gl_FragCoord.y * 128.0 / uHeight / 12.0 + 0.5) * 12.0;
+    bool line = c >= 12.0 && c <= 120.0 &&
+        floor(gl_FragCoord.y) == floor(c * uHeight / 128.0);
+    vec4 well = vec4(vec3(10.0, 9.0, 32.0) / 255.0 * uAlpha, uAlpha);
+    vec4 grid = vec4(vec3(46.0, 39.0, 104.0) / 255.0, 1.0) * 0.45;
+    fragColor = line ? grid + well * (1.0 - grid.a) : well;
 }
+)GLSL";
 
-float blob(vec2 uv, vec2 center, float radius)
-{
-    vec2 d = uv - center;
-    d.x *= uAspect;
+    // The playhead: a 2 px accent bar with a soft glow, blended premultiplied.
+    static const char* playheadFragment = R"GLSL(#version 300 es
+precision highp float;
 
-    float dist =
-        length(d);
+uniform float uCenter;
+uniform vec3 uColor;
 
-    return
-        max(
-            0.0,
-            1.0 -
-            dist /
-            radius);
-}
+out vec4 fragColor;
 
 void main()
 {
-    float hue =
-        fract(uHue / 360.0);
-
-    float activity =
-        clamp(
-            uActivity,
-            0.0,
-            1.0);
-
-    vec3 c1 =
-        hsl2rgb(
-            hue,
-            0.52,
-            0.03 +
-            activity * 0.04);
-
-    vec3 c2 =
-        hsl2rgb(
-            fract(
-                hue +
-                55.0 / 360.0),
-            0.48,
-            0.05 +
-            activity * 0.05);
-
-    float mixValue =
-        clamp(
-            (vUv.x +
-             (1.0 - vUv.y)) *
-            0.5,
-            0.0,
-            1.0);
-
-    vec3 color =
-        mix(
-            c1,
-            c2,
-            mixValue);
-
-    float b1 =
-        blob(
-            vUv,
-            vec2(.15,.80),
-            .30);
-
-    float b2 =
-        blob(
-            vUv,
-            vec2(.82,.25),
-            .28);
-
-    vec3 blob1 =
-        hsl2rgb(
-            hue,
-            .65,
-            .28 +
-            activity * .14);
-
-    vec3 blob2 =
-        hsl2rgb(
-            fract(
-                hue +
-                50.0 / 360.0),
-            .65,
-            .28 +
-            activity * .14);
-
-    color +=
-        blob1 *
-        b1 * b1 *
-        (.09 +
-         activity * .07);
-
-    color +=
-        blob2 *
-        b2 * b2 *
-        (.09 +
-         activity * .07);
-
-    // Premultiplied: the page's neural background shows through (HANDOFF sec. 92).
-    fragColor =
-        vec4(
-            clamp(
-                color,
-                0.0,
-                1.0) *
-            uAlpha,
-            uAlpha);
+    float d = max(0.0, abs(gl_FragCoord.x - uCenter) - 1.0);
+    float a = d <= 0.0 ? 1.0 : 0.55 * exp(-d * d / 50.0);
+    fragColor = vec4(uColor * a, a);
 }
 )GLSL";
 
@@ -645,6 +545,11 @@ void main()
         linkProgram(
             backgroundVertex,
             backgroundFragment);
+
+    playheadProgram_ =
+        linkProgram(
+            backgroundVertex,
+            playheadFragment);
 
     // The horizontal note program is the only mandatory pipeline.
     // Background effects are optional accelerations and must never make
@@ -674,6 +579,11 @@ void main()
 
     viewportWidthUniform_ = -1;
 
+    rollSizeUniform_ =
+        glGetUniformLocation(
+            noteProgram_,
+            "uRollSize");
+
     perTrackUniform_ =
         glGetUniformLocation(
             noteProgram_,
@@ -695,25 +605,27 @@ void main()
             "uTransparencyEnabled");
 
     if (backgroundProgram_) {
-        backgroundHueUniform_ =
+        backgroundHeightUniform_ =
             glGetUniformLocation(
                 backgroundProgram_,
-                "uHue");
-
-        backgroundActivityUniform_ =
-            glGetUniformLocation(
-                backgroundProgram_,
-                "uActivity");
-
-        backgroundAspectUniform_ =
-            glGetUniformLocation(
-                backgroundProgram_,
-                "uAspect");
+                "uHeight");
 
         backgroundAlphaUniform_ =
             glGetUniformLocation(
                 backgroundProgram_,
                 "uAlpha");
+    }
+
+    if (playheadProgram_) {
+        playheadCenterUniform_ =
+            glGetUniformLocation(
+                playheadProgram_,
+                "uCenter");
+
+        playheadColorUniform_ =
+            glGetUniformLocation(
+                playheadProgram_,
+                "uColor");
     }
 
     return true;
@@ -887,7 +799,8 @@ void GLRenderer::destroy()
 
     const GLuint programs[] = {
         noteProgram_,
-        backgroundProgram_
+        backgroundProgram_,
+        playheadProgram_
     };
 
     for (GLuint program : programs) {
@@ -915,6 +828,7 @@ void GLRenderer::destroy()
 
     noteProgram_ = 0;
     backgroundProgram_ = 0;
+    playheadProgram_ = 0;
 
     ring_.clear();
     carryNotes_.clear();
@@ -1050,50 +964,6 @@ void GLRenderer::setChannelColor(
     regenerateSharpPalette();
 }
 
-void GLRenderer::setNeuralVisual(float hue, float activity)
-{
-    neuralTargetHue_ = wrapHue(hue);
-    neuralActivity_ =
-        std::clamp(activity, 0.0f, 1.0f);
-}
-
-void GLRenderer::updateBackgroundHue()
-{
-    const auto now =
-        std::chrono::steady_clock::now();
-
-    float frameScale =
-        std::chrono::duration<float>(
-            now -
-            neuralClock_).count() *
-        60.0f;
-
-    neuralClock_ = now;
-
-    frameScale =
-        std::clamp(
-            frameScale,
-            0.0f,
-            3.0f);
-
-    float hueDiff =
-        neuralTargetHue_ -
-        neuralHue_;
-
-    if (hueDiff > 180.0f)
-        hueDiff -= 360.0f;
-
-    if (hueDiff < -180.0f)
-        hueDiff += 360.0f;
-
-    neuralHue_ =
-        wrapHue(
-            neuralHue_ +
-            hueDiff *
-            .02f *
-            frameScale);
-}
-
 void GLRenderer::setBackgroundAlpha(float alpha)
 {
     backgroundAlpha_ =
@@ -1102,8 +972,6 @@ void GLRenderer::setBackgroundAlpha(float alpha)
 
 void GLRenderer::renderBackground()
 {
-    updateBackgroundHue();
-
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -1113,17 +981,8 @@ void GLRenderer::renderBackground()
             backgroundProgram_);
 
         glUniform1f(
-            backgroundHueUniform_,
-            neuralHue_);
-
-        glUniform1f(
-            backgroundActivityUniform_,
-            neuralActivity_);
-
-        glUniform1f(
-            backgroundAspectUniform_,
-            float(width_) /
-            float(std::max(1, height_)));
+            backgroundHeightUniform_,
+            float(height_));
 
         glUniform1f(
             backgroundAlphaUniform_,
@@ -1143,9 +1002,9 @@ void GLRenderer::renderBackground()
         // Safe visual fallback: notes remain usable even if the optional
         // background shader is rejected by a WebGL implementation.
         glClearColor(
-            .010f * backgroundAlpha_,
-            .010f * backgroundAlpha_,
-            .026f * backgroundAlpha_,
+            10.0f / 255.0f * backgroundAlpha_,
+            9.0f / 255.0f * backgroundAlpha_,
+            32.0f / 255.0f * backgroundAlpha_,
             backgroundAlpha_);
 
         glClear(
@@ -2816,6 +2675,7 @@ void GLRenderer::drawSharpRing(
         2.0f / float(std::max<uint32_t>(1u, windowTicks)),
         -1.0f,
         2.0f / 128.0f);
+    glUniform2f(rollSizeUniform_, float(width_), float(height_));
     glUniform1i(viewStartUniform_, static_cast<GLint>(viewStart));
     glUniform1i(viewEndUniform_, static_cast<GLint>(viewEnd));
     glUniform1i(currentTickUniform_, static_cast<GLint>(currentTick));
@@ -2901,11 +2761,29 @@ void GLRenderer::drawSharpRing(
         0,
         std::max(0, width_ - 1));
 
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(lineX, 0, 1, height_);
-    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_SCISSOR_TEST);
+    if (playheadProgram_) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_SCISSOR_TEST);
+        const int glowLeft = std::max(0, lineX - 15);
+        glScissor(glowLeft, 0, std::min(width_, lineX + 17) - glowLeft, height_);
+        glUseProgram(playheadProgram_);
+        glUniform1f(playheadCenterUniform_, float(lineX) + 1.0f);
+        glUniform3f(playheadColorUniform_,
+            playheadColor_[0], playheadColor_[1], playheadColor_[2]);
+        glBindVertexArray(backgroundVao_);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);
+    } else {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(lineX, 0, std::min(2, width_ - lineX), height_);
+        glClearColor(playheadColor_[0], playheadColor_[1], playheadColor_[2], 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+    }
 }
 
 void GLRenderer::calculateView(
