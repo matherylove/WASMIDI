@@ -20,13 +20,14 @@ namespace {
 
 MainWindow* g_browserMainWindow = nullptr;
 
-float colorHue(const QColor& color)
-{
-    const qreal hue = color.hslHueF();
-    return hue < 0.0
-        ? 230.0f
-        : static_cast<float>(hue * 360.0);
-}
+const QColor DefaultAccent(0x6b, 0x55, 0xd4);
+
+const QColor DefaultChannelColors[16] = {
+    QColor("#818cf8"), QColor("#a78bfa"), QColor("#c4b5fd"), QColor("#fb923c"),
+    QColor("#4ade80"), QColor("#38bdf8"), QColor("#f472b6"), QColor("#facc15"),
+    QColor("#f87171"), QColor("#34d399"), QColor("#60a5fa"), QColor("#e879f9"),
+    QColor("#fb7185"), QColor("#a3e635"), QColor("#22d3ee"), QColor("#fbbf24")
+};
 
 } // namespace
 
@@ -56,6 +57,13 @@ void wasmidi_browser_file_selected(
         data,
         static_cast<std::size_t>(dataSize),
         name);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_browser_colors_imported(const uint32_t* rgb, int count)
+{
+    if (g_browserMainWindow && rgb && count > 0)
+        g_browserMainWindow->applyImportedColors(rgb, count);
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE
@@ -1463,6 +1471,61 @@ EM_JS(void, wasmidi_browser_toggle_full_screen, (), {
     }
 });
 
+// Reads the 16 note colors of a config.xml (Visual/Colors/Color R G B), as
+// the BPFA-style players write it.
+EM_JS(void, wasmidi_browser_import_color_config, (), {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.xml,text/xml,application/xml';
+    input.style.position = 'fixed';
+    input.style.left = '-10000px';
+    document.body.appendChild(input);
+    input.onchange = async () => {
+        const file = input.files && input.files.length ? input.files[0] : null;
+        input.remove();
+        if (!file)
+            return;
+        try {
+            const doc = new DOMParser().parseFromString(await file.text(), 'application/xml');
+            const colors = [];
+            const root = doc.documentElement;
+            const visual = root ? Array.from(root.children).find((e) => e.tagName === 'Visual') : null;
+            const list = visual ? Array.from(visual.children).find((e) => e.tagName === 'Colors') : null;
+            for (const c of list ? Array.from(list.children) : []) {
+                if (c.tagName !== 'Color' || colors.length >= 16)
+                    continue;
+                const v = (n) => Math.max(0, Math.min(255, parseInt(c.getAttribute(n), 10) || 0));
+                colors.push((v('R') << 16) | (v('G') << 8) | v('B'));
+            }
+            if (!colors.length) {
+                console.warn('[WASMIDI] config.xml: no Visual/Colors/Color entries in', file.name);
+                return;
+            }
+            const ptr = _malloc(colors.length * 4);
+            HEAPU32.set(colors, ptr >>> 2);
+            try {
+                _wasmidi_browser_colors_imported(ptr, colors.length);
+            } finally {
+                _free(ptr);
+            }
+        } catch (e) {
+            console.warn('[WASMIDI] config.xml:', e);
+        }
+    };
+    input.click();
+});
+
+EM_JS(void, wasmidi_browser_download_text, (const char* name, const char* data, int size), {
+    const blob = new Blob([HEAPU8.slice(data, data + size)], { type: 'application/xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = UTF8ToString(name);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+
 EM_JS(void, wasmidi_snappy_set_gpu, (int enabled), {
     const b = globalThis.WasmidiSnappyBridge;
     if (b && b.setGpu)
@@ -1533,16 +1596,9 @@ MainWindow::MainWindow(QObject* parent)
 {
     g_browserMainWindow = this;
 
-    static const QColor defaults[16] = {
-        QColor("#818cf8"), QColor("#a78bfa"), QColor("#c4b5fd"), QColor("#fb923c"),
-        QColor("#4ade80"), QColor("#38bdf8"), QColor("#f472b6"), QColor("#facc15"),
-        QColor("#f87171"), QColor("#34d399"), QColor("#60a5fa"), QColor("#e879f9"),
-        QColor("#fb7185"), QColor("#a3e635"), QColor("#22d3ee"), QColor("#fbbf24")
-    };
-
     channelColors_.reserve(16);
 
-    for (const auto& color : defaults)
+    for (const auto& color : DefaultChannelColors)
         channelColors_.push_back(color);
 
 #ifdef __EMSCRIPTEN__
@@ -1558,6 +1614,8 @@ MainWindow::MainWindow(QObject* parent)
         "postBufferAuto", postBufferAuto_ ? 1.0 : 0.0) != 0.0;
     perTrackColors_ = wasmidi_setting_number(
         "perTrackColors", perTrackColors_ ? 1.0 : 0.0) != 0.0;
+    adaptColors_ = wasmidi_setting_number(
+        "adaptColors", adaptColors_ ? 1.0 : 0.0) != 0.0;
     volume_ = std::clamp<int>(
         static_cast<int>(std::lround(wasmidi_setting_number("volume", volume_))),
         0, 100);
@@ -2127,6 +2185,7 @@ void MainWindow::applyRemoteLiveSnapshot(double targetTick)
     }
 
     visualTick_ = snapshot.tick;
+    ++keyboardFrames_;
     visualStateValid_ = true;
 
     if (oldMask != visualPitchMask_ || oldColors != visualPitchColor_)
@@ -2153,6 +2212,7 @@ void MainWindow::applyRemoteLiveSnapshot(double targetTick)
     }
     if (snapshot.activeVoices > peakPolyphony_) {
         peakPolyphony_ = snapshot.activeVoices;
+        peakPolyphonyTime_ = static_cast<float>(document_.tickToSeconds(snapshot.tick));
         emit peakPolyphonyChanged();
         peakChanged = true;
     }
@@ -2208,6 +2268,7 @@ void MainWindow::clearFile()
     peakNps_ = 0;
     peakNpsTime_ = 0.0f;
     peakPolyphony_ = 0;
+    peakPolyphonyTime_ = 0.0f;
     pitchRange_ = QStringLiteral("—");
     synthEffectiveVelocityFloor_ = synthVelocityFloor_;
     skippedVelocity_ = synthEffectiveVelocityFloor_;
@@ -2219,8 +2280,7 @@ void MainWindow::clearFile()
     clearVisualState();
     invalidateLiveTrackers();
 
-    dominantHue_ = 230.0f;
-    neuralActivity_ = 0.0f;
+    dominantColor_ = -1;
 
     ++documentRevision_;
 
@@ -2243,7 +2303,7 @@ void MainWindow::clearFile()
     emit skippedVelocityChanged();
     emit timelineChanged();
     emit activePitchesChanged();
-    emit neuralVisualChanged();
+    emit accentColorChanged();
     emit documentRevisionChanged();
 }
 
@@ -2330,6 +2390,7 @@ void MainWindow::rebuildDerivedStats()
     peakNps_ = 0;
     peakNpsTime_ = 0.0f;
     peakPolyphony_ = 0;
+    peakPolyphonyTime_ = 0.0f;
 
     if (document_.tempoMap.empty()) {
         tempoTimes_.push_back(0.0f);
@@ -3079,7 +3140,9 @@ void MainWindow::setChannelColor(
     channelColors_[channel] = color;
 
     emit channelColorsChanged();
-    updateNeuralVisuals();
+    if (channel == dominantColor_ && adaptColors_)
+        emit accentColorChanged();
+    updateDominantColor();
     const QByteArray settingKey = QByteArray("channelColor.") + QByteArray::number(channel);
     WASMIDI_PERSIST_SETTING(settingKey.constData(), color.rgb() & 0x00ffffffu);
 }
@@ -3265,6 +3328,7 @@ bool MainWindow::restoreVisualStateFromPage(double targetTick)
     visualKeyOwnerCursor_ = std::min<std::size_t>(
         best->ownerCursor, document_.visualKeyOwners.size());
     visualTick_ = double(bestTick);
+    ++keyboardFrames_;
     visualStateValid_ = true;
 
     advanceVisualStateTo(targetTick);
@@ -3300,6 +3364,7 @@ void MainWindow::advanceVisualStateTo(double targetTick)
     }
 
     visualTick_ = targetTick;
+    ++keyboardFrames_;
 }
 
 void MainWindow::rebuildVisualStateAt(double targetTick)
@@ -3369,6 +3434,7 @@ void MainWindow::rebuildVisualStateAt(double targetTick)
         ownerIt - document_.visualKeyOwners.begin());
 
     visualTick_ = targetTick;
+    ++keyboardFrames_;
     visualStateValid_ = true;
 }
 
@@ -3431,9 +3497,9 @@ void MainWindow::syncVisualState(double targetTick, bool forceRebuild)
         emit activePitchesChanged();
 }
 
-void MainWindow::updateNeuralVisuals()
+void MainWindow::updateDominantColor()
 {
-    float newHue = dominantHue_;
+    int newColor = dominantColor_;
 
     if (!document_.visualNotes.empty()) {
         const double futureSeconds =
@@ -3493,21 +3559,85 @@ void MainWindow::updateNeuralVisuals()
         }
 
         if (bestColor >= 0 && bestColor < channelColors_.size())
-            newHue = colorHue(channelColors_[bestColor]);
+            newColor = bestColor;
     }
 
-    const float activity =
-        peakNps_ > 0
-            ? std::min(1.0f, float(nps_) / float(peakNps_))
-            : 0.0f;
-    const float newActivity = activity * 0.7f + neuralActivity_ * 0.3f;
-
-    if (!qFuzzyCompare(newHue, dominantHue_) ||
-        !qFuzzyCompare(newActivity, neuralActivity_)) {
-        dominantHue_ = newHue;
-        neuralActivity_ = newActivity;
-        emit neuralVisualChanged();
+    if (newColor != dominantColor_) {
+        dominantColor_ = newColor;
+        if (adaptColors_)
+            emit accentColorChanged();
     }
+}
+
+QColor MainWindow::accentColor() const
+{
+    return adaptColors_ && dominantColor_ >= 0 && dominantColor_ < channelColors_.size()
+        ? channelColors_[dominantColor_]
+        : DefaultAccent;
+}
+
+void MainWindow::setAdaptColors(bool enable)
+{
+    if (adaptColors_ == enable)
+        return;
+    adaptColors_ = enable;
+    WASMIDI_PERSIST_SETTING("adaptColors", adaptColors_ ? 1 : 0);
+    emit accentColorChanged();
+}
+
+void MainWindow::setChannelColors(const QVariantList& colors)
+{
+    for (int i = 0; i < colors.size() && i < channelColors_.size(); ++i)
+        setChannelColor(i, colors[i].value<QColor>());
+}
+
+void MainWindow::resetChannelColors()
+{
+    for (int i = 0; i < channelColors_.size(); ++i)
+        setChannelColor(i, DefaultChannelColors[i]);
+}
+
+void MainWindow::applyImportedColors(const uint32_t* rgb, int count)
+{
+    for (int i = 0; i < count && i < channelColors_.size(); ++i)
+        setChannelColor(i, QColor::fromRgb(static_cast<QRgb>(rgb[i] & 0x00ffffffu)));
+}
+
+void MainWindow::importColorConfig()
+{
+#ifdef __EMSCRIPTEN__
+    wasmidi_browser_import_color_config();
+#endif
+}
+
+void MainWindow::exportColorConfig()
+{
+    // The same layout as the config.xml it imports; programs that read that
+    // file take its Visual/Colors list and ignore the root's name.
+    QString xml = QStringLiteral(
+        "<?xml version=\"1.0\" ?>\n<WebAssemblyMIDIPlayer>\n    <Visual>\n        <Colors>\n");
+    for (const auto& color : channelColors_)
+        xml += QStringLiteral("            <Color R=\"%1\" G=\"%2\" B=\"%3\" />\n")
+                   .arg(color.red()).arg(color.green()).arg(color.blue());
+    xml += QStringLiteral("        </Colors>\n    </Visual>\n</WebAssemblyMIDIPlayer>\n");
+#ifdef __EMSCRIPTEN__
+    const QByteArray bytes = xml.toUtf8();
+    wasmidi_browser_download_text("config.xml", bytes.constData(), bytes.size());
+#else
+    Q_UNUSED(xml);
+#endif
+}
+
+QVariantMap MainWindow::takeKeyboardSample()
+{
+    const double lag = hasMidi() && visualStateValid_
+        ? std::max(0.0, double(currentTime_) - document_.tickToSeconds(visualTick_))
+        : 0.0;
+    QVariantMap sample;
+    sample.insert(QStringLiteral("frames"), keyboardFrames_);
+    sample.insert(QStringLiteral("lag"), lag);
+    keyboardFrames_ = 0;
+    return sample;
 }
 
 void MainWindow::updateLiveStats()
@@ -3549,7 +3679,7 @@ void MainWindow::updateLiveStats()
             newBpm = tempoBpms_[index];
         }
         if (!qFuzzyCompare(bpm_, newBpm)) { bpm_ = newBpm; emit bpmChanged(); }
-        updateNeuralVisuals();
+        updateDominantColor();
         return;
     }
 
@@ -3733,6 +3863,7 @@ void MainWindow::updateLiveStats()
     }
     if (newActive > peakPolyphony_) {
         peakPolyphony_ = newActive;
+        peakPolyphonyTime_ = currentTime_;
         emit peakPolyphonyChanged();
         peakChanged = true;
     }
@@ -3746,7 +3877,7 @@ void MainWindow::updateLiveStats()
         emit bpmChanged();
     }
 
-    updateNeuralVisuals();
+    updateDominantColor();
 }
 
 void MainWindow::updateCurrentTime()

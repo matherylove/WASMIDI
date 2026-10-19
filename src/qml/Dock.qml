@@ -11,6 +11,8 @@ Item {
     signal advancedRequested()
     signal colorsRequested()
 
+    function takeGraphFrames() { return graph.takeFrames() }
+
     component Label: Text {
         color: Dk.dim
         font.family: Dk.ui
@@ -156,11 +158,11 @@ Item {
                     readonly property real swatch: (parent.width - 4 - 15 * spacing) / 16
                     Repeater {
                         model: 16
-                        Rectangle {
+                        NoteSwatch {
                             required property int index
                             width: parent.swatch
                             height: 16
-                            color: dock.mw.channelColorList[index]
+                            noteColor: dock.mw.channelColorList[index]
                         }
                     }
                 }

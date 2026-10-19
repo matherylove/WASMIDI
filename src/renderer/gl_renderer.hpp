@@ -35,6 +35,7 @@ public:
                          uint8_t g,
                          uint8_t b);
     void setBackgroundAlpha(float alpha);
+    void setPlayheadColor(float r, float g, float b);
 
     bool renderRoll();
 

@@ -45,6 +45,8 @@ public:
     void setGridColor(const QColor& value);
 
     Q_INVOKABLE void clear();
+    // Samples drawn since the last call (the graph's own frame count).
+    Q_INVOKABLE int takeFrames();
 
 signals:
     void valuesChanged();
@@ -64,6 +66,7 @@ private:
     void sample();
 
     std::deque<Sample> samples_;
+    int frames_ = 0;
     double time_ = 0.0;
     double nps_ = 0.0;
     double polyphony_ = 0.0;

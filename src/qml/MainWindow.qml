@@ -16,7 +16,10 @@ ApplicationWindow {
         ? "WebAssembly MIDI Player — " + mainWindow.fileName
         : "WebAssembly MIDI Player"
 
-    property int colorIndex: 0
+    // The accent follows the notes' dominant color, gently.
+    property color uiAccent: mainWindow.accentColor
+    Behavior on uiAccent { ColorAnimation { duration: 600 } }
+    Binding { target: Dk; property: "accent"; value: window.uiAccent }
 
     PlayerController {
         id: mainWindow
@@ -29,17 +32,6 @@ ApplicationWindow {
     MessageDialog {
         id: errorDialog
         title: "WebAssembly MIDI Player"
-    }
-
-    ColorDialog {
-        id: colorDialog
-        title: "Color " + (window.colorIndex + 1)
-        // Every preview change goes straight to both GPU renderers.
-        onSelectedColorChanged: {
-            if (visible)
-                mainWindow.setChannelColor(window.colorIndex, selectedColor)
-        }
-        onAccepted: mainWindow.setChannelColor(window.colorIndex, selectedColor)
     }
 
     NeuralBackground {
@@ -185,7 +177,7 @@ ApplicationWindow {
                                     Layout.preferredWidth: 1
                                     label: "NPS"
                                     value: Dk.integer(mainWindow.nps)
-                                    valueColor: Qt.lighter(Dk.accent, 1.6)
+                                    valueColor: Dk.mix(Dk.accent, 0.25)
                                 }
                                 DkReadout {
                                     Layout.fillWidth: true
@@ -321,6 +313,7 @@ ApplicationWindow {
                 }
 
                 Dock {
+                    id: dock
                     Layout.preferredWidth: 304
                     Layout.fillHeight: true
                     mainWindow: mainWindow
@@ -366,63 +359,20 @@ ApplicationWindow {
         mainWindow: mainWindow
     }
 
-    DkDialog {
+    ColorsDialog {
         id: colorsDialog
-        title: "Colors"
-        width: 360
+        mainWindow: mainWindow
+    }
 
-        ColumnLayout {
-            width: colorsDialog.availableWidth - 8
-            spacing: 8
-            Text {
-                Layout.fillWidth: true
-                text: mainWindow.perTrackColors
-                    ? "Tracks take these colors in order and loop back to color 1 after 16."
-                    : "One color per MIDI channel."
-                color: Dk.dim
-                font.family: Dk.ui
-                font.pixelSize: 12
-                wrapMode: Text.Wrap
-            }
-            GridLayout {
-                Layout.fillWidth: true
-                columns: 8
-                columnSpacing: 3
-                rowSpacing: 3
-                Repeater {
-                    model: 16
-                    Rectangle {
-                        required property int index
-                        Layout.fillWidth: true
-                        implicitHeight: 30
-                        color: mainWindow.channelColorList[index]
-                        DkBevel { anchors.fill: parent; kind: 1 }
-                        Text {
-                            anchors.centerIn: parent
-                            text: index + 1
-                            color: "#000000"
-                            opacity: 0.6
-                            font.family: Dk.term
-                            font.pixelSize: 16
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                window.colorIndex = parent.index
-                                colorDialog.selectedColor = mainWindow.channelColorList[parent.index]
-                                colorDialog.open()
-                            }
-                        }
-                    }
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Item { Layout.fillWidth: true }
-                DkButton { text: "Close"; implicitWidth: 75; onClicked: colorsDialog.close() }
-            }
-        }
+    Toasts {
+        anchors.top: parent.top
+        anchors.topMargin: 30
+        anchors.right: parent.right
+        anchors.rightMargin: 10
+        z: 50
+        mainWindow: mainWindow
+        roll: roll
+        dock: dock
     }
 
     // MIDI loading window.

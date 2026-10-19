@@ -5,13 +5,14 @@ import QtQuick.Layouts
 Rectangle {
     id: caption
     property string title: ""
+    property color startColor: Dk.captionA
     property color endColor: Dk.accent
     default property alias buttons: buttonRow.data
     property alias iconRects: icon.rects
     implicitHeight: 20
     gradient: Gradient {
         orientation: Gradient.Horizontal
-        GradientStop { position: 0.0; color: Dk.captionA }
+        GradientStop { position: 0.0; color: caption.startColor }
         GradientStop { position: 1.0; color: caption.endColor }
     }
 

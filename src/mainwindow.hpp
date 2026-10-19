@@ -46,6 +46,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(int peakNps READ peakNps NOTIFY peakNpsChanged)
     Q_PROPERTY(float peakNpsTime READ peakNpsTime NOTIFY timelineChanged)
     Q_PROPERTY(int peakPolyphony READ peakPolyphony NOTIFY peakPolyphonyChanged)
+    Q_PROPERTY(float peakPolyphonyTime READ peakPolyphonyTime NOTIFY timelineChanged)
     Q_PROPERTY(QString pitchRange READ pitchRange NOTIFY pitchRangeChanged)
     Q_PROPERTY(int skippedVelocity READ skippedVelocity NOTIFY skippedVelocityChanged)
     Q_PROPERTY(QVariantList npsTimeline READ npsTimeline NOTIFY timelineChanged)
@@ -114,8 +115,9 @@ class MainWindow : public QObject {
     Q_PROPERTY(float neuralPage READ neuralPage WRITE setNeuralPage NOTIFY neuralBackgroundChanged)
 
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
-    Q_PROPERTY(float dominantHue READ dominantHue NOTIFY neuralVisualChanged)
-    Q_PROPERTY(float neuralActivity READ neuralActivity NOTIFY neuralVisualChanged)
+    // The color of the notes playing most, or the dekx violet when adapting is off.
+    Q_PROPERTY(QColor accentColor READ accentColor NOTIFY accentColorChanged)
+    Q_PROPERTY(bool adaptColors READ adaptColors WRITE setAdaptColors NOTIFY accentColorChanged)
 
 public:
     explicit MainWindow(QObject* parent = nullptr);
@@ -145,6 +147,7 @@ public:
     int peakNps() const { return peakNps_; }
     float peakNpsTime() const { return peakNpsTime_; }
     int peakPolyphony() const { return peakPolyphony_; }
+    float peakPolyphonyTime() const { return peakPolyphonyTime_; }
     QString pitchRange() const { return pitchRange_; }
     int skippedVelocity() const { return skippedVelocity_; }
     QVariantList npsTimeline() const { return npsTimeline_; }
@@ -213,8 +216,8 @@ public:
     int rollLookAheadMB() const { return rollLookAheadMB_; }
 
     QVariantList channelColorList() const;
-    float dominantHue() const { return dominantHue_; }
-    float neuralActivity() const { return neuralActivity_; }
+    QColor accentColor() const;
+    bool adaptColors() const { return adaptColors_; }
 
     const wasmidi::MidiDocument& document() const { return document_; }
     const QVector<QColor>& channelColors() const { return channelColors_; }
@@ -257,10 +260,19 @@ public:
     Q_INVOKABLE void seek(float seconds);
     Q_INVOKABLE void setPostBufferAuto();
     Q_INVOKABLE void setChannelColor(int channel, const QColor& color);
+    Q_INVOKABLE void setChannelColors(const QVariantList& colors);
+    Q_INVOKABLE void resetChannelColors();
+    Q_INVOKABLE void importColorConfig();
+    Q_INVOKABLE void exportColorConfig();
+    // Keyboard frames since the last call and how far its keys trail the
+    // playhead, in seconds; read once per second by the lag warning.
+    Q_INVOKABLE QVariantMap takeKeyboardSample();
+    void applyImportedColors(const uint32_t* rgb, int count);
 
     void setNoteSpeed(float speed);
     void setPostBuffer(float buffer);
     void setPerTrackColors(bool enable);
+    void setAdaptColors(bool enable);
     void setVolume(int value);
     void setSynthMaxVoices(int value);
     void setSynthMinVoices(int value);
@@ -320,7 +332,7 @@ signals:
     void neuralBackgroundChanged();
     void channelColorsChanged();
     void activePitchesChanged();
-    void neuralVisualChanged();
+    void accentColorChanged();
     void fileLoaded();
     void loadFailed(QString message);
 
@@ -329,7 +341,7 @@ private:
     void rebuildDerivedStats();
     void updateLiveStats();
     void updateCurrentTime();
-    void updateNeuralVisuals();
+    void updateDominantColor();
     void dispatchScheduler();
     void publishDocumentMetadata();
     bool adoptParsedDocument(wasmidi::MidiDocument&& parsed, const QString& fileName);
@@ -559,13 +571,15 @@ private:
     std::vector<uint32_t> synthMessages_;
     std::vector<double> synthTimes_;
 
-    // Incremental +150 ms neural-color lookahead. This replaces rescanning
+    // Incremental +150 ms note-color lookahead. This replaces rescanning
     // the same dense future event window on every UI frame.
     bool neuralWindowValid_ = false;
     std::size_t neuralFutureLo_ = 0;
     std::size_t neuralFutureHi_ = 0;
     std::array<uint64_t, 16> neuralFutureColors_{};
 
-    float dominantHue_ = 230.0f;
-    float neuralActivity_ = 0.0f;
+    int dominantColor_ = -1;
+    bool adaptColors_ = true;
+    float peakPolyphonyTime_ = 0.0f;
+    int keyboardFrames_ = 0;
 };
