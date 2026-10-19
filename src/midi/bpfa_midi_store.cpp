@@ -2006,11 +2006,12 @@ std::size_t BpfaMidiStore::visualPieceAt(uint64_t position) const
     return it == visPieces_.begin() ? 0 : std::size_t(it - visPieces_.begin()) - 1u;
 }
 
-// Calls fn(tick, packed, track) for the words from c.pos (placed by visualSeek) up to the first
-// one past through, at most maxWords of them; returns how many. Ticks only change at 0xf1 headers,
-// so the tick test runs once per group and the data 1 bytes of a run go straight to fn.
+// Calls fn(tick, message, track, keys, n) for the runs (or parts of runs) from c.pos (placed by
+// visualSeek) up to the first word past through, at most maxWords words; returns how many. Each of
+// the n bytes at keys is a word's data 1 (bit 7 marks a run's last word). Ticks only change at 0xf1
+// headers, so the tick test runs once per group.
 template <typename Fn>
-std::size_t BpfaMidiStore::visualScan(VisualCursor& c, std::size_t maxWords, uint32_t through, Fn&& fn) const
+std::size_t BpfaMidiStore::visualScanRuns(VisualCursor& c, std::size_t maxWords, uint32_t through, Fn&& fn) const
 {
     std::size_t done = 0;
     if (c.pos >= visEnd_ || visualPeekTick(c) > through) return 0;
@@ -2058,16 +2059,14 @@ std::size_t BpfaMidiStore::visualScan(VisualCursor& c, std::size_t maxWords, uin
                 if (data2 & 0x80u) message |= uint32_t(bytes[at++]) << 24;
                 inRun = true;
             }
-            for (;;) {
-                const uint8_t data1 = bytes[at++];
-                fn(tick, message | (uint32_t(data1 & 0x7fu) << 8), track);
-                ++done;
-                if (data1 & 0x80u) {
-                    inRun = false;
-                    break;
-                }
-                if (done >= maxWords) break;
-            }
+            const std::size_t room = maxWords - done;
+            uint32_t n = 0;
+            bool last;
+            do last = (bytes[at + n++] & 0x80u) != 0; while (!last && n < room);
+            fn(tick, message, track, bytes + at, n);
+            at += n;
+            done += n;
+            inRun = !last;
         }
         c.byte = at;
         c.tick = tick;
@@ -2078,6 +2077,15 @@ std::size_t BpfaMidiStore::visualScan(VisualCursor& c, std::size_t maxWords, uin
         if (stop) break;
     }
     return done;
+}
+
+// visualScanRuns one word at a time: fn(tick, packed, track).
+template <typename Fn>
+std::size_t BpfaMidiStore::visualScan(VisualCursor& c, std::size_t maxWords, uint32_t through, Fn&& fn) const
+{
+    return visualScanRuns(c, maxWords, through, [&](uint32_t tick, uint32_t message, uint32_t track, const uint8_t* keys, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i) fn(tick, message | (uint32_t(keys[i] & 0x7fu) << 8), track);
+    });
 }
 
 // Tick of the word at c.pos without reading it (c.pos < visEnd_).
@@ -2323,50 +2331,54 @@ constexpr uint32_t VisualRequestMagic = 0x31525657u;  // "WVR1"
 constexpr uint32_t VisualResultMagic = 0x32535657u;   // "WVS2"
 } // namespace
 
-void BpfaMidiStore::renderStep(uint32_t tick, uint32_t message, uint16_t track, uint32_t count,
-                               std::vector<VisualNote>& appends, std::vector<RenderClose>& closes)
+// One run of the stream: the same status, data 2 and copies (message) for each key byte.
+void BpfaMidiStore::renderRun(uint32_t tick, uint32_t message, uint16_t track, const uint8_t* keys, uint32_t words,
+                              std::vector<VisualNote>& appends, std::vector<RenderClose>& closes)
 {
     const uint8_t status = uint8_t(message & 0xffu), command = uint8_t(status & 0xf0u);
     if (command != 0x90u && command != 0x80u) return;
     const uint8_t channel = uint8_t(status & 0x0fu);
-    const uint8_t key = uint8_t((message >> 8) & 0x7fu);
     const uint8_t velocity = uint8_t((message >> 16) & 0x7fu);
     const bool noteOn = command == 0x90u && velocity != 0;
     const uint8_t colorByte = uint8_t((globalColors_[channel] & 0x0f) | ((trackColors_[track][channel] & 0x0f) << 4));
     const uint8_t ownerIndex = renderPerTrackColors_ ? uint8_t(((track & 0x0fu) << 4) | channel) : channel;
     const uint8_t colorSlot = renderPerTrackColors_ ? uint8_t((colorByte >> 4) & 0x0fu) : uint8_t(colorByte & 0x0fu);
-    const std::size_t headerIndex = (std::size_t(channel) << 7) | std::size_t(key);
-    uint32_t count16 = renderActiveCounts_[headerIndex];
-    uint8_t activeOwner = renderActiveColors_[headerIndex];
-    if (noteOn) {
-        while (count) {
-            if (count16 != 0 && activeOwner != ownerIndex) {
-                const uint32_t oldId = renderActiveIds_[headerIndex];
-                if (oldId != 0) closes.push_back({oldId, tick});
-                count16 = 0;
+    for (uint32_t word = 0; word < words; ++word) {
+        const uint8_t key = uint8_t(keys[word] & 0x7fu);
+        uint32_t count = (message >> 24) + 1u;
+        const std::size_t headerIndex = (std::size_t(channel) << 7) | std::size_t(key);
+        uint32_t count16 = renderActiveCounts_[headerIndex];
+        uint8_t activeOwner = renderActiveColors_[headerIndex];
+        if (noteOn) {
+            while (count) {
+                if (count16 != 0 && activeOwner != ownerIndex) {
+                    const uint32_t oldId = renderActiveIds_[headerIndex];
+                    if (oldId != 0) closes.push_back({oldId, tick});
+                    count16 = 0;
+                }
+                if (count16 == 0) {
+                    const uint32_t id = renderHead_++;
+                    renderActiveIds_[headerIndex] = id;
+                    renderActiveColors_[headerIndex] = ownerIndex;
+                    activeOwner = ownerIndex;
+                    appends.push_back({tick, 0u, uint32_t(velocity) | (uint32_t(key) << 8) | (uint32_t(colorSlot) << 16)});
+                }
+                // The counter is 16 bits wide; past 65535 it wraps to 0 one copy at a time.
+                const uint32_t room = 65536u - count16;
+                const uint32_t take = std::min(count, room);
+                count16 = (count16 + take) & 0xffffu;
+                count -= take;
             }
+        } else if (count16 > 0 && activeOwner == ownerIndex) {
+            const uint32_t take = std::min(count, count16);
+            count16 -= take;
             if (count16 == 0) {
-                const uint32_t id = renderHead_++;
-                renderActiveIds_[headerIndex] = id;
-                renderActiveColors_[headerIndex] = ownerIndex;
-                activeOwner = ownerIndex;
-                appends.push_back({tick, 0u, uint32_t(velocity) | (uint32_t(key) << 8) | (uint32_t(colorSlot) << 16)});
+                const uint32_t id = renderActiveIds_[headerIndex];
+                if (id != 0) closes.push_back({id, tick});
             }
-            // The counter is 16 bits wide; past 65535 it wraps to 0 one copy at a time.
-            const uint32_t room = 65536u - count16;
-            const uint32_t take = std::min(count, room);
-            count16 = (count16 + take) & 0xffffu;
-            count -= take;
         }
-    } else if (count16 > 0 && activeOwner == ownerIndex) {
-        const uint32_t take = std::min(count, count16);
-        count16 -= take;
-        if (count16 == 0) {
-            const uint32_t id = renderActiveIds_[headerIndex];
-            if (id != 0) closes.push_back({id, tick});
-        }
+        renderActiveCounts_[headerIndex] = uint16_t(count16);
     }
-    renderActiveCounts_[headerIndex] = uint16_t(count16);
 }
 
 bool BpfaMidiStore::buildRenderSweepStream(uint32_t endTick, std::size_t maxWords, std::vector<VisualNote>& appends,
@@ -2382,8 +2394,8 @@ bool BpfaMidiStore::buildRenderSweepStream(uint32_t endTick, std::size_t maxWord
     if (held) {
         VisualCursor& c = visRenderAt_;
         visualSeek(c, renderPos_);
-        visualScan(c, maxWords, endTick, [&](uint32_t tick, uint32_t packed, uint32_t track) {
-            renderStep(tick, packed & 0x00ffffffu, uint16_t(track), (packed >> 24) + 1u, appends, closes);
+        visualScanRuns(c, maxWords, endTick, [&](uint32_t tick, uint32_t message, uint32_t track, const uint8_t* keys, uint32_t n) {
+            renderRun(tick, message, uint16_t(track), keys, n, appends, closes);
         });
         renderPos_ = c.pos;
     }
@@ -3072,42 +3084,46 @@ void BpfaMidiStore::liveStreamRun(uint32_t endTick)
     const uint32_t* pairOf = livePairOf_.data();
     std::size_t pairs = livePairOf_.size();
     if (!endTick) return;
-    visualScan(c, std::numeric_limits<std::size_t>::max(), endTick - 1u, [&](uint32_t tick, uint32_t packed, uint32_t track) {
-        const uint32_t type = packed & 0xf0u;
+    visualScanRuns(c, std::numeric_limits<std::size_t>::max(), endTick - 1u,
+                   [&](uint32_t tick, uint32_t message, uint32_t track, const uint8_t* keys, uint32_t words) {
+        const uint32_t type = message & 0xf0u;
         if (type != 0x80u && type != 0x90u) {
-            if (type >= 0xb0u && type <= 0xe0u) liveAddPoint(liveCc_, liveCcCount_, tick, 1u);
+            if (type >= 0xb0u && type <= 0xe0u) liveAddPoint(liveCc_, liveCcCount_, tick, words);
             return;
         }
-        const uint32_t n = (packed >> 24) + 1u, channel = packed & 0x0fu;
-        const uint32_t pitch = (packed >> 8) & 0x7fu;
+        const uint32_t n = (message >> 24) + 1u, channel = message & 0x0fu;
         const std::size_t at = std::size_t(track) * 16u + channel;
         uint32_t pair = at < pairs ? pairOf[at] : ~0u;
-        if (type == 0x90u && (packed & 0x7f0000u)) {
-            liveAddPoint(liveNps_, liveNpsCount_, tick, n);
-            uint32_t slot;
+        if (type == 0x90u && (message & 0x7f0000u)) {
+            liveAddPoint(liveNps_, liveNpsCount_, tick, uint32_t(std::min<uint64_t>(uint64_t(n) * words, std::numeric_limits<uint32_t>::max())));
             if (pair == ~0u) {
-                slot = liveSlot(uint16_t(track), uint8_t(channel), uint8_t(pitch), true);
+                pair = liveSlot(uint16_t(track), uint8_t(channel), 0, true) / 128u;
                 pairOf = livePairOf_.data();
                 pairs = livePairOf_.size();
-            } else {
-                slot = pair * 128u + pitch;
             }
-            LiveKey& k = liveSlots_[slot];
-            k.total = uint32_t(std::min<uint64_t>(uint64_t(k.total) + n, std::numeric_limits<uint32_t>::max()));
-            k.tailStart = tick;
-            k.tailColor = uint32_t(globalColors_[channel] & 0x0fu) | (uint32_t(trackColors_[track][channel] & 0x0fu) << 4);
-            if (k.activeAt == ~0u) {
-                k.activeAt = uint32_t(liveActive_.size());
-                liveActive_.push_back(slot);
+            LiveKey* slots = liveSlots_.data() + std::size_t(pair) * 128u;
+            const uint32_t color = uint32_t(globalColors_[channel] & 0x0fu) | (uint32_t(trackColors_[track][channel] & 0x0fu) << 4);
+            for (uint32_t i = 0; i < words; ++i) {
+                const uint32_t pitch = keys[i] & 0x7fu;
+                LiveKey& k = slots[pitch];
+                k.total = uint32_t(std::min<uint64_t>(uint64_t(k.total) + n, std::numeric_limits<uint32_t>::max()));
+                k.tailStart = tick;
+                k.tailColor = color;
+                if (k.activeAt == ~0u) {
+                    k.activeAt = uint32_t(liveActive_.size());
+                    liveActive_.push_back(pair * 128u + pitch);
+                }
             }
             return;
         }
         if (pair == ~0u) return;
-        const uint32_t slot = pair * 128u + pitch;
-        LiveKey& k = liveSlots_[slot];
-        if (k.total == 0) return;
-        if (k.total > n) k.total -= n;
-        else liveClearSlot(slot);
+        for (uint32_t i = 0; i < words; ++i) {
+            const uint32_t slot = pair * 128u + (keys[i] & 0x7fu);
+            LiveKey& k = liveSlots_[slot];
+            if (k.total == 0) continue;
+            if (k.total > n) k.total -= n;
+            else liveClearSlot(slot);
+        }
     });
     livePos_ = c.pos;
 }

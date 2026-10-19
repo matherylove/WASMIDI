@@ -1365,8 +1365,9 @@ let visualSpanWords = VISUAL_SPAN_WORDS;
 let visualPoolActive = false;
 let visualStreamOn = true;      // ?visualstream=0: the roll and keyboard read the old merge path
 // The compact stream lets the helpers run ahead of the roll up to the plan, in words past the
-// sweep and the keyboard (HANDOFF sec. 88). ?visualplan=M sets it in millions of words;
-// ?visualahead=0 plans only up to the roll's target, with the old 32 M words.
+// sweep and the keyboard (HANDOFF sec. 88): 32 M words (~47 MB per copy) per GiB of RAM, up to
+// 1024 M. ?visualplan=M sets it in millions of words; ?visualahead=0 plans only up to the roll's
+// target, with the old 32 M words.
 let visualAhead = true;
 let visualPlanWords = 32 * 1048576;
 function visualPlanDefault() {
@@ -1374,7 +1375,8 @@ function visualPlanDefault() {
     if (forced) return Math.max(1, forced) * 1048576;
     if (!visualAhead) return 32 * 1048576;
     const deviceGiB = Number(self.navigator && self.navigator.deviceMemory);
-    return (!Number.isFinite(deviceGiB) || deviceGiB <= 0 || deviceGiB >= 8 ? 256 : 96) * 1048576;
+    const gib = Number.isFinite(deviceGiB) && deviceGiB > 0 ? deviceGiB : 8;
+    return Math.round(Math.min(1024, Math.max(32, 32 * gib))) * 1048576;
 }
 // ?visualdebug=1: once a second, where this Worker's time went (sweep, live, appends).
 const visualStats = { at: 0, sweepMs: 0, sweeps: 0, liveMs: 0, lives: 0, appendMs: 0, spans: 0, bytes: 0,
@@ -1445,8 +1447,10 @@ function visualPump(Module) {
     }
     visualStats.appendMs += performance.now() - appendStart;
     jointPlan(Module);
+    // Past the roll's target, while the synth feed runs, one helper stays free for it.
     const queueLimit = visualQueueLimit(pool);
-    while (visualQueue.length < queueLimit && (visualAhead || visualPlanned <= sharpRenderTarget)) {
+    const aheadLimit = feedStarted && !feedComplete ? Math.max(1, pool.helpers.length - 1) : queueLimit;
+    while (visualQueue.length < (visualPlanned <= sharpRenderTarget ? queueLimit : visualAhead ? aheadLimit : 0)) {
         let end = sizeToNumber(Module._wmp_visual_span_end_js(visualPlanned, visualSpanWords), "visual span end");
         if (end <= visualPlanned) break;
         if (jointActive()) {

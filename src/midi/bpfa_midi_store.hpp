@@ -495,8 +495,8 @@ private:
     bool buildRenderSweepStream(uint32_t endTick, std::size_t maxWords, std::vector<VisualNote>& appends,
                                 std::vector<RenderClose>& closes, bool& complete, uint32_t& nextTick,
                                 bool& hasNextTick);
-    void renderStep(uint32_t tick, uint32_t message, uint16_t track, uint32_t count,
-                    std::vector<VisualNote>& appends, std::vector<RenderClose>& closes);
+    void renderRun(uint32_t tick, uint32_t message, uint16_t track, const uint8_t* keys, uint32_t words,
+                   std::vector<VisualNote>& appends, std::vector<RenderClose>& closes);
     void visualReset(uint32_t startTick);
     void visualDecodeSpan(std::vector<Cursor>& cursors, uint32_t endTick, std::vector<EventWord>& events,
                           std::vector<uint16_t>& tracks, bool& anyLeft);
@@ -535,6 +535,7 @@ private:
     void visualAppend(VisualPiece&& piece, uint32_t endTick, bool anyLeft);
     std::size_t visualPieceAt(uint64_t position) const;
     void visualSeek(VisualCursor& c, uint64_t position) const;
+    template <typename Fn> std::size_t visualScanRuns(VisualCursor& c, std::size_t maxWords, uint32_t through, Fn&& fn) const;
     template <typename Fn> std::size_t visualScan(VisualCursor& c, std::size_t maxWords, uint32_t through, Fn&& fn) const;
     inline uint32_t visualPeekTick(const VisualCursor& c) const;
     uint64_t visualLowerBound(uint32_t tick) const;
