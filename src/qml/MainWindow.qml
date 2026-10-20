@@ -315,17 +315,19 @@ ApplicationWindow {
                     color: Dk.lcd
                     DkBevel { anchors.fill: parent; kind: 1 }
                     Column {
-                        x: 8
-                        y: 3
+                        anchors.centerIn: parent
                         Text {
                             id: phoneClock
+                            anchors.horizontalCenter: parent.horizontalCenter
                             text: Dk.clock(mainWindow.currentTime)
                             color: Dk.white
                             font.family: Dk.term
                             font.pixelSize: 28
-                            lineHeight: 0.85
+                            lineHeight: 0.8
                         }
                         Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            lineHeight: 0.8
                             text: "/ " + Dk.clock(mainWindow.duration)
                             color: Dk.faint
                             font.family: Dk.term
@@ -361,13 +363,16 @@ ApplicationWindow {
                 }
             }
 
-            // Roll and dock.
-            RowLayout {
+            // Roll and dock. The phone panel goes under the keyboard (portrait) or
+            // beside the roll (landscape), never over the notes (HANDOFF sec. 100).
+            GridLayout {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.leftMargin: 2
                 Layout.rightMargin: 2
-                spacing: 6
+                columns: window.phone ? 1 : 3
+                rowSpacing: 4
+                columnSpacing: 6
 
                 Item {
                     Layout.fillWidth: true
@@ -402,63 +407,6 @@ ApplicationWindow {
                             onOpenRequested: mainWindow.openMidiPicker()
                         }
 
-                        // Phone panel: the tab's groups over the lower part of the roll.
-                        Rectangle {
-                            visible: window.mobileUi && window.phoneTab !== ""
-                            x: 0
-                            width: parent.width
-                            height: Math.min(roll.height, Math.max(phoneDock.implicitHeight + 16,
-                                window.phoneTab === "song" ? roll.height * 0.45 : 0))
-                            y: roll.height - height
-                            color: Dk.face
-                            DkBevel { anchors.fill: parent; kind: 0 }
-                            MouseArea { anchors.fill: parent }
-
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.margins: 6
-                                spacing: 4
-
-                                RowLayout {
-                                    visible: window.phoneTab === "synth"
-                                    Layout.fillWidth: true
-                                    Layout.topMargin: 6
-                                    spacing: 7
-                                    Text {
-                                        text: "VOL"
-                                        color: Dk.faint
-                                        font.family: Dk.term
-                                        font.pixelSize: 15
-                                    }
-                                    DkSlider {
-                                        Layout.fillWidth: true
-                                        from: 0
-                                        to: 100
-                                        value: mainWindow.volume
-                                        onMoved: mainWindow.volume = Math.round(value)
-                                    }
-                                }
-
-                                Flickable {
-                                    id: phoneFlick
-                                    Layout.fillWidth: true
-                                    Layout.fillHeight: true
-                                    clip: true
-                                    contentWidth: width
-                                    contentHeight: phoneDock.height
-                                    boundsBehavior: Flickable.StopAtBounds
-                                    Dock {
-                                        id: phoneDock
-                                        width: phoneFlick.width
-                                        height: Math.max(phoneFlick.height, implicitHeight)
-                                        section: window.phoneTab
-                                        mainWindow: mainWindow
-                                        onAdvancedRequested: advancedDialog.open()
-                                        onColorsRequested: colorsDialog.open()
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -470,6 +418,64 @@ ApplicationWindow {
                     mainWindow: mainWindow
                     onAdvancedRequested: advancedDialog.open()
                     onColorsRequested: colorsDialog.open()
+                }
+
+                Rectangle {
+                    visible: window.mobileUi && window.phoneTab !== ""
+                    Layout.fillWidth: window.phone
+                    Layout.fillHeight: !window.phone
+                    Layout.preferredWidth: Math.min(320, window.width * 0.45)
+                    Layout.preferredHeight: Math.min(window.height * 0.4,
+                        window.phoneTab === "song" ? 220 : phoneDock.implicitHeight + 16
+                            + (window.phoneTab === "synth" ? 34 : 0))
+                    color: Dk.face
+                    DkBevel { anchors.fill: parent; kind: 0 }
+                    MouseArea { anchors.fill: parent }
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 6
+                        spacing: 4
+
+                        RowLayout {
+                            visible: window.phoneTab === "synth"
+                            Layout.fillWidth: true
+                            Layout.topMargin: 6
+                            spacing: 7
+                            Text {
+                                text: "VOL"
+                                color: Dk.faint
+                                font.family: Dk.term
+                                font.pixelSize: 15
+                            }
+                            DkSlider {
+                                Layout.fillWidth: true
+                                from: 0
+                                to: 100
+                                value: mainWindow.volume
+                                onMoved: mainWindow.volume = Math.round(value)
+                            }
+                        }
+
+                        Flickable {
+                            id: phoneFlick
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            contentWidth: width
+                            contentHeight: phoneDock.height
+                            boundsBehavior: Flickable.StopAtBounds
+                            Dock {
+                                id: phoneDock
+                                width: phoneFlick.width
+                                height: Math.max(phoneFlick.height, implicitHeight)
+                                section: window.phoneTab
+                                mainWindow: mainWindow
+                                onAdvancedRequested: advancedDialog.open()
+                                onColorsRequested: colorsDialog.open()
+                            }
+                        }
+                    }
                 }
             }
 

@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§99). Este archivo resume el estado al cierre de la rev. 102 y dice
+`HANDOFF.md` (§1-§100). Este archivo resume el estado al cierre de la rev. 103 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 102)
+## Estado actual (rev. 103)
 
 Rendimiento medido por el usuario:
 
@@ -301,6 +301,9 @@ Rendimiento medido por el usuario:
   teclado abajo a lo ancho (`falling`): en horizontal las 128 teclas quedaban de ~1 px Deshecho en la rev. 102.
 - Rev. 102 (HANDOFF §99): el celular acostado vuelve al roll horizontal; el teclado horizontal no dibuja
   sus divisores y bordes de 1 px con filas de menos de 4 px (se veía como rayas apiladas).
+- Rev. 103 (HANDOFF §100): el panel de pestañas del celular va debajo del teclado (vertical) o a la derecha
+  del roll (acostado), no encima de las notas. Filas de teclas en píxeles enteros con octavas iguales
+  (`keyEdge`, roll, fondo y teclado); FBO del teclado a resolución del dispositivo. Ícono de Colors y reloj.
 
 Mecanismos activos y cómo desactivarlos:
 
