@@ -19,7 +19,7 @@ struct Req {
   filter_enabled: u32, filter_reset: u32, segment: u32, sustain_down: u32,
   pending_off: i32, row_start: u32, pad1: u32, pad2: u32,
   position: f32, pitch: f32, gain_l: f32, gain_r: f32,
-  env: f32, decay_dec: f32, sustain: f32, attack_inc: f32,
+  env: f32, decay_mul: f32, sustain: f32, attack_inc: f32,
   release_alpha: f32, loop_start: f32, loop_end: f32, playback_end: f32,
   b0: f32, b1: f32, b2: f32, a1: f32,
   a2: f32, z1l: f32, z2l: f32, z1r: f32,
@@ -108,7 +108,7 @@ fn renderVoices(@builtin(global_invocation_id) gid: vec3<u32>) {
         env = env + r.attack_inc;
         if (env >= 1.0) { env = 1.0; st = 1u; }
       } else if (st == 1u) {
-        env = env - r.decay_dec;
+        env = env * r.decay_mul;
         if (env <= r.sustain) { env = r.sustain; st = 2u; }
       } else if (st == 3u) {
         env = env * r.release_alpha;

@@ -52,7 +52,7 @@ typedef struct {
     int kill_now;
     int use_no_interp;
     float attack_inc;
-    float decay_dec;
+    float decay_mul;
     float sustain_level;
     float release_alpha;
     int filter_enabled;
@@ -90,7 +90,7 @@ GPUMIX_API int  gpu_mix_is_active(void);
 GPUMIX_API void gpu_mix_begin(int frames,
                               int channels,
                               float attack_inc,
-                              float decay_dec,
+                              float decay_mul,
                               float sustain_level,
                               float release_alpha,
                               float kill_release_alpha,
@@ -120,13 +120,13 @@ static inline int gpu_mix_is_active(void) { return 0; }
 static inline void gpu_mix_begin(int frames,
                                  int channels,
                                  float attack_inc,
-                                 float decay_dec,
+                                 float decay_mul,
                                  float sustain_level,
                                  float release_alpha,
                                  float kill_release_alpha,
                                  float silence_threshold,
                                  float release_simple_no_interp) {
-    (void)frames; (void)channels; (void)attack_inc; (void)decay_dec;
+    (void)frames; (void)channels; (void)attack_inc; (void)decay_mul;
     (void)sustain_level; (void)release_alpha; (void)kill_release_alpha;
     (void)silence_threshold; (void)release_simple_no_interp;
 }

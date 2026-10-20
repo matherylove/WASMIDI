@@ -65,6 +65,7 @@ typedef struct {
     int loop_start;
     int loop_end;
     float ampeg_attack;
+    float ampeg_hold;
     float ampeg_decay;
     float ampeg_sustain;
     float ampeg_release;
@@ -90,7 +91,7 @@ typedef struct {
     int is_resampled;           // Flag indicating if resampling was done
     unsigned int runtime_flags;
     float cached_attack_inc;
-    float cached_decay_dec;
+    float cached_decay_mul;
     float cached_release_alpha;
     float cached_base_gain;
     float cached_pitch_base_multiplier;
