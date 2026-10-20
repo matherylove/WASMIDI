@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -58,6 +59,7 @@ layout(location=3) in vec2 aKind;
 
 uniform vec2 uSize;
 uniform int uPortrait;
+uniform float uScale;
 
 out vec2 vLocal;
 flat out vec2 vSizePx;
@@ -77,7 +79,7 @@ void main()
             0.0,
             1.0);
 
-    vSizePx = aRect.zw * uSize;
+    vSizePx = aRect.zw * uSize / uScale;
     vLocal = aCorner * vSizePx;
     vColor = aColor;
     vKind = aKind;
@@ -93,6 +95,8 @@ in vec2 vLocal;
 flat in vec2 vSizePx;
 flat in vec4 vColor;
 flat in vec2 vKind;
+
+uniform float uScale;
 
 out vec4 fragColor;
 
@@ -136,7 +140,7 @@ void main()
         pressed = whitePressed;
     }
 
-    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 p = ivec2(gl_FragCoord.xy / uScale);
     if (pressed && ((p.x ^ p.y) & 1) == 1)
         color += (1.0 - color) * 0.13;
 
@@ -215,20 +219,8 @@ public:
     createFramebufferObject(
         const QSize& size) override
     {
-        const QSize cssSize(
-            std::max(
-                1,
-                qRound(
-                    size.width() /
-                    dpr_)),
-            std::max(
-                1,
-                qRound(
-                    size.height() /
-                    dpr_)));
-
         return new QOpenGLFramebufferObject(
-            cssSize);
+            size.expandedTo(QSize(1, 1)));
     }
 
     void synchronize(
@@ -286,6 +278,14 @@ public:
                     fbo->size().height());
         }
 
+        // The roll's rows are laid out on its CSS-pixel length.
+        const int keyLength = std::max(1, qRound(
+            (portrait_ ? width_ : height_) / dpr_));
+        if (keyLength != rowsFor_) {
+            rowsFor_ = keyLength;
+            dirty_ = true;
+        }
+
         if (dirty_)
             rebuild();
 
@@ -316,6 +316,10 @@ public:
         glUniform1i(
             portraitUniform_,
             portrait_ ? 1 : 0);
+
+        glUniform1f(
+            scaleUniform_,
+            float(dpr_));
 
         glBindVertexArray(vao_);
 
@@ -349,6 +353,11 @@ private:
             glGetUniformLocation(
                 program_,
                 "uPortrait");
+
+        scaleUniform_ =
+            glGetUniformLocation(
+                program_,
+                "uScale");
 
         static const float quad[] = {
             0,0, 1,0, 0,1,
@@ -450,9 +459,16 @@ private:
         keys_.clear();
         keys_.reserve(128 + 53);
 
-        // One row per key, low notes at the bottom like the roll's rows.
-        const float rowHeight =
-            1.0f / 128.0f;
+        // One row per key on the same whole-pixel rows as the roll
+        // (HANDOFF sec. 100), low notes at the bottom.
+        const float L = float(rowsFor_);
+        const float octave = std::max(1.0f, std::floor(L * 12.0f / 128.0f));
+        const float offset = std::floor(
+            (L - 10.0f * octave - std::floor(8.0f * octave / 12.0f)) * 0.5f);
+        auto edge = [&](int k) {
+            return (offset + float(k / 12) * octave +
+                std::floor(float(k % 12) * octave / 12.0f)) / L;
+        };
 
         for (int note = 0;
              note < 128;
@@ -470,9 +486,12 @@ private:
                     ? 1.0f
                     : 0.0f;
 
+            const float rowLow = edge(note);
+            const float rowHeight = edge(note + 1) - rowLow;
+
             keys_.push_back({
                 0.0f,
-                note * rowHeight,
+                rowLow,
                 1.0f,
                 rowHeight,
                 color[0],
@@ -488,7 +507,7 @@ private:
             if (isBlack) {
                 keys_.push_back({
                     1.0f - BlackBarShare,
-                    note * rowHeight,
+                    rowLow,
                     BlackBarShare,
                     rowHeight,
                     color[0],
@@ -525,6 +544,8 @@ private:
 
     GLint sizeUniform_ = -1;
     GLint portraitUniform_ = -1;
+    GLint scaleUniform_ = -1;
+    int rowsFor_ = 0;
     bool portrait_ = false;
 
     int width_ = 1;

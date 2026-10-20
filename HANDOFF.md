@@ -6559,3 +6559,44 @@ de rayas grises apiladas.
 ### No verificado
 
 - Un celular real.
+
+## 100. Revisión 103 — panel del celular fuera del roll, teclas en píxeles enteros, ícono y reloj
+
+### Pedido
+
+Dekx, con capturas del celular (Brave, `devicePixelRatio` ~2,6): el panel de las pestañas tapaba la parte
+de abajo del roll y las notas que llegan al teclado ("reducir el piano roll solo cambia qué tan lejos
+puede ver"); el ícono de Colors estaba mal hecho; el tiempo mal centrado; los paneles mal adaptados en
+horizontal; y el teclado horizontal se seguía viendo dañado.
+
+### Causa
+
+- El panel era un rectángulo encima del roll (rev. 99).
+- El roll y el teclado se dibujan en un FBO del tamaño CSS y el navegador lo escala ×DPR. Con ~1,1 px
+  CSS por tecla las filas caían en bordes fraccionarios: unas teclas de 1 px y otras de 2, sin patrón, y
+  escaladas ×2,6 eso se ve como un código de barras irregular.
+- El reloj del celular tenía posición fija (x 8, y 3) y el total se salía del recuadro.
+
+### Cambios
+
+- `MainWindow.qml`: el bloque roll + panel es un `GridLayout`. Celular vertical: el panel va debajo del
+  teclado y el roll se achica (las notas siguen llegando al teclado). Celular acostado: el panel va a la
+  derecha del roll (hasta 320 px o 45% del ancho), con desplazamiento si no cabe. Reloj centrado.
+- Filas de teclas en píxeles enteros con todas las octavas iguales: octava = floor(L·12/128) px CSS,
+  tecla j de la octava empieza en floor(j·octava/12), centrado en el largo L. Lo usan el shader de notas
+  (`keyEdge`), el fondo (líneas de do) y el teclado (`rebuild`), así que las filas coinciden. Sobran
+  como mucho ~11 px.
+- `keyboard.cpp`: el FBO del teclado ahora es del tamaño en píxeles del dispositivo (es chico); las
+  medidas del shader siguen en px CSS (`uScale`).
+- `Glyphs.qml`: paleta de pintor rellena con la muesca a la izquierda y tres puntos.
+
+### Verificación
+
+- Compilación wasm local OK. Chromium con `device_scale_factor` 2,625: 390×844 (panel Song debajo del
+  teclado, notas hasta el teclado, teclas regulares) y 760×300 (panel Synth a la derecha, teclado
+  horizontal con el mismo patrón en cada octava, notas alineadas con las teclas iluminadas).
+
+### No verificado
+
+- Un celular real. Escritorio con DPR distinto de 1 (las filas ahora pueden no llenar todo el alto: hasta
+  ~11 px de margen).

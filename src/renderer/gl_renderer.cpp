@@ -408,6 +408,15 @@ flat out vec3 vDark;
 out vec4 vDist;
 out float vT;
 
+// Key rows on whole pixels, every octave the same height (HANDOFF sec. 100).
+float keyEdge(float k) {
+    float L = uRollSize.y;
+    float O = max(1.0, floor(L * 12.0 / 128.0));
+    float off = floor((L - 10.0 * O - floor(8.0 * O / 12.0)) * 0.5);
+    float oct = floor(k / 12.0);
+    return off + oct * O + floor((k - oct * 12.0) * O / 12.0);
+}
+
 void main() {
     int endTick = aEndTick > 0u ? int(aEndTick) : uViewEnd;
     uint isEnd = uint(gl_VertexID) & 1u;
@@ -420,8 +429,10 @@ void main() {
     uint noteIndex = (aPackedData >> 16u) & 0xffu;
     uint colorIndex = noteIndex & 0x0fu;
 
-    float y = uMetrics.y +
-        float(((aPackedData >> 8u) & 0xffu) + isTop) * uMetrics.z;
+    float key = float((aPackedData >> 8u) & 0xffu);
+    float rowLow = keyEdge(key);
+    float rowPx = keyEdge(key + 1.0) - rowLow;
+    float y = (rowLow + float(isTop) * rowPx) / uRollSize.y * 2.0 - 1.0;
     float z = float(endTick - int(aStartTick)) / 16777216.0;
 
     vec3 base = texelFetch(uPalette, ivec2(int(colorIndex), 0), 0).rgb;
@@ -438,7 +449,6 @@ void main() {
     // The 1 px edge only where the note has room for it: on a side too
     // small, both distances stay at 2 px.
     float widthPx = (endX - startX) * 0.5 * uRollSize.x;
-    float rowPx = uRollSize.y / 128.0;
     float px = float(isEnd) * widthPx;
     float py = float(isTop) * rowPx;
     vDist = vec4(
@@ -512,9 +522,10 @@ void main()
     // Flat well with a line at every C, premultiplied so the page's neural
     // background shows through (HANDOFF sec. 92-93).
     float k = uPortrait == 1 ? gl_FragCoord.x : gl_FragCoord.y;
-    float c = floor(k * 128.0 / uHeight / 12.0 + 0.5) * 12.0;
-    bool line = c >= 12.0 && c <= 120.0 &&
-        floor(k) == floor(c * uHeight / 128.0);
+    float O = max(1.0, floor(uHeight * 12.0 / 128.0));
+    float rel = floor(k) - floor((uHeight - 10.0 * O - floor(8.0 * O / 12.0)) * 0.5);
+    float oct = floor(rel / O);
+    bool line = oct >= 1.0 && oct <= 10.0 && rel == oct * O;
     vec4 well = vec4(vec3(10.0, 9.0, 32.0) / 255.0 * uAlpha, uAlpha);
     vec4 grid = vec4(vec3(46.0, 39.0, 104.0) / 255.0, 1.0) * 0.45;
     fragColor = line ? grid + well * (1.0 - grid.a) : well;
