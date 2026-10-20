@@ -6530,3 +6530,32 @@ El diseño compacto dejaba el roll horizontal con el teclado vertical a la izqui
 ### No verificado
 
 - Un celular real.
+
+## 99. Revisión 102 — teclado horizontal en ventanas bajas (y se deshace la rev. 101)
+
+### Pedido
+
+Dekx: "No hiciste lo que te pedí, lo moviste a modo vertical enves de arreglar el teclado horizontal."
+La rev. 101 cambió de modo en vez de arreglar el teclado horizontal; se deshace (`falling` vuelve a ser
+solo `phone`) y el celular acostado vuelve al roll horizontal de la rev. 100.
+
+### Causa
+
+Con ~1,1 px por tecla (128 filas en ~145 px) cada fila seguía dibujando sus detalles de 1 px: el divisor
+entre E-F y B-C, el divisor del medio del lado blanco de las teclas negras y el borde claro de las
+barras negras. A ese tamaño esas líneas ocupan la fila entera y el teclado se ve como un código de barras
+de rayas grises apiladas.
+
+### Cambios
+
+- `keyboard.cpp`, shader: con filas de menos de 4 px no se dibujan esos detalles de 1 px. Queda el lado
+  blanco continuo y las barras negras sobre él, como un teclado. Con filas de 4 px o más no cambia nada.
+
+### Verificación
+
+- Compilación wasm local OK. Chromium 740×270 con el MIDI sintético, comparando capturas ampliadas: sin
+  las rayas grises; las teclas que suenan se iluminan con el color de la nota.
+
+### No verificado
+
+- Un celular real.

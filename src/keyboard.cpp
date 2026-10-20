@@ -110,6 +110,8 @@ void main()
     bool pressed = vColor.a > 0.5;
     vec3 pc = vColor.rgb;
     vec3 color;
+    // Rows under 4 px have no room for the 1 px dividers and edges.
+    bool fine = vSizePx.y >= 4.0;
 
     if (vKind.x > 1.5) {
         color = pressed
@@ -117,7 +119,7 @@ void main()
             : ramp(vec3(11.0, 9.0, 34.0) / 255.0,
                    vec3(46.0, 39.0, 104.0) / 255.0,
                    vec3(62.0, 48.0, 128.0) / 255.0, 0.75, t);
-        if (!pressed && vLocal.y >= vSizePx.y - 1.0)
+        if (!pressed && fine && vLocal.y >= vSizePx.y - 1.0)
             color += (1.0 - color) * 0.18;
     } else {
         bool whitePressed = pressed && vKind.x < 0.5;
@@ -127,9 +129,9 @@ void main()
                    vec3(239.0, 234.0, 255.0) / 255.0,
                    vec3(216.0, 208.0, 246.0) / 255.0, 0.55, t);
         float mid = floor(vSizePx.y * 0.5);
-        if ((vKind.y > 0.5 && vLocal.y >= vSizePx.y - 1.0) ||
+        if (fine && ((vKind.y > 0.5 && vLocal.y >= vSizePx.y - 1.0) ||
             (vKind.x > 0.5 && vLocal.x < vSizePx.x * (24.0 / 62.0) &&
-             vLocal.y >= mid - 1.0 && vLocal.y < mid))
+             vLocal.y >= mid - 1.0 && vLocal.y < mid)))
             color = mix(color, divider, 0.75);
         pressed = whitePressed;
     }
