@@ -75,6 +75,7 @@ typedef struct {
     int loop_start;
     int loop_end;
     int ampeg_attack_millis;
+    int ampeg_hold_millis;
     int ampeg_decay_millis;
     int ampeg_sustain_permille;
     int ampeg_release_millis;
@@ -178,6 +179,7 @@ static void init_region_defaults(sfz_region_defaults* defs) {
     defs->loop_start = INT_MIN;
     defs->loop_end = INT_MIN;
     defs->ampeg_attack_millis = INT_MIN;
+    defs->ampeg_hold_millis = INT_MIN;
     defs->ampeg_decay_millis = INT_MIN;
     defs->ampeg_sustain_permille = INT_MIN;
     defs->ampeg_release_millis = INT_MIN;
@@ -234,6 +236,7 @@ static inline void apply_region_defaults_from(sfz_region* region, const sfz_regi
     if (defs->loop_start != INT_MIN) region->loop_start = defs->loop_start;
     if (defs->loop_end != INT_MIN) region->loop_end = defs->loop_end;
     if (defs->ampeg_attack_millis != INT_MIN) region->ampeg_attack = (float)defs->ampeg_attack_millis * 0.001f;
+    if (defs->ampeg_hold_millis != INT_MIN) region->ampeg_hold = (float)defs->ampeg_hold_millis * 0.001f;
     if (defs->ampeg_decay_millis != INT_MIN) region->ampeg_decay = (float)defs->ampeg_decay_millis * 0.001f;
     if (defs->ampeg_sustain_permille != INT_MIN) region->ampeg_sustain = (float)defs->ampeg_sustain_permille * 0.001f;
     if (defs->ampeg_release_millis != INT_MIN) region->ampeg_release = (float)defs->ampeg_release_millis * 0.001f;
@@ -319,6 +322,7 @@ static inline void region_apply_defaults(sfz_region* region,
     region->loop_start = -1;
     region->loop_end = -1;
     region->ampeg_attack = -1.0f;
+    region->ampeg_hold = 0.0f;
     region->ampeg_decay = -1.0f;
     region->ampeg_sustain = -1.0f;
     region->ampeg_release = -1.0f;
@@ -339,7 +343,7 @@ static inline void region_apply_defaults(sfz_region* region,
     region->cached_base_gain = 0.0f;
     region->cached_pitch_base_multiplier = 1.0f;
     region->cached_attack_inc = -1.0f;
-    region->cached_decay_dec = -1.0f;
+    region->cached_decay_mul = -1.0f;
     region->cached_release_alpha = -1.0f;
     region->cache_entry = NULL;
     region->opcodes = NULL;
@@ -1183,6 +1187,8 @@ static void sfz_apply_opcode(sfz_region* region, sfz_region_defaults* defs, cons
             defs->loop_end = atoi(value);
         } else if (strcmp(key, "ampeg_attack") == 0) {
             defs->ampeg_attack_millis = (int)lrintf((float)atof(value) * 1000.0f);
+        } else if (strcmp(key, "ampeg_hold") == 0) {
+            defs->ampeg_hold_millis = (int)lrintf((float)atof(value) * 1000.0f);
         } else if (strcmp(key, "ampeg_decay") == 0) {
             defs->ampeg_decay_millis = (int)lrintf((float)atof(value) * 1000.0f);
         } else if (strcmp(key, "ampeg_sustain") == 0) {
@@ -1270,6 +1276,8 @@ static void sfz_apply_opcode(sfz_region* region, sfz_region_defaults* defs, cons
         region->loop_end = atoi(value);
     } else if (strcmp(key, "ampeg_attack") == 0) {
         region->ampeg_attack = (float)atof(value);
+    } else if (strcmp(key, "ampeg_hold") == 0) {
+        region->ampeg_hold = (float)atof(value);
     } else if (strcmp(key, "ampeg_decay") == 0) {
         region->ampeg_decay = (float)atof(value);
     } else if (strcmp(key, "ampeg_sustain") == 0) {

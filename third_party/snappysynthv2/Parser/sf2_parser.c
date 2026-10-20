@@ -64,8 +64,10 @@ enum {
     SF2_GEN_MOD_ENV_TO_PITCH = 7,
     SF2_GEN_INITIAL_FILTER_FC = 8,
     SF2_GEN_INITIAL_FILTER_Q = 9,
+    SF2_GEN_MOD_ENV_TO_FILTER_FC = 11,
     SF2_GEN_END_ADDRS_COARSE_OFFSET = 12,
     SF2_GEN_PAN = 17,
+    SF2_GEN_SUSTAIN_MOD_ENV = 29,
     SF2_GEN_DELAY_VOL_ENV = 33,
     SF2_GEN_ATTACK_VOL_ENV = 34,
     SF2_GEN_HOLD_VOL_ENV = 35,
@@ -86,7 +88,8 @@ enum {
     SF2_GEN_SAMPLE_MODES = 54,
     SF2_GEN_SCALE_TUNING = 56,
     SF2_GEN_EXCLUSIVE_CLASS = 57,
-    SF2_GEN_OVERRIDING_ROOT_KEY = 58
+    SF2_GEN_OVERRIDING_ROOT_KEY = 58,
+    SF2_GEN_COUNT = 61
 };
 
 enum {
@@ -144,6 +147,8 @@ typedef struct {
     int end_offset;
     int loop_start_offset;
     int loop_end_offset;
+    int16_t gen[SF2_GEN_COUNT];
+    unsigned char has[SF2_GEN_COUNT];
     float attack_seconds;
     float decay_seconds;
     float sustain_level;
@@ -249,116 +254,14 @@ static void sf2_zone_init(sf2_zone* zone) {
     zone->release_seconds = 0.0f;
 }
 
-static int sf2_max_int(int a, int b) {
-    return a > b ? a : b;
-}
-
-static int sf2_min_int(int a, int b) {
-    return a < b ? a : b;
-}
-
-static float sf2_merge_time_seconds(float dst_seconds, int dst_set, float src_seconds) {
-    return dst_set ? (dst_seconds * src_seconds) : src_seconds;
-}
-
-static float sf2_merge_sustain_level(float dst_level, int dst_set, float src_level) {
-    return dst_set ? (dst_level * src_level) : src_level;
-}
-
-static void sf2_zone_merge(sf2_zone* dst, const sf2_zone* src) {
-    if (!dst || !src) return;
-    if (src->set_key_range) {
-        if (dst->set_key_range) {
-            dst->lokey = sf2_max_int(dst->lokey, src->lokey);
-            dst->hikey = sf2_min_int(dst->hikey, src->hikey);
-        } else {
-            dst->lokey = src->lokey;
-            dst->hikey = src->hikey;
-        }
-        dst->set_key_range = 1;
-    }
-    if (src->set_vel_range) {
-        if (dst->set_vel_range) {
-            dst->lovel = sf2_max_int(dst->lovel, src->lovel);
-            dst->hivel = sf2_min_int(dst->hivel, src->hivel);
-        } else {
-            dst->lovel = src->lovel;
-            dst->hivel = src->hivel;
-        }
-        dst->set_vel_range = 1;
-    }
-    if (src->set_root_key) {
-        dst->root_key = src->root_key;
-        dst->set_root_key = 1;
-    }
-    if (src->key_override >= 0) dst->key_override = src->key_override;
-    if (src->vel_override >= 0) dst->vel_override = src->vel_override;
-    if (src->set_pan) {
-        dst->pan = src->pan;
-        dst->set_pan = 1;
-    }
-    if (src->set_cutoff) {
-        dst->cutoff_cents = src->cutoff_cents;
-        dst->set_cutoff = 1;
-    }
-    if (src->set_resonance) {
-        dst->resonance_cents = src->resonance_cents;
-        dst->set_resonance = 1;
-    }
-    if (src->set_instrument) {
-        dst->instrument = src->instrument;
-        dst->set_instrument = 1;
-    }
-    if (src->set_sample_id) {
-        dst->sample_id = src->sample_id;
-        dst->set_sample_id = 1;
-    }
-    if (src->set_exclusive_class) {
-        dst->exclusive_class = src->exclusive_class;
-        dst->set_exclusive_class = 1;
-    }
-    if (src->set_sample_modes) {
-        dst->sample_modes = src->sample_modes;
-        dst->set_sample_modes = 1;
-    }
-    if (src->set_scale_tuning) {
-        dst->scale_tuning = src->scale_tuning;
-        dst->set_scale_tuning = 1;
-    }
-    if (src->set_attenuation) {
-        dst->attenuation_cb += src->attenuation_cb;
-        dst->set_attenuation = 1;
-    }
-    dst->coarse_tune += src->coarse_tune;
-    dst->fine_tune += src->fine_tune;
-    dst->start_offset += src->start_offset;
-    dst->end_offset += src->end_offset;
-    dst->loop_start_offset += src->loop_start_offset;
-    dst->loop_end_offset += src->loop_end_offset;
-    if (src->set_attack) {
-        dst->attack_seconds = sf2_merge_time_seconds(dst->attack_seconds, dst->set_attack, src->attack_seconds);
-        dst->set_attack = 1;
-    }
-    if (src->set_decay) {
-        dst->decay_seconds = sf2_merge_time_seconds(dst->decay_seconds, dst->set_decay, src->decay_seconds);
-        dst->set_decay = 1;
-    }
-    if (src->set_sustain) {
-        dst->sustain_level = sf2_merge_sustain_level(dst->sustain_level, dst->set_sustain, src->sustain_level);
-        if (dst->sustain_level < 0.0f) dst->sustain_level = 0.0f;
-        if (dst->sustain_level > 1.0f) dst->sustain_level = 1.0f;
-        dst->set_sustain = 1;
-    }
-    if (src->set_release) {
-        dst->release_seconds = sf2_merge_time_seconds(dst->release_seconds, dst->set_release, src->release_seconds);
-        dst->set_release = 1;
-    }
-}
-
 static void sf2_apply_generator(sf2_zone* zone, const sf2_gen_record* gen) {
     uint16_t raw = (uint16_t)gen->amount;
     uint8_t lo = (uint8_t)(raw & 0xFFu);
     uint8_t hi = (uint8_t)((raw >> 8) & 0xFFu);
+    if (gen->oper < SF2_GEN_COUNT) {
+        zone->gen[gen->oper] = gen->amount;
+        zone->has[gen->oper] = 1;
+    }
     switch (gen->oper) {
         case SF2_GEN_KEY_RANGE:
             zone->lokey = lo;
@@ -796,7 +699,7 @@ static wav_data* sf2_build_wav_for_sample(const sf2_file* sf2, int sample_index,
         wav->sample_rate = (int)left->sample_rate;
         wav->num_samples = frames;
         wav->root_key = sf2_sample_root_key_from_header(left);
-        wav->root_key_fraction = (float)left->pitch_correction * 0.01f;
+        wav->root_key_fraction = -(float)left->pitch_correction * 0.01f;
         wav->has_loop = (left->end_loop > left->start_loop);
         wav->loop_start = wav->has_loop ? (int)(left->start_loop - left->start) : 0;
         wav->loop_end = wav->has_loop ? (int)(left->end_loop - left->start) : 0;
@@ -844,41 +747,98 @@ static int sf2_zone_range_end(const sf2_bag_record* bags, size_t bag_count, size
     return (int)gen_count;
 }
 
-static int sf2_region_from_zone(sfz_instrument* inst,
-                                const sf2_file* sf2,
-                                const sf2_zone* preset_zone,
-                                const sf2_zone* inst_zone,
-                                wav_data** sample_cache,
-                                int preset_bank,
-                                int preset_program) {
-    sf2_zone merged;
+static int sf2_gen_default(int oper) {
+    switch (oper) {
+        case SF2_GEN_INITIAL_FILTER_FC: return 13500;
+        case 21: case 23: case 25: case 26: case 27: case 28: case 30:
+        case SF2_GEN_DELAY_VOL_ENV: case SF2_GEN_ATTACK_VOL_ENV: case SF2_GEN_HOLD_VOL_ENV:
+        case SF2_GEN_DECAY_VOL_ENV: case SF2_GEN_RELEASE_VOL_ENV: return -12000;
+        case SF2_GEN_KEY_RANGE: case SF2_GEN_VEL_RANGE: return 0x7F00;
+        case SF2_GEN_KEYNUM: case SF2_GEN_VELOCITY: case SF2_GEN_OVERRIDING_ROOT_KEY: return -1;
+        case SF2_GEN_SCALE_TUNING: return 100;
+        default: return 0;
+    }
+}
+
+/* Instrument value (local zone over global zone over the default) plus the
+ * preset value (local over global), as the SF2 2.04 spec sec. 9.4 defines. */
+static int sf2_gen_value(int oper, const sf2_zone* pglobal, const sf2_zone* plocal,
+                         const sf2_zone* iglobal, const sf2_zone* ilocal) {
+    int value = sf2_gen_default(oper);
+    if (iglobal && iglobal->has[oper]) value = iglobal->gen[oper];
+    if (ilocal->has[oper]) value = ilocal->gen[oper];
+    switch (oper) {
+        case SF2_GEN_START_ADDRS_OFFSET: case SF2_GEN_END_ADDRS_OFFSET:
+        case SF2_GEN_START_LOOP_ADDRS_OFFSET: case SF2_GEN_END_LOOP_ADDRS_OFFSET:
+        case SF2_GEN_START_ADDRS_COARSE_OFFSET: case SF2_GEN_END_ADDRS_COARSE_OFFSET:
+        case SF2_GEN_START_LOOP_ADDRS_COARSE_OFFSET: case SF2_GEN_END_LOOP_ADDRS_COARSE_OFFSET:
+        case SF2_GEN_INSTRUMENT: case SF2_GEN_KEY_RANGE: case SF2_GEN_VEL_RANGE:
+        case SF2_GEN_KEYNUM: case SF2_GEN_VELOCITY: case SF2_GEN_SAMPLE_ID:
+        case SF2_GEN_SAMPLE_MODES: case SF2_GEN_EXCLUSIVE_CLASS: case SF2_GEN_OVERRIDING_ROOT_KEY:
+            return value;
+        default:
+            break;
+    }
+    if (plocal && plocal->has[oper]) value += plocal->gen[oper];
+    else if (pglobal && pglobal->has[oper]) value += pglobal->gen[oper];
+    return value;
+}
+
+static void sf2_range_value(int oper, const sf2_zone* pglobal, const sf2_zone* plocal,
+                            const sf2_zone* iglobal, const sf2_zone* ilocal, int* lo, int* hi) {
+    const sf2_zone* izone = ilocal->has[oper] ? ilocal : ((iglobal && iglobal->has[oper]) ? iglobal : NULL);
+    const sf2_zone* pzone = (plocal && plocal->has[oper]) ? plocal : ((pglobal && pglobal->has[oper]) ? pglobal : NULL);
+    *lo = 0; *hi = 127;
+    if (izone) { uint16_t r = (uint16_t)izone->gen[oper]; *lo = r & 0xFF; *hi = r >> 8; }
+    if (pzone) {
+        uint16_t r = (uint16_t)pzone->gen[oper];
+        if ((r & 0xFF) > *lo) *lo = r & 0xFF;
+        if ((r >> 8) < *hi) *hi = r >> 8;
+    }
+    if (*hi > 127) *hi = 127;
+}
+
+static float sf2_tc_seconds(int tc) {
+    if (tc <= -12000) return 0.0f;
+    if (tc > 8000) tc = 8000;
+    return powf(2.0f, (float)tc * (1.0f / 1200.0f));
+}
+
+static int sf2_clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static int sf2_region_from_zones(sfz_instrument* inst,
+                                 const sf2_file* sf2,
+                                 const sf2_zone* pglobal,
+                                 const sf2_zone* plocal,
+                                 const sf2_zone* iglobal,
+                                 const sf2_zone* ilocal,
+                                 wav_data** sample_cache,
+                                 int preset_bank,
+                                 int preset_program) {
+#define G(op) sf2_gen_value((op), pglobal, plocal, iglobal, ilocal)
     sfz_region* region;
     const sf2_shdr_record* sh;
     char cache_key[512];
     wav_data* sample;
     uint16_t sample_type;
-    int linked_stereo = 0;
-    int stereo_partner;
-    if (!inst || !sf2 || !inst_zone || !sf2_zone_has_sample(inst_zone)) return 0;
+    int stereo_partner, linked_stereo, sample_id, lokey, hikey, lovel, hivel;
+    int modes, root_key, fc, sustain_cb, decay_tc;
+    if (!inst || !sf2 || !ilocal || !sf2_zone_has_sample(ilocal)) return 0;
 
-    sf2_zone_init(&merged);
-    if (preset_zone) sf2_zone_merge(&merged, preset_zone);
-    sf2_zone_merge(&merged, inst_zone);
-    if (merged.lokey < 0) merged.lokey = 0;
-    if (merged.hikey > 127) merged.hikey = 127;
-    if (merged.lovel < 0) merged.lovel = 0;
-    if (merged.hivel > 127) merged.hivel = 127;
-    if (merged.lokey > merged.hikey || merged.lovel > merged.hivel) return 0;
-    if (!merged.set_sample_id || merged.sample_id < 0 || (size_t)merged.sample_id >= sf2->shdr_count - 1) return 0;
+    sf2_range_value(SF2_GEN_KEY_RANGE, pglobal, plocal, iglobal, ilocal, &lokey, &hikey);
+    sf2_range_value(SF2_GEN_VEL_RANGE, pglobal, plocal, iglobal, ilocal, &lovel, &hivel);
+    if (lokey > hikey || lovel > hivel) return 0;
+    sample_id = (int)(uint16_t)ilocal->gen[SF2_GEN_SAMPLE_ID];
+    if ((size_t)sample_id >= sf2->shdr_count - 1) return 0;
 
-    sh = &sf2->shdr[merged.sample_id];
+    sh = &sf2->shdr[sample_id];
     sample_type = sh->sample_type & 0x7FFFu;
-    stereo_partner = sf2_stereo_partner(sf2, merged.sample_id);
+    stereo_partner = sf2_stereo_partner(sf2, sample_id);
     if (sample_type == SF2_SAMPLE_RIGHT && stereo_partner >= 0) {
         return 0;
     }
 
-    sample = sf2_build_wav_for_sample(sf2, merged.sample_id, sample_cache);
+    sample = sf2_build_wav_for_sample(sf2, sample_id, sample_cache);
     if (!sample) return 0;
     linked_stereo = (sample->num_channels == 2 && stereo_partner >= 0);
 
@@ -887,49 +847,50 @@ static int sf2_region_from_zone(sfz_instrument* inst,
     sf2_trim_name(sh->name, region->sample, sizeof(region->sample));
     region->midi_bank = preset_bank;
     region->midi_program = preset_program;
-    if (merged.key_override >= 0) {
-        region->key_override = merged.key_override;
-        region->lokey = merged.lokey;
-        region->hikey = merged.hikey;
-    } else {
-        region->lokey = merged.lokey;
-        region->hikey = merged.hikey;
+    region->lokey = lokey;
+    region->hikey = hikey;
+    region->lovel = lovel;
+    region->hivel = hivel;
+    {
+        int keynum = G(SF2_GEN_KEYNUM), velocity = G(SF2_GEN_VELOCITY);
+        if (keynum >= 0 && keynum <= 127) region->key_override = keynum;
+        if (velocity >= 0 && velocity <= 127) region->vel_override = velocity;
     }
-    if (merged.vel_override >= 0) {
-        region->vel_override = merged.vel_override;
-        region->lovel = merged.lovel;
-        region->hivel = merged.hivel;
-    } else {
-        region->lovel = merged.lovel;
-        region->hivel = merged.hivel;
-    }
-    region->pitch_keycenter = merged.set_root_key
-        ? ((merged.root_key < 0) ? 0 : ((merged.root_key > 127) ? 127 : merged.root_key))
-        : sf2_sample_root_key_from_header(sh);
-    region->pitch_keytrack = (float)merged.scale_tuning * 0.01f;
-    region->transpose = merged.coarse_tune;
-    region->tune_cents = merged.fine_tune;
-    region->pan = linked_stereo ? 0 : merged.pan;
-    region->attenuation = merged.attenuation_cb;
-    region->group = merged.exclusive_class;
-    region->off_by = merged.exclusive_class;
-    region->loop_mode = merged.set_sample_modes && (merged.sample_modes != 0) ? 2 : 0;
-    region->offset = (int)sh->start + merged.start_offset;
-    region->end = (int)sh->end + merged.end_offset;
-    region->loop_start = (int)sh->start_loop + merged.loop_start_offset;
-    region->loop_end = (int)sh->end_loop + merged.loop_end_offset;
-    region->ampeg_attack = merged.set_attack ? merged.attack_seconds : sf2_timecents_to_seconds(-12000);
-    region->ampeg_decay = merged.set_decay ? merged.decay_seconds : sf2_timecents_to_seconds(-12000);
-    region->ampeg_sustain = merged.set_sustain ? merged.sustain_level : 1.0f;
-    region->ampeg_release = merged.set_release ? merged.release_seconds : sf2_timecents_to_seconds(-12000);
-    if (merged.set_cutoff) {
+    root_key = G(SF2_GEN_OVERRIDING_ROOT_KEY);
+    region->pitch_keycenter = (root_key >= 0 && root_key <= 127) ? root_key : sf2_sample_root_key_from_header(sh);
+    region->pitch_keytrack = (float)G(SF2_GEN_SCALE_TUNING) * 0.01f;
+    region->transpose = G(SF2_GEN_COARSE_TUNE);
+    region->tune_cents = G(SF2_GEN_FINE_TUNE);
+    region->pan = linked_stereo ? 0 : sf2_clamp_int(G(SF2_GEN_PAN), -500, 500) / 5;
+    /* 0.4 x initialAttenuation, as EMU hardware, FluidSynth and BASSMIDI play it (HANDOFF sec. 102). */
+    region->attenuation = (int)lroundf((float)sf2_clamp_int(G(SF2_GEN_INITIAL_ATTENUATION), 0, 1440) * 0.4f);
+    region->group = G(SF2_GEN_EXCLUSIVE_CLASS);
+    region->off_by = region->group;
+    modes = G(SF2_GEN_SAMPLE_MODES) & 3;
+    region->loop_mode = modes == 1 ? 1 : (modes == 3 ? 2 : 0);
+    region->offset = (int)sh->start + G(SF2_GEN_START_ADDRS_OFFSET) + G(SF2_GEN_START_ADDRS_COARSE_OFFSET) * 32768;
+    region->end = (int)sh->end + G(SF2_GEN_END_ADDRS_OFFSET) + G(SF2_GEN_END_ADDRS_COARSE_OFFSET) * 32768;
+    region->loop_start = (int)sh->start_loop + G(SF2_GEN_START_LOOP_ADDRS_OFFSET) + G(SF2_GEN_START_LOOP_ADDRS_COARSE_OFFSET) * 32768;
+    region->loop_end = (int)sh->end_loop + G(SF2_GEN_END_LOOP_ADDRS_OFFSET) + G(SF2_GEN_END_LOOP_ADDRS_COARSE_OFFSET) * 32768;
+    /* The engine's decay is a ramp from full level to sustain; SF2 decay time is
+     * for the whole 100 dB, so the ramp lasts decay x sustain/100 dB (sec. 102). */
+    sustain_cb = sf2_clamp_int(G(SF2_GEN_SUSTAIN_VOL_ENV), 0, 1000);
+    decay_tc = G(SF2_GEN_DECAY_VOL_ENV);
+    region->ampeg_attack = sf2_tc_seconds(G(SF2_GEN_ATTACK_VOL_ENV));
+    region->ampeg_hold = sf2_tc_seconds(G(SF2_GEN_HOLD_VOL_ENV));
+    region->ampeg_decay = sf2_tc_seconds(decay_tc) * ((float)sustain_cb / 1000.0f);
+    region->ampeg_sustain = powf(10.0f, -(float)sustain_cb * (1.0f / 200.0f));
+    region->ampeg_release = sf2_tc_seconds(G(SF2_GEN_RELEASE_VOL_ENV));
+    /* No modulation envelope in the engine: use the cutoff it settles at (sustain). */
+    fc = G(SF2_GEN_INITIAL_FILTER_FC) +
+         (int)lroundf((float)G(SF2_GEN_MOD_ENV_TO_FILTER_FC) *
+                      (1.0f - (float)sf2_clamp_int(G(SF2_GEN_SUSTAIN_MOD_ENV), 0, 1000) * 0.001f));
+    if (fc < 13500) {
         region->filter_type = 1;
-        region->cutoff_hz = sf2_abs_cents_to_hz(merged.cutoff_cents);
+        region->cutoff_hz = sf2_abs_cents_to_hz(sf2_clamp_int(fc, 1500, 13500));
+        region->resonance_q = powf(10.0f, ((float)sf2_clamp_int(G(SF2_GEN_INITIAL_FILTER_Q), 0, 960) * 0.1f - 3.01f) * (1.0f / 20.0f));
     }
-    if (merged.set_resonance) {
-        region->resonance_q = 0.707f + ((float)merged.resonance_cents * 0.01f);
-    }
-    snprintf(cache_key, sizeof(cache_key), "%s#sf2sample:%d", inst->source_path, merged.sample_id);
+    snprintf(cache_key, sizeof(cache_key), "%s#sf2sample:%d", inst->source_path, sample_id);
     if (!sfz_region_attach_sample_owned(inst, region, cache_key, sample)) {
         return 0;
     }
@@ -938,7 +899,14 @@ static int sf2_region_from_zone(sfz_instrument* inst,
     region->loop_start -= (int)sh->start;
     region->loop_end -= (int)sh->start;
     sfz_region_finalize(region);
+    if (!linked_stereo) {
+        /* Constant-power pan as SF2 players use, scaled so the centre keeps unity gain. */
+        float angle = (float)(sf2_clamp_int(G(SF2_GEN_PAN), -500, 500) + 500) * (0.5f * 3.14159265f / 1000.0f);
+        region->pan_l_gain = 1.41421356f * cosf(angle);
+        region->pan_r_gain = 1.41421356f * sinf(angle);
+    }
     return 1;
+#undef G
 }
 
 sfz_instrument* sf2_load_as_instrument(const char* path) {
@@ -1019,7 +987,6 @@ sfz_instrument* sf2_load_as_instrument(const char* path) {
                     int igen_start = sf2_zone_range_start(sf2.ibag, sf2.ibag_count, iz);
                     int igen_end = sf2_zone_range_end(sf2.ibag, sf2.ibag_count, iz, sf2.igen_count);
                     sf2_zone inst_zone;
-                    sf2_zone merged_preset;
                     if (igen_start < 0 || igen_end < igen_start || (size_t)igen_end > sf2.igen_count) {
                         ShowErrorWithLocation(HOWTHEFUCK, __LINE__, __FILE__);
                         continue;
@@ -1030,16 +997,10 @@ sfz_instrument* sf2_load_as_instrument(const char* path) {
                         have_inst_global = 1;
                         continue;
                     }
-                    sf2_zone_init(&merged_preset);
-                    if (have_preset_global) sf2_zone_merge(&merged_preset, &preset_global);
-                    sf2_zone_merge(&merged_preset, &preset_zone);
-                    if (have_inst_global) {
-                        sf2_zone tmp = merged_preset;
-                        sf2_zone_merge(&tmp, &inst_global);
-                        merged_preset = tmp;
-                    }
-                    if (sf2_region_from_zone(inst, &sf2, &merged_preset, &inst_zone, sample_cache,
-                                             preset_bank, preset_program)) {
+                    if (sf2_region_from_zones(inst, &sf2,
+                                              have_preset_global ? &preset_global : NULL, &preset_zone,
+                                              have_inst_global ? &inst_global : NULL, &inst_zone,
+                                              sample_cache, preset_bank, preset_program)) {
                         ++loaded_regions;
                     }
                 }

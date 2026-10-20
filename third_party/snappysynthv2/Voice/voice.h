@@ -53,7 +53,7 @@ typedef struct {
     float           region_a1;             // +108
     float           region_a2;             // +112
     float           env_attack_inc;         // +116
-    float           env_decay_dec;          // +120
+    float           env_decay_mul;          // +120
     float           env_sustain_level;      // +124
     // ---- CACHE LINE 2 (bytes 128-191): warm + cold ----
     float           env_release_alpha;      // +128
@@ -92,6 +92,7 @@ typedef struct {
     float           vor_original_volume_unit;
     #endif
     uint32_t        wgpu_serial;            // rev. 70: last WebGPU block that rendered this voice
+    int             env_hold_samples;       // decay held at full level for this many more samples
 } voice;
 
 typedef struct {

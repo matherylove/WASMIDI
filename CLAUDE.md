@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§101). Este archivo resume el estado al cierre de la rev. 104 y dice
+`HANDOFF.md` (§1-§102). Este archivo resume el estado al cierre de la rev. 105 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 104)
+## Estado actual (rev. 105)
 
 Rendimiento medido por el usuario:
 
@@ -309,6 +309,11 @@ Rendimiento medido por el usuario:
   con Hash cada worker resuelve el programa con su propio estado de selector (copias `EVT_SELECTOR_COPY`), antes
   la primera nota tras un program change sonaba con el programa anterior; banco melódico de SF2 = MSB (o LSB),
   MSB 1 ya no cae en el banco 128 de batería.
+- Rev. 105 (HANDOFF §102): comparado con BASSMIDI (biblioteca de Linux, `NOFX`). SF2 toca todas las capas de la
+  nota; generadores según la especificación (local > global > defecto, el preset se suma), atenuación ×0,4, hold,
+  decay en dB hasta sustain, Q y filtro como SF2, loops 1/3, pan de potencia constante; las clases exclusivas no
+  apagan capas de la misma nota. Arachno: niveles a ~1 dB de BASSMIDI (antes hasta -14 dB). Falta envolvente de
+  modulación, LFOs, moduladores, reverb y chorus.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -382,7 +387,7 @@ Mecanismos activos y cómo desactivarlos:
    ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
    (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.
 3. Anteriores: que el hilo coordinador también tome tiles de render; GUI cosmética; precisión de CC;
-   generadores de preset de SF2 y capas en SF2 (HANDOFF §101).
+   envolvente de modulación, LFOs, moduladores, reverb y chorus de SF2 (HANDOFF §102).
 
 ## Errores a no repetir (detalle en HANDOFF §7)
 

@@ -31,7 +31,7 @@ typedef struct {
     uint32_t out_offset, frames, startup, voice_id;
     uint32_t filter_enabled, filter_reset, segment, sustain_down;
     int32_t pending_off; uint32_t pad0, pad1, pad2;
-    float position, pitch, gain_l, gain_r, env, decay_dec, sustain, attack_inc;
+    float position, pitch, gain_l, gain_r, env, decay_mul, sustain, attack_inc;
     float release_alpha, loop_start, loop_end, playback_end, b0, b1, b2, a1, a2, z1l, z2l, z1r, z2r, vor_scale, vor_target, pad5;
 } emu_req;
 static float g_emu_z[1 << 17][4];
@@ -76,7 +76,7 @@ static void emu_gpu_render(float *out, int frames) {
             vs = q->vor_target + (vs - q->vor_target) * q->release_alpha;
             if (pending > 0 && --pending == 0) { pending = -1; if (st != 3 && st != 4 && !q->sustain_down) st = 3; }
             if (st == 0) { env += q->attack_inc; if (env >= 1.0f) { env = 1.0f; st = 1; } }
-            else if (st == 1) { env -= q->decay_dec; if (env <= q->sustain) { env = q->sustain; st = 2; } }
+            else if (st == 1) { env *= q->decay_mul; if (env <= q->sustain) { env = q->sustain; st = 2; } }
             else if (st == 3) { env *= q->release_alpha; if (env <= 1.0f / 65536.0f) break; }
             adv += 1.0f;
         }

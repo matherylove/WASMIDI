@@ -6664,3 +6664,110 @@ preset correcto para los 128 programas del banco 0 y para la batería (banco 128
   preset se combinan con reglas de instrumento (rangos que se cruzan con la zona global en vez de
   reemplazarla, valores que se reemplazan en vez de sumarse), solo se toca una región por nota en SF2
   (las capas de SFZ sí suenan todas) y no hay moduladores.
+
+## 102. Revisión 105 — capas, generadores y envolvente de SF2 como BASSMIDI
+
+### Pedido
+
+Después de la rev. 104, Dekx: "el problema persiste, los instrumentos no son correctos en ningún MIDI que
+use GM. y el piano y los drums están mal ecualizados, probablemente todos los instrumentos". Referencia:
+BASSMIDI (FluidSynth es muy lento para él).
+
+### Cómo se midió
+
+BASSMIDI 2.4 de un4seen (biblioteca de Linux, `BASS_MIDI_StreamCreateFile` + `BASS_MIDI_DECAYEND`, 48 kHz;
+`BASS_MIDI_NOFX` para comparar sin reverb ni chorus, que WasmiSynth no tiene) contra `midibench` con
+`DET=1`. MIDI de prueba: 18 tramos de 2 s (nota de 1 s, velocidad 100) con piano, piano eléctrico, órgano,
+guitarra, bajo, violín, cuerdas, trompeta, saxo, flauta, lead, pad, bombo, redoblante, hi-hat, crash, ride
+y tom. Por tramo: nivel RMS, balance L/R, energía por octavas (relativa al total) y correlación de los
+espectros. SoundFonts: Arachno 1.0, FluidR3_GM, MatheryLSD.
+
+### Causa
+
+1. **SF2 tocaba una sola zona por nota.** `sfz_find_region_for_program` elegía la mejor región y las demás
+   capas no sonaban, y la búsqueda de capas descartaba las que usaban la misma muestra. Arachno arma casi
+   todos sus presets con dos instrumentos que usan la misma muestra con pan -500/+500 (estéreo falso) o con
+   capas de distinta velocidad: sonaba la mitad del instrumento, en un solo lado o sin la capa principal.
+2. **Generadores leídos con reglas equivocadas.** Las zonas de preset se mezclaban con la de instrumento
+   cruzando rangos y multiplicando tiempos; la especificación (SF2 2.04 §9.4) dice: en el instrumento la zona
+   local reemplaza a la global, que reemplaza al valor por defecto; en el preset igual, y el valor del preset
+   se **suma** al del instrumento (los rangos se cruzan). Además:
+   - `initialAttenuation` sin el factor 0,4 que usan el hardware EMU, FluidSynth y BASSMIDI (la trompeta de
+     Arachno, 117 cB, sonaba 7 dB más baja).
+   - `sampleModes` 1 y 3 iban los dos a "sustain"; Q como `0,707 + cB·0,01`; filtro siempre encendido y con
+     corte mínimo 1500 cents aunque no se hubiera pedido.
+   - Decay: en SF2 el tiempo es el de caer 100 dB; el motor lo usaba como el tiempo hasta el sustain.
+   - Hold ignorado (piano de Arachno: 2,3 s; órgano: 5,7 s).
+   - Corrección de afinación de la muestra con el signo cambiado.
+3. **Pan lineal.** El pan de región era un balance (centro 1/1, extremo 1/0); los reproductores de SF2 usan
+   potencia constante (centro 0,707, extremo 1). Las capas de Arachno con pan ±500 (bombo, redoblante,
+   toms) quedaban 3 dB más bajas que un instrumento centrado.
+4. **Clases exclusivas entre capas de la misma nota.** Las tres capas del hi-hat de Arachno tienen
+   `exclusiveClass` 1: cada capa nueva apagaba a las anteriores de la misma nota (el hi-hat sonaba con una
+   capa, -9 dB).
+5. **Decaimiento lineal en amplitud.** SF2 decae lineal en dB (exponencial en amplitud). Con una rampa
+   lineal el crash (decay de 6,2 s) seguía casi entero 1,5 s después: +5 dB contra BASSMIDI.
+
+### Cambios
+
+- `voice.c`: SF2 toca todas las regiones que coinciden (`sfz_collect_exact_regions_for_program`) sin
+  descartar las que comparten muestra.
+- `sf2_parser.c`: cada zona guarda sus generadores crudos y cuáles tiene (`gen[]`, `has[]`);
+  `sf2_gen_value` aplica las reglas de la especificación y `sf2_region_from_zones` convierte: atenuación ×0,4,
+  tiempos en timecents (attack, hold, decay, release), sustain en cB, decay hasta el sustain =
+  decay × sustain/100 dB, filtro solo con corte < 13500 cents y Q = 10^((cB/10 − 3,01)/20), loop 1 =
+  continuo y 3 = hasta soltar, `keynum`/`velocity` fijos, offsets finos y gruesos, afinación de la muestra
+  con el signo correcto. Pan de región de potencia constante con el centro en ganancia 1 (los instrumentos
+  centrados no cambian de nivel). Sin envolvente de modulación en el motor, el corte del filtro es el
+  valor al que llega esa envolvente en el sustain (`modEnvToFilterFc` × (1 − `sustainModEnv`)).
+- `voice.c`: el decay es exponencial (multiplicador por muestra `decay_mul`, como el release) hasta el
+  sustain o hasta -100 dB si el sustain es 0; el campo `decay_dec` pasó a `decay_mul` en el voice, la
+  región, las peticiones a la GPU, el shader WGSL y `midibench`. En el modo GPU el sustain por voz no llegaba
+  (se usaba siempre 0,8): ahora va el de la voz.
+- `voice.c`: etapa hold (`ampeg_hold` en SF2 y SFZ) por bloque: mientras dura, el multiplicador del decay
+  es 1 (error de a lo sumo un bloque al terminar). Se descuenta donde se escribe el estado de la voz (CPU o
+  GPU), una vez por bloque.
+- `voice.c`: al empezar una nota se apagan una vez los grupos (`off_by`) de todas sus capas, antes de
+  crearlas; antes cada capa apagaba a las anteriores de la misma nota.
+
+### Medición
+
+Nivel por tramo, BASSMIDI sin efectos → WasmiSynth (dB). Antes = rev. 104; después = esta revisión.
+
+| Arachno | BASSMIDI | antes | después |
+|---|---|---|---|
+| piano | -35,9 | -39,9 | -36,8 |
+| órgano | -26,8 | -33,4 | -27,8 |
+| violín | -24,6 | -32,2 | -25,3 |
+| cuerdas | -28,5 | -32,8 | -29,0 |
+| trompeta | -29,8 | -37,7 | -30,7 |
+| lead | -26,9 | -40,8 | -28,5 |
+| bombo | -30,5 | -42,3 | -31,5 |
+| redoblante | -30,9 | -40,5 | -31,7 |
+| hi-hat | -42,3 | -51,6 | -45,4 |
+| crash | -36,3 | -31,3 | -35,9 |
+| tom | -24,9 | -29,9 | -25,7 |
+
+Todos quedan ~1 dB debajo de BASSMIDI salvo el hi-hat (-3 dB); el balance L/R coincide y las bandas por
+octava quedan a ±1 dB en casi todos los tramos. FluidR3_GM: todos los niveles a ~1 dB de BASSMIDI (antes de
+esta revisión no se midió). Lo que sigue distinto es el brillo de los sonidos que mueven el filtro con la
+envolvente de modulación (bajo de Arachno: -8 a -10 dB en 3-6 kHz; pad de FluidR3: -10 a -19 dB en
+3-12 kHz) y los graves de la trompeta de Arachno (+5 dB en 63-187 Hz).
+Con `GPUEMU=1` (emulación del shader) el WAV queda a ≤ 0,2 dB del de CPU en todos los tramos.
+Costo con MatheryLSD (una capa por nota), MIDI sintético de 3000 notas/s en 16 canales, 1024 voces, 1 worker:
+0,29× tiempo real antes y después.
+
+### Verificación
+
+- Pruebas de host del CI (`run_ci_step.py "Host tests (engine logic, no Emscripten)"`): todas pasan.
+- `node --check` de `web/*.js`.
+- Compilación local con Emscripten 3.1.56 / Qt 6.8.3 (`tools/local_build.sh`, mismos pasos del CI) y WASMIDI
+  Audio en Chromium con Arachno y el MIDI de prueba: carga en 4,8 s (4420 regiones), 2-7 voces por nota con
+  capas, 0 underruns.
+
+### No verificado
+
+- El sonido en las PCs de Dekx y el modo GPU en una GPU real.
+- Envolvente de modulación, LFOs y moduladores de SF2 (vibrato, filtro que se abre y se cierra): siguen sin
+  implementarse. Reverb y chorus tampoco (BASSMIDI los aplica por defecto con los envíos de la SF2).
+- Con SFZ el decay ahora también es exponencial (como sfizz); no se comparó con otra implementación.
