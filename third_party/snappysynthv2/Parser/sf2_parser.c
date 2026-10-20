@@ -105,10 +105,6 @@ static int sf2_sample_root_key_from_header(const sf2_shdr_record* sh) {
     return sh->original_pitch <= 127u ? (int)sh->original_pitch : -1;
 }
 
-static int sf2_is_linked_stereo_type(uint16_t type) {
-    return type == SF2_SAMPLE_LEFT || type == SF2_SAMPLE_RIGHT;
-}
-
 typedef struct {
     int set_key_range;
     int set_vel_range;
@@ -734,6 +730,24 @@ static int sf2_file_load(const char* path, sf2_file* sf2) {
     return 1;
 }
 
+/* Partner of a stereo half only when both headers point at each other with
+ * opposite sides (HANDOFF sec. 101); any other link is played as mono. */
+static int sf2_stereo_partner(const sf2_file* sf2, int sample_index) {
+    const sf2_shdr_record* sh;
+    const sf2_shdr_record* other;
+    uint16_t type, other_type;
+    if (!sf2 || sample_index < 0 || (size_t)sample_index >= sf2->shdr_count - 1) return -1;
+    sh = &sf2->shdr[sample_index];
+    type = sh->sample_type & 0x7FFFu;
+    if (type != SF2_SAMPLE_LEFT && type != SF2_SAMPLE_RIGHT) return -1;
+    if (sh->sample_link >= (uint16_t)(sf2->shdr_count - 1) || sh->sample_link == (uint16_t)sample_index) return -1;
+    other = &sf2->shdr[sh->sample_link];
+    other_type = other->sample_type & 0x7FFFu;
+    if (other->sample_link != (uint16_t)sample_index) return -1;
+    if (other_type != (type == SF2_SAMPLE_LEFT ? SF2_SAMPLE_RIGHT : SF2_SAMPLE_LEFT)) return -1;
+    return (int)sh->sample_link;
+}
+
 static wav_data* sf2_build_wav_for_sample(const sf2_file* sf2, int sample_index, wav_data** sample_cache) {
     const sf2_shdr_record* sh;
     uint16_t type;
@@ -746,8 +760,7 @@ static wav_data* sf2_build_wav_for_sample(const sf2_file* sf2, int sample_index,
 
     sh = &sf2->shdr[sample_index];
     type = sh->sample_type & 0x7FFFu;
-    if ((type == SF2_SAMPLE_LEFT || type == SF2_SAMPLE_RIGHT) &&
-        sh->sample_link < (uint16_t)(sf2->shdr_count - 1)) {
+    if (sf2_stereo_partner(sf2, sample_index) >= 0) {
         if (type == SF2_SAMPLE_LEFT) {
             right_index = (int)sh->sample_link;
         } else {
@@ -845,6 +858,7 @@ static int sf2_region_from_zone(sfz_instrument* inst,
     wav_data* sample;
     uint16_t sample_type;
     int linked_stereo = 0;
+    int stereo_partner;
     if (!inst || !sf2 || !inst_zone || !sf2_zone_has_sample(inst_zone)) return 0;
 
     sf2_zone_init(&merged);
@@ -859,15 +873,14 @@ static int sf2_region_from_zone(sfz_instrument* inst,
 
     sh = &sf2->shdr[merged.sample_id];
     sample_type = sh->sample_type & 0x7FFFu;
-    if (sample_type == SF2_SAMPLE_RIGHT &&
-        sh->sample_link < (uint16_t)(sf2->shdr_count - 1) &&
-        (sf2->shdr[sh->sample_link].sample_type & 0x7FFFu) == SF2_SAMPLE_LEFT) {
+    stereo_partner = sf2_stereo_partner(sf2, merged.sample_id);
+    if (sample_type == SF2_SAMPLE_RIGHT && stereo_partner >= 0) {
         return 0;
     }
 
     sample = sf2_build_wav_for_sample(sf2, merged.sample_id, sample_cache);
     if (!sample) return 0;
-    linked_stereo = (sample->num_channels == 2 && sf2_is_linked_stereo_type(sample_type));
+    linked_stereo = (sample->num_channels == 2 && stereo_partner >= 0);
 
     region = sfz_append_region(inst);
     if (!region) return 0;
