@@ -15,7 +15,9 @@
 Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
          --query=helpers=3 (appended to the page URL)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
-         --seek=S (app: at second S click the position slider near the start)
+         --seek=S (app: at second S click the position slider near the start; --seekx=X clicks at x=X)
+         --setting=NAME=VALUE (app: a saved WASMIDI setting before the page loads, e.g. noteSpeed=0.1)
+         --shot=S:OUT (app: screenshot at second S)
          --pause=S:D (app: pause at second S and resume D seconds later)
          --profile=S:D:OUT (app: CPU profile of the page's main thread from second S for D seconds,
                    saved to OUT for DevTools; prints the functions with the most self time.
@@ -137,6 +139,10 @@ async def main():
                 };
                 window.Worker.prototype = W.prototype;
             })()""")
+            settings = dict(f.split("=", 1)[1].split("=", 1) for f in flags if f.startswith("--setting="))
+            if settings:
+                await page.add_init_script("(s => { for (const k in s) localStorage.setItem('wasmidi.settings.v1.' + k, s[k]); })(%s)"
+                                           % json.dumps(settings))
             await page.goto(url + "/index.html" + qs)
             await page.wait_for_function("() => globalThis.crossOriginIsolated", timeout=60000)
             chosen = {"path": None, "done": 0}
@@ -178,11 +184,15 @@ async def main():
             trace = next((f.split("=", 1)[1].split(":", 2) for f in flags if f.startswith("--trace=")), None)
             cdp = await page.context.new_cdp_session(page) if profile or trace else None
             pause = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--pause=")), None)
+            seek_x = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--seekx=")), 963)
+            shot = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--shot=")), None)
             for second in range(int(seconds)):
                 if pause and second in (int(pause[0]), int(pause[0]) + int(pause[1])):
                     await page.mouse.click(943 if second == int(pause[0]) else 906, 88)  # pause, then play
                 if seek_at is not None and second == seek_at:
-                    await page.mouse.click(963, 60)  # position slider, about 18% of the song
+                    await page.mouse.click(seek_x, 60)  # position slider, about 18% of the song by default
+                if shot and second == int(shot[0]):
+                    await page.screenshot(path=shot[1])
                 if trace and second == int(trace[0]):
                     await browser.start_tracing(page=page, path=trace[2], categories=[
                         "toplevel", "blink", "v8", "gpu", "devtools.timeline", "disabled-by-default-devtools.timeline",
