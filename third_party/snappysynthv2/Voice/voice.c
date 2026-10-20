@@ -179,8 +179,11 @@ typedef enum {
     EVT_PITCH_BEND = 4,
     EVT_PROGRAM_CHANGE = 5,
     EVT_DRUM_PART = 6,
-    EVT_SCALE_TUNE = 7
+    EVT_SCALE_TUNE = 7,
+    EVT_SELECTOR_COPY = 8   // key: SELECTOR_*; worker-local selector state only
 } ch_event_type;
+
+enum { SELECTOR_BANK_MSB = 0, SELECTOR_BANK_LSB = 1, SELECTOR_PROGRAM = 2, SELECTOR_DRUM_PART = 3 };
 
 typedef struct {
     uint8_t type;
@@ -338,12 +341,12 @@ typedef struct {
     LONG last_key_off_epoch;
     uint32_t voice_age_counter;
 
-    LONG selector_cache_version[MIDI_CHANNEL_COUNT];
     int selector_program[MIDI_CHANNEL_COUNT];
-    int selector_bank_combined[MIDI_CHANNEL_COUNT];
     int selector_bank_msb[MIDI_CHANNEL_COUNT];
     int selector_bank_lsb[MIDI_CHANNEL_COUNT];
-    int selector_is_drum[MIDI_CHANNEL_COUNT];
+    int selector_applied_msb[MIDI_CHANNEL_COUNT];
+    int selector_applied_lsb[MIDI_CHANNEL_COUNT];
+    int selector_drum_part[MIDI_CHANNEL_COUNT];
 
     note_region_cache_entry *note_region_cache;
     note_single_region_cache_entry *note_single_region_cache;
@@ -441,6 +444,7 @@ static int    g_final_cap = 0;
 static float  g_global_mix_gain = 1.0f;
 static volatile LONG g_output_soft_clip_enabled = 1;
 static volatile LONG g_steal_cap_percent = 25;
+static int g_selector_copies = 0;  /* note events are not routed to the channel's worker */
 static int g_event_worker_count = 1; /* workers that process events: 1 in "single" sharding */
 void voice_set_steal_cap_percent(int percent) { InterlockedExchange(&g_steal_cap_percent, percent < 0 ? 0 : percent); }
 
@@ -657,10 +661,8 @@ static inline LONG load_relaxed_long(volatile LONG* value) {
     return *value;
 }
 
-static inline void channel_effective_banks(int ch, int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
-    int bank_msb = (int)load_relaxed_long(&g_channels[ch].applied_bank_msb) & 0x7F;
-    int bank_lsb = (int)load_relaxed_long(&g_channels[ch].applied_bank_lsb) & 0x7F;
-    int drum_part = (int)load_relaxed_long(&g_channels[ch].drum_part);
+static inline void selector_effective_banks(int ch, int bank_msb, int bank_lsb, int drum_part,
+                                            int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
     int gs_part_mode = (int)load_relaxed_long(&g_gs_part_mode);
     /* Channel 10 remains a rhythm channel across drum-kit Program Changes.
        XG uses bank MSB 127 for drum kits and 126 for SFX kits; GM2 uses 120
@@ -681,11 +683,35 @@ static inline void channel_effective_banks(int ch, int* out_combined, int* out_m
         if (combined < 128) {
             combined = 128 + bank_lsb;
         }
-        }
+    } else if (instrument && instrument->format == SOUND_FONT_FORMAT_SF2) {
+        combined = bank_msb ? bank_msb : bank_lsb;
+    }
         if (out_combined) *out_combined = combined;
         if (out_msb) *out_msb = bank_msb;
         if (out_lsb) *out_lsb = bank_lsb;
         if (out_is_drum_part) *out_is_drum_part = is_drum_part ? 1 : 0;
+}
+
+static inline void channel_effective_banks(int ch, int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
+    selector_effective_banks(ch,
+                             (int)load_relaxed_long(&g_channels[ch].applied_bank_msb) & 0x7F,
+                             (int)load_relaxed_long(&g_channels[ch].applied_bank_lsb) & 0x7F,
+                             (int)load_relaxed_long(&g_channels[ch].drum_part),
+                             out_combined, out_msb, out_lsb, out_is_drum_part);
+}
+
+static inline void worker_apply_selector(worker_data *wd, int ch, int kind, int value) {
+    switch (kind) {
+        case SELECTOR_BANK_MSB: wd->selector_bank_msb[ch] = value & 0x7F; break;
+        case SELECTOR_BANK_LSB: wd->selector_bank_lsb[ch] = value & 0x7F; break;
+        case SELECTOR_PROGRAM:
+            wd->selector_program[ch] = value & 0x7F;
+            wd->selector_applied_msb[ch] = wd->selector_bank_msb[ch];
+            wd->selector_applied_lsb[ch] = wd->selector_bank_lsb[ch];
+            break;
+        case SELECTOR_DRUM_PART: wd->selector_drum_part[ch] = value & 0x7F; break;
+        default: break;
+    }
 }
 
 static inline void worker_get_channel_selector(worker_data *wd, int ch,
@@ -694,30 +720,18 @@ static inline void worker_get_channel_selector(worker_data *wd, int ch,
                                                int *out_msb,
                                                int *out_lsb,
                                                int *out_is_drum_part) {
-    LONG version = load_relaxed_long(&g_channel_selector_version[ch]);
-    if (wd && wd->selector_cache_version[ch] == version) {
-        *out_program = wd->selector_program[ch];
-        *out_combined = wd->selector_bank_combined[ch];
-        *out_msb = wd->selector_bank_msb[ch];
-        *out_lsb = wd->selector_bank_lsb[ch];
-        *out_is_drum_part = wd->selector_is_drum[ch];
+    if (!wd) {
+        *out_program = (int)load_relaxed_long(&g_channels[ch].program);
+        channel_effective_banks(ch, out_combined, out_msb, out_lsb, out_is_drum_part);
         return;
     }
+    *out_program = wd->selector_program[ch];
+    selector_effective_banks(ch, wd->selector_applied_msb[ch], wd->selector_applied_lsb[ch],
+                             wd->selector_drum_part[ch],
+                             out_combined, out_msb, out_lsb, out_is_drum_part);
+}
 
-    *out_program = (int)load_relaxed_long(&g_channels[ch].program);
-    channel_effective_banks(ch, out_combined, out_msb, out_lsb, out_is_drum_part);
-
-    if (wd) {
-        wd->selector_program[ch] = *out_program;
-        wd->selector_bank_combined[ch] = *out_combined;
-        wd->selector_bank_msb[ch] = *out_msb;
-        wd->selector_bank_lsb[ch] = *out_lsb;
-        wd->selector_is_drum[ch] = *out_is_drum_part;
-        wd->selector_cache_version[ch] = version;
-    }
-                                               }
-
-                                               static inline int get_active_voice_count_estimate(void) {
+static inline int get_active_voice_count_estimate(void) {
                                                    return (int)load_relaxed_long(&g_active_voice_count);
                                                }
 
@@ -1364,7 +1378,49 @@ out->vor_token = 0;
                                                                                                                                                                                        return 1;
                                                                                                                                                                                    }
 
-                                                                                                                                                                                   static void enqueue_event(int ch, ch_event e) {
+                                                                                                                                                                                   static int selector_copy_kind(const ch_event *e) {
+    if (e->type == EVT_PROGRAM_CHANGE) return SELECTOR_PROGRAM;
+    if (e->type == EVT_DRUM_PART) return SELECTOR_DRUM_PART;
+    if (e->type == EVT_CONTROL_CHANGE && e->key == 0) return SELECTOR_BANK_MSB;
+    if (e->type == EVT_CONTROL_CHANGE && e->key == 32) return SELECTOR_BANK_LSB;
+    return -1;
+}
+
+static void enqueue_selector_copies(int owner, int qch, const ch_event *src) {
+    int kind;
+    if (!g_selector_copies) return;
+    kind = selector_copy_kind(src);
+    if (kind < 0) return;
+    for (int w = 0; w < g_worker_count; ++w) {
+        if (w == owner) continue;
+        event_queue *q = &g_workers[w].queues[qch];
+        LONG head = q->head;
+        LONG next = (head + 1) & CH_EVENT_QUEUE_MASK;
+        LONG tail = q->tail;
+        if (head != tail) {
+            LONG prev_slot = (head - 1 + CH_EVENT_QUEUE_SIZE) & CH_EVENT_QUEUE_MASK;
+            ch_event *prev = &q->events[prev_slot];
+            if (prev_slot != tail && prev->type == EVT_SELECTOR_COPY &&
+                prev->ch == qch && prev->key == kind) {
+                prev->value = src->value;
+                prev->timestamp_qpc = src->timestamp_qpc;
+                continue;
+            }
+        }
+        if (next == tail) continue;
+        ch_event copy = *src;
+        copy.type = EVT_SELECTOR_COPY;
+        copy.ch = (uint8_t)qch;
+        copy.key = (uint8_t)kind;
+        copy.clear_generation = 0;
+        copy.stack_count = 0;
+        copy.vor_token = 0;
+        q->events[head] = copy;
+        q->head = next;
+    }
+}
+
+static void enqueue_event(int ch, ch_event e) {
                                                                                                                                                                                      int qch = ch & 0x0F;
                                                                                                                                                                                      if (!load_relaxed_long(&g_voice_ready) || !g_workers || g_worker_count <= 0) {
                                                                                                                                                                                          return;
@@ -1411,6 +1467,7 @@ e.vor_token = 0;
                                                                                                                                                                                          }
                                                                                                                                                                                          if (w < 0) w = 0;
                                                                                                                                                                                          worker_data *wd = &g_workers[w];
+                                                                                                                                                                                         enqueue_selector_copies(w, qch, &e);
 
                                                                                                                                                                                      // NOTE-OFF PRIMARY PATH: always try the main event queue first.
                                                                                                                                                                                      // The overflow queue is a secondary spillway, not a primary route.
@@ -5316,6 +5373,7 @@ QueryPerformanceCounter(&ss_cc_begin);
                                                                                                                                                                                                                                                                 // High-frequency continuous controllers
 case 0:
 cs->bank_msb = val;
+worker_apply_selector(wd, e.ch, SELECTOR_BANK_MSB, val);
 break;
                                                                                                                                                                                                                                                                 case 1:  cs->mod_wheel = val; break;
                                                                                                                                                                                                                                                                 case 2:  cs->breath = val; break;
@@ -5335,6 +5393,7 @@ break;
                                                                                                                                                                                                                                                                 break;
 case 32:
 cs->bank_lsb = val;
+worker_apply_selector(wd, e.ch, SELECTOR_BANK_LSB, val);
 break;
 
                                                                                                                                                                                                                                                                 // Switches
@@ -5487,13 +5546,18 @@ channel_state *cs = &g_channels[e.ch];
 cs->program = e.value & 0x7F; // single-writer
 cs->applied_bank_msb = cs->bank_msb;
 cs->applied_bank_lsb = cs->bank_lsb;
+worker_apply_selector(wd, e.ch, SELECTOR_PROGRAM, e.value);
 InterlockedIncrement(&g_channel_selector_version[e.ch]);
 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_DRUM_PART) {
                                                                                                                                                                                                                                                                 g_channels[e.ch].drum_part = e.value & 0x7F; // single-writer
+                                                                                                                                                                                                                                                                worker_apply_selector(wd, e.ch, SELECTOR_DRUM_PART, e.value);
                                                                                                                                                                                                                                                                 InterlockedIncrement(&g_channel_selector_version[e.ch]);
                                                                                                                                                                                                                                                                 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                else if (e.type == EVT_SELECTOR_COPY) {
+                                                                                                                                                                                                                                                                worker_apply_selector(wd, e.ch, e.key, e.value);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_SCALE_TUNE) {
                                                                                                                                                                                                                                                                 int note = e.key % 12;
@@ -7117,6 +7181,7 @@ note_map_by_channel = (max_voices <= 4096) ? 2 : 0;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
+                                                                                                                                                                                                                                                                g_selector_copies = (note_map_by_channel == 0 && g_worker_count > 1);
                                                                                                                                                                                                                                                                 g_event_worker_count = (note_map_by_channel == 2) ? 1 : (g_worker_count > 0 ? g_worker_count : 1);
   for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
                                                                                                                                                                                                                                                                 /* "single" (SVMS, HANDOFF sec. 62): worker 0 processes every event; all workers
@@ -7161,12 +7226,12 @@ note_map_by_channel = (max_voices <= 4096) ? 2 : 0;
                                                                                                                                                                                                                                                                     MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT,
                                                                                                                                                                                                                                                                     sizeof(note_single_region_cache_entry));
                                                                                                                                                                                                                                                                 for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
-                                                                                                                                                                                                                                                                g_workers[w].selector_cache_version[ch] = -1;
                                                                                                                                                                                                                                                                 g_workers[w].selector_program[ch] = 0;
-                                                                                                                                                                                                                                                                g_workers[w].selector_bank_combined[ch] = 0;
                                                                                                                                                                                                                                                                 g_workers[w].selector_bank_msb[ch] = 0;
                                                                                                                                                                                                                                                                 g_workers[w].selector_bank_lsb[ch] = 0;
-                                                                                                                                                                                                                                                                g_workers[w].selector_is_drum[ch] = 0;
+                                                                                                                                                                                                                                                                g_workers[w].selector_applied_msb[ch] = 0;
+                                                                                                                                                                                                                                                                g_workers[w].selector_applied_lsb[ch] = 0;
+                                                                                                                                                                                                                                                                g_workers[w].selector_drum_part[ch] = 0;
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 // REMOVED: Broken steal bucket initialization

@@ -6600,3 +6600,67 @@ horizontal; y el teclado horizontal se seguía viendo dañado.
 
 - Un celular real. Escritorio con DPR distinto de 1 (las filas ahora pueden no llenar todo el alto: hasta
   ~11 px de margen).
+
+## 101. Revisión 104 — instrumentos General MIDI y batería en WasmiSynth
+
+### Pedido
+
+Dekx: WasmiSynth "nunca detecta bien las soundfonts General MIDI": en MIDIs de solo piano suenan
+instrumentos que no tienen nada que ver, con varios instrumentos se equivoca y la batería suena mal.
+Soundfont de prueba que mandó: Arachno SoundFont 1.0 (155 MB).
+
+### Causa
+
+La elección de preset en sí estaba bien: con FluidR3_GM y TimGM6mb, `sfz_find_region_for_program` da el
+preset correcto para los 128 programas del banco 0 y para la batería (banco 128). Los fallos eran tres:
+
+1. **Enlaces estéreo rotos de la SF2** (`sf2_parser.c`). Cada muestra LEFT/RIGHT se juntaba con la que
+   nombra su `sample_link` sin comprobar que esa apunte de vuelta. Arachno tiene 180 de 1397 muestras con
+   enlaces que no son pares (por ejemplo "Grand Piano 39", LEFT, enlazada a "Trombone C41", mono): el
+   piano salía con el trombón en el canal derecho. Además una muestra podía quedar en la tabla de varias
+   formas y `sfz_region_attach_sample_owned` liberaba un WAV que seguía en uso (ASan: heap-use-after-free;
+   en host se cae al cargar Arachno, en wasm no se cae pero esa memoria la reusan otras muestras). Las
+   mitades RIGHT cuyo enlace apuntaba a una LEFT ajena además se descartaban (notas que faltan).
+2. **Carrera entre program change y notas con reparto Hash** (`voice.c`, Auto usa Hash arriba de 4096
+   voces). El program change va a la cola del worker del canal y las notas a la del worker de su tecla;
+   las dos colas se consumen a la vez en el mismo ciclo, así que una nota en el mismo tramo que el program
+   change (lo normal al empezar la canción: PC y primera nota en el tick 0) leía el programa anterior
+   (piano). La frontera exacta para selectores de `ssw_render_queued_into` solo cubría "nota antes del selector", no "selector antes de
+   la nota", y con los dos en el mismo cuadro no hay frontera posible. Host, MIDI de 5 instrumentos, 4
+   workers, Hash, 12288 voces, 30 corridas: 46 notas con el programa equivocado.
+3. **Banco MSB 1 sonaba como batería** con SF2. Para un canal melódico el banco combinado era
+   `MSB·128 + LSB`, y con MSB 1 eso da 128, que en una SF2 es el banco de batería: el programa 0 sonaba con
+   el kit Standard. MSB 8 (variaciones GS) también perdía contra el banco 0 por coincidir el LSB.
+
+### Cambios
+
+- `sf2_parser.c`: `sf2_stereo_partner` solo acepta un par si las dos cabeceras se apuntan entre sí con
+  lados opuestos; cualquier otro enlace se toca como mono con el pan de la zona. Se usa al armar el WAV,
+  al descartar la mitad derecha y para el pan.
+- `voice.c`: cada worker guarda su propio estado de selector por canal (banco pendiente, banco aplicado,
+  programa, parte de batería) y las notas se resuelven con ese estado. Con Hash, `enqueue_event` manda
+  una copia `EVT_SELECTOR_COPY` del banco/programa/parte de batería a la cola del mismo canal de cada
+  otro worker, en el mismo orden que las notas; el worker dueño del canal sigue siendo el único que
+  escribe `g_channels`. Las copias seguidas del mismo tipo se pisan en la cola. En Single y Channel las
+  notas ya iban a la cola del canal: no hay copias.
+- `voice.c` (`selector_effective_banks`): con SF2, el banco melódico es el MSB, o el LSB si el MSB es 0
+  (como XG). La batería no cambia.
+
+### Medición / verificación
+
+- Arachno carga sin errores de ASan (4420 regiones); FluidR3 y TimGM6mb dan las mismas regiones que
+  antes (16912 y 2063). Selección por programa: 0 errores en las tres.
+- Motor real en host (`midibench` con traza por nota), Hash, 4 workers, 12288 voces, 30 corridas: notas
+  con programa equivocado 46 → 0. `pipeline_bench` (feed del parser) con un MIDI de Arachno ("Paul
+  Albrecht - Homeward"): Hash y Single dan los mismos programas y bancos por nota.
+- MIDI con banco MSB 1 + programa 0 en Arachno: antes banco 128 (kit de batería), ahora Grand Piano.
+- Pruebas de host del CI: sintaxis, `ssw_schedule_harness`, `worker_freelist_borrow_check`,
+  `worker_cycle_smoke`.
+
+### No verificado
+
+- En el navegador con Arachno y los MIDIs de Dekx.
+- Quedan diferencias de sonido de la SF2 que no cambian el instrumento: los generadores de la zona de
+  preset se combinan con reglas de instrumento (rangos que se cruzan con la zona global en vez de
+  reemplazarla, valores que se reemplazan en vez de sumarse), solo se toca una región por nota en SF2
+  (las capas de SFZ sí suenan todas) y no hay moduladores.
