@@ -28,8 +28,7 @@ ApplicationWindow {
     // horizontal roll with the phone header, panel and transport (HANDOFF sec. 97).
     readonly property bool compact: !phone && (height < 540 || width < 860)
     readonly property bool mobileUi: phone || compact
-    // A short window cannot fit 128 rows: notes fall onto a keyboard across it.
-    readonly property bool falling: phone || (compact && height < 540)
+    readonly property bool falling: phone
     property string phoneTab: ""
     onMobileUiChanged: phoneTab = ""
     readonly property var phoneTabs: [
