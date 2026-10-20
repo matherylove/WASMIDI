@@ -6503,3 +6503,30 @@ al reves, debe hacer caer las notas como synthesia".
 ### No verificado
 
 - Un celular real en ambas orientaciones.
+
+## 98. Revisión 101 — teclado del celular acostado
+
+### Pedido
+
+Dekx, con la rev. 100 en el celular acostado: "El teclado en horizontal se ve apilado, como apeñuzcado".
+
+### Causa
+
+El diseño compacto dejaba el roll horizontal con el teclado vertical a la izquierda: 128 filas en
+~150 px de alto (con la barra de Brave el roll queda en ~145 px), poco más de 1 px por tecla.
+
+### Cambios
+
+- `MainWindow.qml`: `falling` = `phone` o `compact` con menos de 540 px de alto. Con `falling` el roll usa
+  el modo vertical de la rev. 100 (notas que caen, teclado abajo a lo ancho). En el celular acostado el
+  teclado mide 36 px de alto y cada tecla ~5,7 px de ancho (128 en 740 px). Un compacto alto y angosto
+  (menos de 860 px de ancho y 540 o más de alto) sigue horizontal.
+
+### Verificación
+
+- Compilación wasm local OK. Chromium 740×270 y 844×390 con el MIDI sintético: teclado abajo con las
+  teclas legibles, notas cayendo e iluminando las teclas.
+
+### No verificado
+
+- Un celular real.

@@ -28,6 +28,8 @@ ApplicationWindow {
     // horizontal roll with the phone header, panel and transport (HANDOFF sec. 97).
     readonly property bool compact: !phone && (height < 540 || width < 860)
     readonly property bool mobileUi: phone || compact
+    // A short window cannot fit 128 rows: notes fall onto a keyboard across it.
+    readonly property bool falling: phone || (compact && height < 540)
     property string phoneTab: ""
     onMobileUiChanged: phoneTab = ""
     readonly property var phoneTabs: [
@@ -379,24 +381,24 @@ ApplicationWindow {
                         id: rollArea
                         anchors.fill: parent
                         anchors.margins: 2
-                        readonly property int keySize: window.phone ? 46 : 62
+                        readonly property int keySize: window.phone ? 46 : window.falling ? 36 : 62
 
                         Keyboard {
                             x: 0
-                            y: window.phone ? parent.height - height : 0
-                            width: window.phone ? parent.width : rollArea.keySize
-                            height: window.phone ? rollArea.keySize : parent.height
-                            portrait: window.phone
+                            y: window.falling ? parent.height - height : 0
+                            width: window.falling ? parent.width : rollArea.keySize
+                            height: window.falling ? rollArea.keySize : parent.height
+                            portrait: window.falling
                             mainWindow: mainWindow
                         }
 
                         PianoRoll {
                             id: roll
-                            x: window.phone ? 0 : rollArea.keySize
+                            x: window.falling ? 0 : rollArea.keySize
                             y: 0
-                            width: parent.width - (window.phone ? 0 : rollArea.keySize)
-                            height: parent.height - (window.phone ? rollArea.keySize : 0)
-                            portrait: window.phone
+                            width: parent.width - (window.falling ? 0 : rollArea.keySize)
+                            height: parent.height - (window.falling ? rollArea.keySize : 0)
+                            portrait: window.falling
                             mainWindow: mainWindow
                             onOpenRequested: mainWindow.openMidiPicker()
                         }
