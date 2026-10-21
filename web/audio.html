@@ -11,6 +11,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400..700&family=VT323&display=swap" rel="stylesheet" crossorigin="anonymous">
 <link rel="stylesheet" href="audio.css?v=dev">
 <script src="snappysynth_bridge.js?v=dev"></script>
+<script src="wasmidi-archive.js?v=dev"></script>
 </head>
 <body class="wa">
 <div class="wa-desk" id="desk">
@@ -66,10 +67,10 @@
         <button type="button" data-toggle="lyrics" aria-pressed="false" title="Lyrics and markers">LYR</button>
         <button type="button" data-toggle="graphs" aria-pressed="false" title="Graphs">GRAPH</button>
         <button type="button" data-toggle="vis" aria-pressed="false" title="Spectrum visualizer">VIS</button>
-        <span class="hint">Drop a .mid and a .sf2 or SFZ folder here</span>
+        <span class="hint">Drop a .mid and a .sf2 or SFZ folder here (also inside .zip, .7z or .xz)</span>
       </div>
-      <input type="file" id="midi-input" accept=".mid,.midi,.kar,audio/midi" hidden>
-      <input type="file" id="sf2-input" accept=".sf2,.sf3" hidden>
+      <input type="file" id="midi-input" accept=".mid,.midi,.kar,audio/midi,.zip,.7z,.xz,.txz,.gz" hidden>
+      <input type="file" id="sf2-input" accept=".sf2,.sf3,.zip,.7z,.xz,.txz,.gz" hidden>
       <input type="file" id="sfz-input" webkitdirectory multiple hidden>
     </div>
     <div class="win-status">

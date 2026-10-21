@@ -204,8 +204,8 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
     input.accept =
         isSf2
-            ? '.sf2'
-            : '.mid,.midi,audio/midi,audio/x-midi';
+            ? '.sf2,.zip,.7z,.xz,.txz,.gz'
+            : '.mid,.midi,audio/midi,audio/x-midi,.zip,.7z,.xz,.txz,.gz';
 
     input.style.position = 'fixed';
     input.style.left = '-10000px';
@@ -228,11 +228,15 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
     };
 
     input.onchange = async () => {
-        const file =
+        let file =
             input.files &&
             input.files.length
                 ? input.files[0]
                 : null;
+
+        if (file && !isSfz && globalThis.WasmidiArchive)
+            file = await globalThis.WasmidiArchive.resolve(
+                file, isSf2 ? 'soundfont' : 'midi');
 
         if (!file) {
             cleanup();
