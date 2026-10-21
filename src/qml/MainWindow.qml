@@ -641,6 +641,7 @@ ApplicationWindow {
     AdvancedDialog {
         id: advancedDialog
         mainWindow: mainWindow
+        toasts: lagNotices
     }
 
     ColorsDialog {
@@ -655,6 +656,7 @@ ApplicationWindow {
 
     // Notices at the top right of the roll.
     Toasts {
+        id: lagNotices
         parent: rollArea
         x: roll.x + roll.width - width - 6
         y: roll.y + 6

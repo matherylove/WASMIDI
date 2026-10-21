@@ -58,6 +58,7 @@ Item {
                     nps: dock.mw.nps
                     polyphony: dock.mw.activeVoices
                     sampling: dock.mw.hasMidi && dock.mw.isPlaying
+                    span: Math.max(0.1, dock.mw.noteSpeed)
                     accent: Dk.accent
                     lineColor: Dk.accentLight
                     polyColor: Dk.pink
@@ -87,7 +88,7 @@ Item {
                     font.pixelSize: 15
                 }
                 Text {
-                    text: Math.round(graph.span) + " S"
+                    text: Dk.number(graph.span, graph.span < 10 ? 1 : 0) + " S"
                     color: Dk.dim
                     font.family: Dk.term
                     font.pixelSize: 15

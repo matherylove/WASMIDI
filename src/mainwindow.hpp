@@ -123,6 +123,7 @@ class MainWindow : public QObject {
     // The color of the notes playing most, or the dekx violet when adapting is off.
     Q_PROPERTY(QColor accentColor READ accentColor NOTIFY accentColorChanged)
     Q_PROPERTY(bool adaptColors READ adaptColors WRITE setAdaptColors NOTIFY accentColorChanged)
+    Q_PROPERTY(bool lagLog READ lagLog WRITE setLagLog NOTIFY lagLogChanged)
 
 public:
     explicit MainWindow(QObject* parent = nullptr);
@@ -228,6 +229,7 @@ public:
     QVariantList channelColorList() const;
     QColor accentColor() const;
     bool adaptColors() const { return adaptColors_; }
+    bool lagLog() const { return lagLog_; }
 
     const wasmidi::MidiDocument& document() const { return document_; }
     const QVector<QColor>& channelColors() const { return channelColors_; }
@@ -274,6 +276,7 @@ public:
     Q_INVOKABLE void resetChannelColors();
     Q_INVOKABLE void importColorConfig();
     Q_INVOKABLE void exportColorConfig();
+    Q_INVOKABLE void downloadText(const QString& name, const QString& text);
     // Keyboard frames since the last call and how far its keys trail the
     // playhead, in seconds; read once per second by the lag warning.
     Q_INVOKABLE QVariantMap takeKeyboardSample();
@@ -284,6 +287,7 @@ public:
     void setPostBuffer(float buffer);
     void setPerTrackColors(bool enable);
     void setAdaptColors(bool enable);
+    void setLagLog(bool enable);
     void setVolume(int value);
     void setSynthMaxVoices(int value);
     void setSynthMinVoices(int value);
@@ -336,6 +340,7 @@ signals:
     void skippedVelocityChanged();
     void timelineChanged();
     void documentRevisionChanged();
+    void lagLogChanged();
     void transportRevisionChanged();
     void midiLoadingChanged();
     void synthStateChanged();
@@ -597,6 +602,7 @@ private:
 
     int dominantColor_ = -1;
     bool adaptColors_ = true;
+    bool lagLog_ = false;
     float peakPolyphonyTime_ = 0.0f;
     int keyboardFrames_ = 0;
 };

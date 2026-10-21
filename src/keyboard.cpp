@@ -21,10 +21,9 @@ struct KeyInstance {
     float kind, separator;
 };
 
-// Instance kinds: a key row (white face), a black key's row (white face with
-// the short divider) and the black bar drawn over it.
+// Instance kinds: a white face (a white key's row, or half of the row behind a
+// black key) and the black bar drawn over it.
 constexpr float KindWhiteRow = 0.0f;
-constexpr float KindBlackRow = 1.0f;
 constexpr float KindBlackBar = 2.0f;
 
 // Black bars cover the side next to the roll: 37 of the keyboard's 62 px.
@@ -114,8 +113,9 @@ void main()
     bool pressed = vColor.a > 0.5;
     vec3 pc = vColor.rgb;
     vec3 color;
-    // Rows under 4 px have no room for the 1 px dividers and edges.
-    bool fine = vSizePx.y >= 4.0;
+    // Rows under 4 px have no room for the 1 px dividers and edges
+    // (vKind.y 2: half of a black key's row).
+    bool fine = vSizePx.y * (vKind.y > 1.5 ? 2.0 : 1.0) >= 4.0;
 
     if (vKind.x > 1.5) {
         color = pressed
@@ -132,10 +132,7 @@ void main()
             : ramp(vec3(169.0, 159.0, 214.0) / 255.0,
                    vec3(239.0, 234.0, 255.0) / 255.0,
                    vec3(216.0, 208.0, 246.0) / 255.0, 0.55, t);
-        float mid = floor(vSizePx.y * 0.5);
-        if (fine && ((vKind.y > 0.5 && vLocal.y >= vSizePx.y - 1.0) ||
-            (vKind.x > 0.5 && vLocal.x < vSizePx.x * (24.0 / 62.0) &&
-             vLocal.y >= mid - 1.0 && vLocal.y < mid)))
+        if (fine && vKind.y > 0.5 && vLocal.y >= vSizePx.y - 1.0)
             color = mix(color, divider, 0.75);
         pressed = whitePressed;
     }
@@ -457,7 +454,7 @@ private:
         };
 
         keys_.clear();
-        keys_.reserve(128 + 53);
+        keys_.reserve(128 + 2 * 53);
 
         // One row per key on the same whole-pixel rows as the roll
         // (HANDOFF sec. 100), low notes at the bottom.
@@ -489,22 +486,37 @@ private:
             const float rowLow = edge(note);
             const float rowHeight = edge(note + 1) - rowLow;
 
-            keys_.push_back({
-                0.0f,
-                rowLow,
-                1.0f,
-                rowHeight,
-                color[0],
-                color[1],
-                color[2],
-                color[3],
-                isBlack
-                    ? KindBlackRow
-                    : KindWhiteRow,
-                separator
-            });
+            if (!isBlack) {
+                keys_.push_back({
+                    0.0f,
+                    rowLow,
+                    1.0f,
+                    rowHeight,
+                    color[0],
+                    color[1],
+                    color[2],
+                    color[3],
+                    KindWhiteRow,
+                    separator
+                });
+            } else {
+                // The white face behind a black key belongs to the white keys
+                // beside it: each half takes its neighbour's colour, with the
+                // divider between them.
+                const auto below = activeColor(note - 1);
+                const auto above = activeColor(note + 1);
+                const float half = rowHeight * 0.5f;
+                keys_.push_back({
+                    0.0f, rowLow, 1.0f, half,
+                    below[0], below[1], below[2], below[3],
+                    KindWhiteRow, 2.0f
+                });
+                keys_.push_back({
+                    0.0f, rowLow + half, 1.0f, rowHeight - half,
+                    above[0], above[1], above[2], above[3],
+                    KindWhiteRow, 0.0f
+                });
 
-            if (isBlack) {
                 keys_.push_back({
                     1.0f - BlackBarShare,
                     rowLow,

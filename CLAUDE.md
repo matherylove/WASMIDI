@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§100). Este archivo resume el estado al cierre de la rev. 103 y dice
+`HANDOFF.md` (§1-§101). Este archivo resume el estado al cierre de la rev. 104 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 103)
+## Estado actual (rev. 104)
 
 Rendimiento medido por el usuario:
 
@@ -304,6 +304,10 @@ Rendimiento medido por el usuario:
 - Rev. 103 (HANDOFF §100): el panel de pestañas del celular va debajo del teclado (vertical) o a la derecha
   del roll (acostado), no encima de las notas. Filas de teclas en píxeles enteros con octavas iguales
   (`keyEdge`, roll, fondo y teclado); FBO del teclado a resolución del dispositivo. Ícono de Colors y reloj.
+- Rev. 104 (HANDOFF §101): la franja blanca junto a cada tecla negra toma el color de las teclas blancas de
+  al lado. El gráfico NPS/polifonía muestra solo los segundos del note speed. El aviso de lag cuenta su
+  duración; "Lag log" (Advanced… → View) guarda totales por fuente, FPS mín/prom/máx y episodios con su
+  segundo del MIDI, y "Download" lo baja como texto. Se borra al cambiar el MIDI o la SoundFont.
 
 Mecanismos activos y cómo desactivarlos:
 
