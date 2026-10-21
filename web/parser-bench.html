@@ -56,7 +56,7 @@ runButton.addEventListener("click", async () => {
     if (!file) { closeStage(performance.now()); statusBox.textContent = "Extracción cancelada"; runButton.disabled = false; return; }
     closeStage(performance.now());
   }
-  const worker = new Worker("midi-parser-worker.js?bench=" + Date.now());
+  const worker = new Worker("midi-parser-worker.js?" + new URLSearchParams([...new URLSearchParams(location.search), ["bench", String(Date.now())]]));
 
   function closeStage(now) {
     if (!current) return;

@@ -243,18 +243,20 @@ bool browserReadAt(void*,
 }
 
 #if defined(__EMSCRIPTEN__) && WASMIDI_PARSER_BPFA
-// Synth feed helper (HANDOFF sec. 70): compressed source slabs shared by the parser
-// Worker as SharedArrayBuffers of sourceSlabBytes() each.
+// Synth feed helper (HANDOFF sec. 70, 109): compressed source slabs of sourceSlabBytes() each,
+// read from the parser Worker's shared heap at the addresses it sent.
 EM_JS(int, wmp_copy_feed_slab, (double physicalOffset, double byteCount, double destinationAddress), {
     const root = typeof globalThis !== "undefined" ? globalThis : self;
+    const heap = root.__wasmidiFeedHeap;
     const slabs = root.__wasmidiFeedSlabs;
     const slabBytes = root.__wasmidiFeedSlabBytes;
     const offset = Number(physicalOffset), count = Number(byteCount), destination = Number(destinationAddress);
-    if (!slabs || !slabBytes) return 0;
+    if (!heap || !slabs || !slabBytes) return 0;
     const index = Math.floor(offset / slabBytes), at = offset - index * slabBytes;
-    const slab = slabs[index];
-    if (!slab || at + count > slab.byteLength || destination + count > HEAPU8.length) return 0;
-    HEAPU8.set(new Uint8Array(slab, at, count), destination);
+    if (index >= slabs.length || at + count > slabBytes) return 0;
+    const from = slabs[index] + at;
+    if (from + count > heap.byteLength || destination + count > HEAPU8.length) return 0;
+    HEAPU8.set(new Uint8Array(heap, from, count), destination);
     return 1;
 });
 #endif
@@ -1102,9 +1104,30 @@ int wmp_track_table_js(double byteCount)
         g_trackTable.push_back(double((h[12] << 8) | h[13]));
         g_trackTable.push_back(double(wasmidi::BpfaMidiStore::blockSizeForTracks(tracks)));
         uint64_t position = 8ull + headerSize;
+        // Each read takes a window past the header so the next headers of short tracks come
+        // with it: 64 KiB, doubled up to 4 MiB while the headers keep landing just past the
+        // last window (HANDOFF sec. 114).
+        constexpr std::size_t WindowMin = 64u * 1024u, WindowMax = 4u * 1024u * 1024u;
+        std::vector<uint8_t> window(WindowMax);
+        std::size_t windowSize = WindowMin;
+        uint64_t windowBegin = 0, windowEnd = 0;
         for (uint16_t t = 0; t < tracks; ++t) {
-            uint8_t c[8];
-            if (position + 8 > size || !browserReadAt(nullptr, position, c, 8) || std::memcmp(c, "MTrk", 4) != 0) {
+            if (position + 8 > size) {
+                g_trackTable.clear();
+                return 0;
+            }
+            if (position < windowBegin || position + 8 > windowEnd) {
+                windowSize = windowEnd && position < windowEnd + windowSize ? std::min(windowSize * 2, WindowMax) : WindowMin;
+                const std::size_t amount = std::size_t(std::min<uint64_t>(windowSize, size - position));
+                if (!browserReadAt(nullptr, position, window.data(), amount)) {
+                    g_trackTable.clear();
+                    return 0;
+                }
+                windowBegin = position;
+                windowEnd = position + amount;
+            }
+            const uint8_t* c = window.data() + (position - windowBegin);
+            if (std::memcmp(c, "MTrk", 4) != 0) {
                 g_trackTable.clear();
                 return 0;
             }

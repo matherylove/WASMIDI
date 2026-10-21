@@ -133,13 +133,18 @@ if(EMSCRIPTEN)
     add_library(wasmidi_zstd STATIC ${WASMIDI_ZSTD_SOURCES})
     target_include_directories(wasmidi_zstd PUBLIC "${wasmidi_zstd_SOURCE_DIR}/lib")
     target_compile_definitions(wasmidi_zstd PRIVATE ZSTD_DISABLE_ASM=1 XXH_NAMESPACE=ZSTD_)
-    target_compile_options(wasmidi_zstd PRIVATE "-sMEMORY64=1" "-O3")
+    target_compile_options(wasmidi_zstd PRIVATE "-sMEMORY64=1" "-O3" "-pthread")
     target_link_libraries(midi_parser_core PRIVATE wasmidi_zstd)
 
     set_target_properties(midi_parser_core PROPERTIES
         OUTPUT_NAME "wasmidi-midi-parser"
         SUFFIX ".js"
     )
+    add_custom_command(TARGET midi_parser_core POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch_parser_shared_memory.py"
+            "$<TARGET_FILE:midi_parser_core>"
+        VERBATIM)
 
     target_include_directories(midi_parser_core PRIVATE src)
     target_compile_options(midi_parser_core PRIVATE
@@ -150,6 +155,9 @@ if(EMSCRIPTEN)
         # from Qt, so it can use 64-bit pointers without changing the Qt wasm32
         # renderer/player ABI. This removes the artificial 4 GiB parser heap.
         "-sMEMORY64=1"
+        # Shared heap (HANDOFF sec. 114): the decode helpers read the compressed
+        # source straight from it instead of from a copy.
+        "-pthread"
     )
     target_link_options(midi_parser_core PRIVATE
         -O3
@@ -176,6 +184,8 @@ if(EMSCRIPTEN)
         # this is the highest useful declaration rather than an app-imposed RAM
         # budget.
         "-sMEMORY64=1"
+        "-pthread"
+        "-sPTHREAD_POOL_SIZE=0"
         "-sALLOW_MEMORY_GROWTH=1"
         "-sINITIAL_MEMORY=67108864"
         "-sMAXIMUM_MEMORY=17179869184"

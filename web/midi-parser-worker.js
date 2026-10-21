@@ -261,7 +261,7 @@ function parserErrorText(Module, fallback) {
 
     try {
         return new TextDecoder("utf-8", { fatal: false }).decode(
-            Module.HEAPU8.subarray(address, end));
+            Module.HEAPU8.slice(address, end));
     } catch (_) {
         return String(fallback || "Could not parse MIDI");
     }
@@ -1907,18 +1907,13 @@ async function feedStartPool() {
     visualSpanMax = Math.min(1 << 23, Math.max(VISUAL_SPAN_WORDS, trackCount * 1024));
     const slabBytes = sizeToNumber(Module._wmp_source_slab_bytes_js(), "slab size");
     const slabCount = sizeToNumber(Module._wmp_source_slab_count_js(), "slab count");
-    const slabs = [];
-    try {
-        for (let i = 0; i < slabCount; ++i) {
-            const ptr = pointerToNumber(Module._wmp_source_slab_ptr_js(i), "slab pointer");
-            const sab = new SharedArrayBuffer(slabBytes);
-            new Uint8Array(sab).set(Module.HEAPU8.subarray(ptr, ptr + slabBytes));
-            slabs.push(sab);
-        }
-    } catch (error) {
-        console.warn("[WASMIDI synth feed] no memory for shared source slabs; decoding on one thread", error);
-        return;
-    }
+    // The helpers read the compressed source straight from this Worker's shared heap
+    // (HANDOFF sec. 114); the slabs never move or get freed while this Worker lives.
+    const heap = Module.HEAPU8.buffer;
+    if (!(heap instanceof SharedArrayBuffer)) return;
+    const slabs = new Float64Array(slabCount);
+    for (let i = 0; i < slabCount; ++i)
+        slabs[i] = pointerToNumber(Module._wmp_source_slab_ptr_js(i), "slab pointer");
     const url = new URL("midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
         WASMIDI_MIDI_PARSER_BASE_URL).href;
     const pool = { ready: false, failed: false, helpers: [], pending: [], visualPending: [], rollPending: [], rollBusy: null };
@@ -1949,7 +1944,7 @@ async function feedStartPool() {
         const copy = image.slice();
         worker.postMessage({
             type: "feed-init", baseUrl: WASMIDI_MIDI_PARSER_BASE_URL, version: WASMIDI_MIDI_PARSER_BOOTSTRAP,
-            image: copy.buffer, slabs, slabBytes
+            image: copy.buffer, heap, slabs, slabBytes
         }, [copy.buffer]);
     }
     pool.settled = Promise.allSettled(inits);
@@ -2251,7 +2246,10 @@ async function handleMessage(event) {
         // MPWGL2 was fast partly because it parsed from one contiguous buffer.
         // Keep that fast path for ordinary/large desktop MIDIs while retaining
         // the paged File-backed path for truly huge Black MIDI sources.
-        const fastSourceBytes = fastSourceLimitBytes();
+        // The BPFA store reads 8 MiB windows (and the track table 64 KiB ones), so the copy only
+        // added a full read before parsing and up to 1 GiB of RAM (HANDOFF sec. 114). ?fastsource=1
+        // keeps it.
+        const fastSourceBytes = pageOverride("fastsource") === 1 ? fastSourceLimitBytes() : 0;
         if (total > 0 && total <= fastSourceBytes &&
             typeof FileReaderSync === "function") {
             self.__wasmidiMidiParserStage = "Reading MIDI into fast source cache";

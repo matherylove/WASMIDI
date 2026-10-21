@@ -71,6 +71,7 @@ FILES = [
     "tools/host_posix_env_shim.h",
     "tools/midi_parser_bootstrap_smoke.cjs",
     "tools/patch_emscripten_memory64_growth.py",
+    "tools/patch_parser_shared_memory.py",
     "tools/regen_manifest.py",
     "tools/run_ci_step.py",
     "tools/dev_setup.sh",

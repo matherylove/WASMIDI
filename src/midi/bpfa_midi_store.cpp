@@ -339,6 +339,21 @@ void BpfaMidiStore::clear()
     renderPos_ = 0;
 }
 
+BpfaMidiStore::TrackSeekPoint BpfaMidiStore::seekPoint(uint64_t byteOffset, uint32_t tick, uint8_t runningStatus)
+{
+    return {tick, uint32_t(byteOffset), uint8_t(byteOffset >> 32), runningStatus};
+}
+
+BpfaMidiStore::TrackCheckpoint BpfaMidiStore::checkpointBefore(const TrackStorage& storage, uint32_t tick)
+{
+    const auto& cps = storage.checkpoints;
+    auto it = std::lower_bound(cps.begin(), cps.end(), tick,
+        [](const TrackSeekPoint& cp, uint32_t at) { return cp.tick < at; });
+    if (it != cps.begin()) --it;
+    return {uint64_t(it->offsetHigh) << 32 | it->offsetLow, uint64_t(it - cps.begin()) * CheckpointEventInterval,
+            it->tick, it->runningStatus};
+}
+
 std::size_t BpfaMidiStore::memoryBytes() const
 {
     std::size_t bytes = fileBytes_.capacity() + sourceSlabs_.size() * SourceSlabSize +
@@ -348,7 +363,7 @@ std::size_t BpfaMidiStore::memoryBytes() const
         longNotes_.capacity() * sizeof(LongNote) + noteBlocks_.capacity() * sizeof(NoteBlock) +
         stateEvents_.capacity() * sizeof(SeekStateEvent);
     for (const auto& t : tracks_) {
-        bytes += t.checkpoints.capacity() * sizeof(TrackCheckpoint);
+        bytes += t.checkpoints.capacity() * sizeof(TrackSeekPoint);
         for (const auto& v : t.snapshots) bytes += sizeof(VisualSnapshot) + v.notes.capacity() * sizeof(SnapshotNote);
         for (const auto& v : t.liveSnapshots) bytes += sizeof(LiveSnapshotPoint) + v.keys.capacity() * sizeof(LiveSnapshotKey);
     }
@@ -363,7 +378,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
     auto report = [&](int p, const char* stage) { if (progress) progress(progressUser, p, stage); };
     try {
         if (!readAt || size < 14) { error_ = "MIDI data is too short"; return false; }
-        if (size > std::numeric_limits<std::size_t>::max()) { error_ = "MIDI file is too large"; return false; }
+        if (size > std::numeric_limits<std::size_t>::max() || size >= (uint64_t(1) << 40)) { error_ = "MIDI file is too large"; return false; }
 
         // BPFA source blocks, streamed: the raw file is never resident (HANDOFF sec. 49).
         readAt_ = readAt;
@@ -469,7 +484,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             const uint64_t liveBudget = std::max<uint64_t>(
                 2048u, LiveSnapshotBudgetKeys * (tracks_[t].byteEnd - tracks_[t].byteBegin) / snapshotBytes);
             TrackStorage& storage = tracks_[t];
-            storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
+            storage.checkpoints.push_back(seekPoint(storage.byteBegin, 0, 0));
             storage.channelEnd = storage.byteBegin;
             uint64_t events = 0, order = 0;
             FirstNote& first = firstNotes_[t];
@@ -580,7 +595,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 ++events;
                 storage.channelEnd = d.position;
                 if ((events % CheckpointEventInterval) == 0)
-                    storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
+                    storage.checkpoints.push_back(seekPoint(d.position, d.tick, d.runningStatus));
                 if ((events % snapshotInterval) == 0 && openCount <= SnapshotMaxNotes &&
                     openCount <= trackSnapshotBudget) {
                     while (snapshotNotesUsed + openCount > trackSnapshotBudget) {
@@ -859,10 +874,7 @@ void BpfaMidiStore::mergeReset(MergeCursor& m, uint32_t startTick, bool notesOnl
     };
     for (uint16_t t = 0; t < tracks_.size(); ++t) {
         const TrackStorage& storage = tracks_[t];
-        const auto& cps = storage.checkpoints;
-        auto it = std::lower_bound(cps.begin(), cps.end(), startTick,
-            [](const TrackCheckpoint& cp, uint32_t tick) { return cp.tick < tick; });
-        const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+        const TrackCheckpoint cp = checkpointBefore(storage, startTick);
         Cursor& c = m.cursors[t];
         c.position = cp.byteOffset;
         c.end = cursorEnd(storage);
@@ -1059,8 +1071,12 @@ void BpfaMidiStore::decodeTrackUntil(Cursor& c, uint32_t endTick, std::vector<Fe
             uint8_t rs = d.runningStatus;
             uint64_t nextIndex = c.nextIndex;
             std::size_t used = out.size();
-            // Room for every event the remaining block bytes could hold (>= 2 bytes each).
-            out.resize(used + std::size_t(limit - p) / 2u + 1u);
+            // Room for every event the remaining block bytes could hold (>= 2 bytes each),
+            // growing by a quarter instead of doubling: the span buffers keep their largest size
+            // (HANDOFF sec. 114).
+            const std::size_t room = used + std::size_t(limit - p) / 2u + 1u;
+            if (room > out.capacity()) out.reserve(std::max(room, out.capacity() + out.capacity() / 4u));
+            out.resize(room);
             while (p < limit) {
                 const uint8_t* const start = p;
                 uint32_t delta = *p & 0x7fu;
@@ -1299,7 +1315,7 @@ void BpfaMidiStore::feedDecodeChunk(std::vector<Cursor>& cursors, const uint32_t
         for (std::size_t t = 0; t < trackCount; ++t) {
             const uint32_t end = feedTrackEnd_[t];
             visRaw_.insert(visRaw_.end(), feedRaw_.begin() + begin, feedRaw_.begin() + end);
-            visRawTrack_.resize(visRaw_.size(), uint16_t(t));
+            visualMarkRun(t);
             begin = end;
         }
     }
@@ -1681,10 +1697,7 @@ bool BpfaMidiStore::buildFeedRequest(uint64_t firstBlock, uint32_t blocks, uint3
     putPod(request, uint32_t(std::min<uint32_t>(feedConfig_.velocityFloor, 127u)));
     putArray(request, edge.data(), edge.size());
     for (const TrackStorage& storage : tracks_) {
-        const auto& cps = storage.checkpoints;
-        auto it = std::lower_bound(cps.begin(), cps.end(), edge[0],
-            [](const TrackCheckpoint& cp, uint32_t tick) { return cp.tick < tick; });
-        const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+        const TrackCheckpoint cp = checkpointBefore(storage, edge[0]);
         putPod(request, cp.byteOffset);
         putPod(request, cp.eventIndex);
         putPod(request, cp.tick);
@@ -1700,7 +1713,7 @@ bool BpfaMidiStore::decodeFeedRequest(const uint8_t* data, std::size_t size, std
     if (visual) {
         visual->clear();
         visRaw_.clear();
-        visRawTrack_.clear();
+        visRawRuns_.clear();
     }
     PodReader in{data, size};
     if (!valid_ || in.get<uint32_t>() != FeedRequestMagic || in.get<uint32_t>() != tracks_.size()) {
@@ -2692,57 +2705,78 @@ void BpfaMidiStore::visualDecodeSpan(std::vector<Cursor>& cursors, uint32_t endT
     events.clear();
     tracks.clear();
     visRaw_.clear();
-    visRawTrack_.clear();
+    visRawRuns_.clear();
     anyLeft = false;
     for (std::size_t t = 0; t < cursors.size(); ++t) {
-        const std::size_t before = visRaw_.size();
         decodeTrackUntil(cursors[t], endTick, visRaw_);
-        visRawTrack_.resize(visRaw_.size(), uint16_t(t));
-        (void)before;
+        visualMarkRun(t);
         anyLeft = anyLeft || !cursors[t].finished;
     }
     visualOrderRaw(events, tracks);
+}
+
+void BpfaMidiStore::visualMarkRun(std::size_t track)
+{
+    const uint32_t begin = visRawRuns_.empty() ? 0u : visRawRuns_.back().end;
+    if (visRaw_.size() > begin) visRawRuns_.push_back(VisualRawRun{uint32_t(visRaw_.size()), uint32_t(track)});
 }
 
 void BpfaMidiStore::visualOrderRaw(std::vector<EventWord>& events, std::vector<uint16_t>& tracks)
 {
     events.clear();
     tracks.clear();
-    visOrder_.clear();
-    visOrder_.reserve(visRaw_.size());
-    uint32_t low = ~0u, high = 0;
-    for (uint32_t i = 0; i < visRaw_.size(); ++i) {
-        const uint32_t type = visRaw_[i].packed & 0xf0u;
-        if (type == 0x80u || type == 0x90u || type >= 0xb0u) {
-            visOrder_.push_back(i);
-            low = std::min(low, visRaw_[i].tick);
-            high = std::max(high, visRaw_[i].tick);
-        }
+    if (visRaw_.empty()) return;
+    const auto kept = [](uint32_t packed) {
+        const uint32_t type = packed & 0xf0u;
+        return type == 0x80u || type == 0x90u || type >= 0xb0u;
+    };
+    // Each run is in tick order, so its ends bound the ticks.
+    uint32_t low = ~0u, high = 0, begin = 0;
+    for (const VisualRawRun& run : visRawRuns_) {
+        low = std::min(low, visRaw_[begin].tick);
+        high = std::max(high, visRaw_[run.end - 1u].tick);
+        begin = run.end;
     }
-    if (visOrder_.empty()) return;
     // The words are in (track, tick) order: a counting sort by tick keeps that order within
-    // a tick, like the stable sort, without the n log n over 9679 runs (HANDOFF sec. 82).
+    // a tick, like the stable sort, without the n log n over 9679 runs (HANDOFF sec. 82). The
+    // passes walk the track runs instead of a per-word track and index (HANDOFF sec. 114).
     const uint64_t range = uint64_t(high) - low + 1u;
-    if (range > uint64_t(visOrder_.size()) * 4u + 65536u) {
+    if (range > uint64_t(visRaw_.size()) * 4u + 65536u) {
+        visOrder_.clear();
+        for (uint32_t i = 0; i < visRaw_.size(); ++i)
+            if (kept(visRaw_[i].packed)) visOrder_.push_back(i);
         std::stable_sort(visOrder_.begin(), visOrder_.end(),
             [this](uint32_t a, uint32_t b) { return visRaw_[a].tick < visRaw_[b].tick; });
         events.reserve(visOrder_.size());
         tracks.reserve(visOrder_.size());
         for (uint32_t index : visOrder_) {
             events.push_back(EventWord{visRaw_[index].tick, visRaw_[index].packed});
-            tracks.push_back(visRawTrack_[index]);
+            const auto run = std::upper_bound(visRawRuns_.begin(), visRawRuns_.end(), index,
+                [](uint32_t at, const VisualRawRun& r) { return at < r.end; });
+            tracks.push_back(uint16_t(run->track));
         }
+        std::vector<uint32_t>().swap(visOrder_);
         return;
     }
     visTickCount_.assign(std::size_t(range) + 1u, 0u);
-    for (uint32_t index : visOrder_) ++visTickCount_[visRaw_[index].tick - low + 1u];
+    for (const FeedWord& w : visRaw_)
+        if (kept(w.packed)) ++visTickCount_[w.tick - low + 1u];
     for (std::size_t i = 1; i < visTickCount_.size(); ++i) visTickCount_[i] += visTickCount_[i - 1];
-    events.resize(visOrder_.size());
-    tracks.resize(visOrder_.size());
-    for (uint32_t index : visOrder_) {
-        const uint32_t at = visTickCount_[visRaw_[index].tick - low]++;
-        events[at] = EventWord{visRaw_[index].tick, visRaw_[index].packed};
-        tracks[at] = visRawTrack_[index];
+    const std::size_t count = visTickCount_.back();
+    if (count == 0) return;
+    events.resize(count);
+    tracks.resize(count);
+    begin = 0;
+    for (const VisualRawRun& run : visRawRuns_) {
+        const uint16_t track = uint16_t(run.track);
+        for (uint32_t i = begin; i < run.end; ++i) {
+            const FeedWord& w = visRaw_[i];
+            if (!kept(w.packed)) continue;
+            const uint32_t at = visTickCount_[w.tick - low]++;
+            events[at] = EventWord{w.tick, w.packed};
+            tracks[at] = track;
+        }
+        begin = run.end;
     }
 }
 
@@ -3306,10 +3340,7 @@ bool BpfaMidiStore::buildVisualRequest(uint32_t startTick, uint32_t endTick, std
     putPod(request, startTick);
     putPod(request, endTick);
     for (const TrackStorage& storage : tracks_) {
-        const auto& cps = storage.checkpoints;
-        auto it = std::lower_bound(cps.begin(), cps.end(), startTick,
-            [](const TrackCheckpoint& cp, uint32_t tick) { return cp.tick < tick; });
-        const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+        const TrackCheckpoint cp = checkpointBefore(storage, startTick);
         putPod(request, cp.byteOffset);
         putPod(request, cp.eventIndex);
         putPod(request, cp.tick);
@@ -3943,10 +3974,7 @@ void BpfaMidiStore::liveDensityDecode(const LiveRequest& r)
     const uint32_t densityTick = static_cast<uint32_t>(std::floor(densityStart));
     std::vector<FeedWord> points;
     for (uint16_t t = 0; t < tracks_.size(); ++t) {
-        const auto& cps = tracks_[t].checkpoints;
-        auto it = std::lower_bound(cps.begin(), cps.end(), densityTick,
-            [](const TrackCheckpoint& cp, uint32_t at) { return cp.tick < at; });
-        const TrackCheckpoint& cp = it == cps.begin() ? cps.front() : *(it - 1);
+        const TrackCheckpoint cp = checkpointBefore(tracks_[t], densityTick);
         Cursor c;
         c.position = cp.byteOffset;
         c.end = cursorEnd(tracks_[t]);
@@ -5008,7 +5036,7 @@ void BpfaMidiStore::exportPartial(const MidiDocument& out, const std::vector<uin
         w.bytes(f.order.data(), sizeof(f.order));
         w.bytes(f.closeOrder.data(), sizeof(f.closeOrder));
         w.put(uint64_t(tr.checkpoints.size()));
-        w.bytes(tr.checkpoints.data(), tr.checkpoints.size() * sizeof(TrackCheckpoint));
+        w.bytes(tr.checkpoints.data(), tr.checkpoints.size() * sizeof(TrackSeekPoint));
         w.put(uint64_t(tr.snapshots.size()));
         for (const VisualSnapshot& v : tr.snapshots) {
             w.put(v.resume);
@@ -5074,6 +5102,7 @@ bool BpfaMidiStore::beginMerge(uint64_t size, uint16_t format, uint16_t trackCou
                                uint32_t blockSize, bool compressed)
 {
     clear();
+    if (size >= (uint64_t(1) << 40)) { error_ = "MIDI file is too large"; return false; }
     try {
         sourceSize_ = size;
         sourceBlockSize_ = blockSize;
@@ -5229,10 +5258,10 @@ bool BpfaMidiStore::mergePartial(const uint8_t* data, std::size_t size)
             p = r.take(sizeof(f.closeOrder));
             if (p) std::memcpy(f.closeOrder.data(), p, sizeof(f.closeOrder));
             const uint64_t nc = r.get<uint64_t>();
-            p = r.take(static_cast<std::size_t>(nc * sizeof(TrackCheckpoint)));
+            p = r.take(static_cast<std::size_t>(nc * sizeof(TrackSeekPoint)));
             if (!r.ok) break;
             tr.checkpoints.resize(static_cast<std::size_t>(nc));
-            std::memcpy(tr.checkpoints.data(), p, static_cast<std::size_t>(nc * sizeof(TrackCheckpoint)));
+            std::memcpy(tr.checkpoints.data(), p, static_cast<std::size_t>(nc * sizeof(TrackSeekPoint)));
             const uint64_t ns = r.get<uint64_t>();
             tr.snapshots.resize(static_cast<std::size_t>(ns));
             for (VisualSnapshot& v : tr.snapshots) {
