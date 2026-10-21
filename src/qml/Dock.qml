@@ -54,6 +54,7 @@ Item {
                     id: graph
                     anchors.fill: parent
                     anchors.margins: 2
+                    clip: true
                     time: dock.mw.currentTime
                     nps: dock.mw.nps
                     polyphony: dock.mw.activeVoices
