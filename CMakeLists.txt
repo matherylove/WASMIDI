@@ -279,7 +279,31 @@ if(EMSCRIPTEN)
         "-lworkerfs.js"
     )
 
-    add_dependencies(wasmidi midi_parser_core snappysynth_core)
+    # Archive reader (HANDOFF sec. 110): LZMA / LZMA2 from the public-domain LZMA SDK,
+    # a small wasm32 module for web/archive-worker.js.
+    add_executable(archive_core
+        src/archive/archive_codec.c
+        third_party/lzma/LzmaDec.c
+        third_party/lzma/Lzma2Dec.c
+    )
+    set_target_properties(archive_core PROPERTIES
+        OUTPUT_NAME "wasmidi-archive-core"
+        SUFFIX ".js"
+    )
+    target_include_directories(archive_core PRIVATE third_party/lzma)
+    target_compile_options(archive_core PRIVATE -O3)
+    target_link_options(archive_core PRIVATE
+        -O3
+        "-sMODULARIZE=1"
+        "-sEXPORT_NAME=WasmidiArchiveCore"
+        "-sENVIRONMENT=worker,node"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sMAXIMUM_MEMORY=4294967296"
+        "-sFILESYSTEM=0"
+        "-sEXPORTED_FUNCTIONS=['_wa_dec_new','_wa_dec_free','_wa_dec_input','_wa_dec_input_capacity','_wa_dec_run','_wa_dec_consumed','_wa_dec_out_ptr','_wa_dec_out_size','_malloc','_free']"
+    )
+
+    add_dependencies(wasmidi midi_parser_core snappysynth_core archive_core)
 
     # Qt for WebAssembly owns the generated HTML/JS/WASM packaging.
     target_link_options(wasmidi PRIVATE

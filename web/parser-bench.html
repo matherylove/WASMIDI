@@ -18,7 +18,7 @@
 <h1>WASMIDI parser benchmark</h1>
 <p>Carga un MIDI con el mismo worker del parser que usa la app y mide cuánto dura cada etapa.
 No reproduce audio ni dibuja nada.</p>
-<p><input id="file" type="file" accept=".mid,.midi,audio/midi"> <button id="run" disabled>Medir</button></p>
+<p><input id="file" type="file" accept=".mid,.midi,audio/midi,.zip,.7z,.xz,.txz,.gz"> <button id="run" disabled>Medir</button></p>
 <div id="status"></div>
 <table id="stages" hidden>
   <thead><tr><th>Etapa</th><th class="num">Duración</th><th class="num">%</th></tr></thead>
@@ -26,6 +26,7 @@ No reproduce audio ni dibuja nada.</p>
 </table>
 <h2>Resultado para copiar</h2>
 <pre id="report">—</pre>
+<script src="wasmidi-archive.js?v=dev"></script>
 <script>
 "use strict";
 const fileInput = document.getElementById("file");
@@ -39,8 +40,8 @@ fileInput.addEventListener("change", () => { runButton.disabled = !fileInput.fil
 
 function fmt(ms) { return ms >= 10000 ? (ms / 1000).toFixed(1) + " s" : Math.round(ms) + " ms"; }
 
-runButton.addEventListener("click", () => {
-  const file = fileInput.files[0];
+runButton.addEventListener("click", async () => {
+  let file = fileInput.files[0];
   if (!file) return;
   runButton.disabled = true;
   tbody.textContent = "";
@@ -48,6 +49,13 @@ runButton.addEventListener("click", () => {
   const stages = [];
   let current = null;
   const t0 = performance.now();
+  if (WasmidiArchive.isArchive(file)) {
+    const archiveName = file.name;
+    current = { stage: "Extracción de " + archiveName, start: t0, percent: 0 };
+    file = await WasmidiArchive.open(file, { kind: "midi" });
+    if (!file) { closeStage(performance.now()); statusBox.textContent = "Extracción cancelada"; runButton.disabled = false; return; }
+    closeStage(performance.now());
+  }
   const worker = new Worker("midi-parser-worker.js?bench=" + Date.now());
 
   function closeStage(now) {
