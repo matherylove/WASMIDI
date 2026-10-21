@@ -419,10 +419,10 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
     const Spans = await helper();
 
     // A reset inside the held stream keeps it (HANDOFF sec. 89): these checks restart it first.
-    const sweep = (stream, spans) => {
+    const sweep = (stream, spans, perTrack = 0) => {
         Module._wmp_visual_config_js(stream ? 1 : 0, spans ? 0 : 1);
         Module._wmp_live_restart_js(0);
-        Module._wmp_reset_render_cursor_js(0, 0);
+        Module._wmp_reset_render_cursor_js(0, perTrack);
         const appends = [], closes = [];
         for (let guard = 0; guard < 100000; ++guard) {
             if (spans && !Module._wmp_visual_done_js()) {
@@ -455,6 +455,23 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
         if (!same(r.appends, merge.appends) || !same(r.closes, merge.closes))
             throw new Error("Visual stream (" + name + ") differs from the merge sweep: " +
                 r.appends.length / 3 + "/" + merge.appends.length / 3 + " notes");
+    }
+
+    // Colors per track with the fold (HANDOFF sec. 108): the same notes on every path, fewer than unfolded.
+    for (const name of ["_wmp_roll_summary_js", "_wmp_render_fold_js"]) {
+        if (typeof Module[name] !== "function")
+            throw new Error("Missing generated export " + name);
+    }
+    const tracksAll = sweep(false, false, 1);
+    Module._wmp_render_fold_js(Math.max(2, Math.floor(maxTick / 16)), 64);
+    const foldMerge = sweep(false, false, 1), foldLocal = sweep(true, false, 1), foldSpans = sweep(true, true, 1);
+    Module._wmp_render_fold_js(0, 0);
+    if (!foldMerge.appends.length || foldMerge.appends.length > tracksAll.appends.length)
+        throw new Error("Visual smoke: fold per track gave " + foldMerge.appends.length / 3 + " of " + tracksAll.appends.length / 3 + " notes");
+    for (const [name, r] of [["local", foldLocal], ["helper", foldSpans]]) {
+        if (!same(r.appends, foldMerge.appends) || !same(r.closes, foldMerge.closes))
+            throw new Error("Folded stream (" + name + ") differs from the merge sweep: " +
+                r.appends.length / 3 + "/" + foldMerge.appends.length / 3 + " notes");
     }
 
     // Joint spans (HANDOFF sec. 85): one helper decode gives the feed result and the visual span.

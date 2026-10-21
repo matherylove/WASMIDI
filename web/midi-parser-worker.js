@@ -657,6 +657,12 @@ function sweepYield() {
     });
 }
 
+// Roll summaries (HANDOFF sec. 108) for the sweep in channel colors; ?rollsummary=0 reads every word.
+// Colors per track do not use them, so neither this Worker nor the helpers compute them then.
+function rollSummaryOn() {
+    return pageOverride("rollsummary") !== 0 && !sharpRenderPerTrack;
+}
+
 async function drainSharpRenderer() {
     if (sharpRenderRunning)
         return;
@@ -803,6 +809,13 @@ async function requestSharpRenderer(message) {
         sharpRenderCompletedTarget = startTick > 0 ? (startTick - 1) >>> 0 : 0;
         sharpRenderSafeThrough = sharpRenderCompletedTarget;
         sharpRenderReady = true;
+        if (typeof Module._wmp_roll_summary_js === "function")
+            Module._wmp_roll_summary_js(rollSummaryOn() ? 1 : 0);
+        // ?rollfold=0: colors per track send every note, also those that cover no pixel (HANDOFF sec. 108).
+        if (typeof Module._wmp_render_fold_js === "function") {
+            const fold = pageOverride("rollfold") !== 0;
+            Module._wmp_render_fold_js(fold ? Number(message.foldWindow) >>> 0 : 0, fold ? Number(message.foldPixels) >>> 0 : 0);
+        }
         Module._wmp_reset_render_cursor_js(startTick, perTrack ? 1 : 0);
         // A start inside the held stream keeps it and the spans in flight (HANDOFF sec. 89).
         const kept = typeof Module._wmp_visual_kept_js === "function" && Module._wmp_visual_kept_js() === 1;
@@ -1933,7 +1946,7 @@ function feedDispatch() {
         helper.busy = entry;
         helper.since = performance.now();
         helper.worker.postMessage({ type: entry.kind === "visual" ? "visual-decode" : entry.kind === "joint" ? "joint-decode" : "feed-decode",
-            id: entry.id, request: entry.request.buffer }, [entry.request.buffer]);
+            id: entry.id, request: entry.request.buffer, rollSummary: rollSummaryOn() }, [entry.request.buffer]);
         entry.request = null;
     }
 }
@@ -2224,6 +2237,8 @@ async function handleMessage(event) {
         // feed chase it. ?jointdecode=1 keeps them.
         jointOn = pageOverride("jointdecode") === 1 || (!visualAhead && pageOverride("jointdecode") !== 0);
         Module._wmp_visual_config_js(visualStreamOn ? 1 : 0, 1);
+        if (typeof Module._wmp_roll_summary_js === "function")
+            Module._wmp_roll_summary_js(rollSummaryOn() ? 1 : 0);
         const ok = await parallelParse(Module, file, total, total > rawLimit) ||
             Module._wmp_parse_file_js(total);
         if (!ok) {

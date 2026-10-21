@@ -61,6 +61,12 @@ for pt in 0 1; do for w in "0 40" "5.5 20"; do
   ./render_compare_bpfa /tmp/feeder_synth.mid $1 $2 $pt /tmp/rb.bin 2>/dev/null
   cmp -s /tmp/ra.bin /tmp/rb.bin && echo "render perTrack=$pt start=$1 IDENTICAL" || echo "render perTrack=$pt start=$1 DIFFER"
 done; done
+# Colors per track with the fold (HANDOFF sec. 108): BPFA's folded sweep = old sweep filtered by pixel centres.
+for fold in 4000:640 40000:64 100000:32; do
+  FOLD=$fold ./render_compare_old /tmp/feeder_synth.mid 0 40 1 /tmp/ra.bin 2>/dev/null
+  FOLD=$fold ./render_compare_bpfa /tmp/feeder_synth.mid 0 40 1 /tmp/rb.bin 2>/dev/null
+  [ -s /tmp/ra.bin ] && cmp -s /tmp/ra.bin /tmp/rb.bin && echo "render fold $fold IDENTICAL" || echo "render fold $fold DIFFER"
+done
 ./live_compare_old /tmp/feeder_synth.mid /tmp/la.bin 0 5 2.5 30 1 2>/dev/null
 ./live_compare_bpfa /tmp/feeder_synth.mid /tmp/lb.bin 0 5 2.5 30 1 2>/dev/null
 cmp -s /tmp/la.bin /tmp/lb.bin && echo "live snapshots IDENTICAL" || echo "live snapshots DIFFER"

@@ -149,6 +149,12 @@ public:
     void setVisualPlan(std::size_t planWords);
     // Full mode (HANDOFF sec. 89): the stream keeps every word, behind the readers too.
     void setVisualKeepAll(bool keepAll) { visualKeepAll_ = keepAll; }
+    // Roll summaries (HANDOFF sec. 108): the helpers send them with each span and the sweep in
+    // channel colors applies whole segments from them; off, it reads every word.
+    void setRollSummaryEnabled(bool enabled) { rollSummaryEnabled_ = enabled; }
+    // Colors per track (HANDOFF sec. 108): a note that covers no pixel centre of a roll `pixels`
+    // wide per `windowTicks` is never sent. 0 sends every note; applies from the next reset.
+    void setRenderFold(uint32_t windowTicks, uint32_t pixels) { foldWindow_ = windowTicks; foldPixels_ = pixels; }
     uint64_t visualHeldWords() const { return visEnd_ - visBase_; }
     uint64_t visualHeldBytes() const { return visHeldBytes_; }
     // One span decoded on this thread past the head while the plan has room (the prefill
@@ -535,11 +541,33 @@ private:
     // group, then runs of words sharing status, data 2 and copy count, one byte per word, with
     // a mark every VisualMarkWords words for seeking (HANDOFF sec. 88).
     struct VisualMark { uint64_t word; uint32_t byte, tick, track; };
+    // Roll summary (HANDOFF sec. 108): per segment of a piece, the copies count walk of each
+    // (channel, key) it touches, so the sweep in channel colors applies the segment without its words.
+    struct RollSegment {
+        uint32_t beginWord, endWord, endByte, endTick, endTrack, firstTick;
+        uint32_t slotBegin, slotCount;
+    };
+    // total/low/high: sum, lowest and highest prefix sum of the copies; final: the walk from zero
+    // at the end. At data: the records (each new lowest sum below zero) and the opens/closes of the
+    // walk from zero, as varints (word and tick deltas, then the level drop or an open's velocity).
+    struct RollSlot {
+        uint16_t slot, final, records, items;
+        int32_t total, low, high;
+        uint32_t data;
+    };
+    struct RollSummary {
+        std::vector<RollSegment> segments;
+        std::vector<RollSlot> slots;
+        std::vector<uint8_t> data;
+        bool empty() const { return segments.empty(); }
+        std::size_t bytes() const;
+    };
     struct VisualPiece {
         uint64_t base = 0, words = 0;   // absolute index of its first word, word count
         uint32_t startTick = 0, lastTick = 0, endTick = 0;
         std::vector<uint8_t> bytes;
         std::vector<VisualMark> marks;
+        RollSummary roll;
     };
     struct VisualCursor {
         uint64_t pos = 0;               // absolute index of the next word
@@ -553,7 +581,13 @@ private:
     uint64_t visEnd_ = 0;           // absolute index past the last word held
     VisualCursor visRenderAt_, visLiveAt_;
     static void visualEncode(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t startTick,
-                             std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks);
+                             std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks, RollSummary* roll = nullptr);
+    bool rollSummaryStep(VisualCursor& c, uint32_t through, std::size_t& budget, std::vector<VisualNote>& appends,
+                         std::vector<RenderClose>& closes);
+    bool rollSummaryEnabled_ = true;
+    struct RollOut { uint32_t word, tick; uint16_t slot; uint8_t velocity, kind; };
+    std::vector<RollOut> rollOut_;
+    std::vector<uint32_t> rollNeeded_;
     void visualAddPiece(VisualPiece&& piece);
     void visualAppend(VisualPiece&& piece, uint32_t endTick, bool anyLeft);
     std::size_t visualPieceAt(uint64_t position) const;
@@ -637,6 +671,17 @@ private:
     std::array<uint16_t, 128u * 16u> renderActiveCounts_{};
     std::array<uint8_t, 128u * 16u> renderActiveColors_{};
     std::array<uint32_t, 128u * 16u> renderActiveIds_{};
+    void renderOpen(std::size_t slot, uint32_t tick, uint32_t packed, std::vector<VisualNote>& appends);
+    void renderClose(std::size_t slot, uint32_t tick, std::vector<RenderClose>& closes);
+    void renderFoldFlush(uint32_t through, std::vector<VisualNote>& appends);
+    struct RenderPending { uint32_t tick, packed, visibleAt, slot; };
+    uint32_t foldWindow_ = 0, foldPixels_ = 0;
+    bool renderFold_ = false;
+    uint32_t foldTick_ = 0, foldVisibleAt_ = 0;
+    std::vector<RenderPending> renderPending_;
+    std::size_t renderPendingHead_ = 0;
+    uint64_t renderPendingBase_ = 0;
+    std::array<uint64_t, 128u * 16u> renderPendingSeq_{};
 };
 
 } // namespace wasmidi

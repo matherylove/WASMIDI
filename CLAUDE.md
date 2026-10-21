@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§107). Este archivo resume el estado al cierre de la rev. 110 y dice
+`HANDOFF.md` (§1-§108). Este archivo resume el estado al cierre de la rev. 111 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 110)
+## Estado actual (rev. 111)
 
 Rendimiento medido por el usuario:
 
@@ -333,6 +333,12 @@ Rendimiento medido por el usuario:
 - Rev. 109 (HANDOFF §106): el gráfico dibuja solo las muestras de la ventana del note speed y no se sale del recuadro.
 - Rev. 110 (HANDOFF §107): la escala del gráfico es un techo por serie que solo sube (1/2/5 × 10^n) y vuelve a 1 con otro MIDI;
   la leyenda muestra valor / techo.
+- Rev. 111 (HANDOFF §108): el roll moría a 0 fps desde 7:14 de The Nuker 3 (más de 300 k de polifonía): el barrido leía
+  40-86 M palabras/s para menos de 3000 notas/s. Los helpers mandan con cada pedazo un resumen por (canal, tecla) de tramos
+  de 4 M palabras y el barrido en colores por canal aplica tramos enteros (host 430-449 s: 0,07-0,38 → 0,0005 s por
+  segundo, mismas notas; Chromium: barrido 160-440 → 1-10 ms/s; codificar en los helpers cuesta +24%). Colores por
+  pista: solo se mandan las notas que cubren un centro de píxel (ventana y ancho del roll; 278 M → 25 M notas en 25 s),
+  mismos píxeles; ese barrido sigue leyendo cada palabra (300-700 ms/s en el contenedor).
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -351,6 +357,8 @@ Mecanismos activos y cómo desactivarlos:
 | Cola del ring del roll avanza también durante una reconstrucción (rev. 107) | sin interruptor (`advanceSharpTail`) |
 | Notas sostenidas fuera del ring, debajo de todo (rev. 107) | sin interruptor (`held_`; `long N` en `[WASMIDI app]`) |
 | Adelanto del roll con presupuesto fijo y ring con tope de 2^26 notas (rev. 107) | sin interruptor (`kSharpResidentBudget`, `kSharpRingMax`) |
+| Resumen del roll por tramos de 4 M palabras, barrido en colores por canal sin leer palabras (rev. 111) | `?rollsummary=0` |
+| Colores por pista: solo las notas que cubren un centro de píxel; otro ancho del roll reconstruye (rev. 111) | `?rollfold=0` |
 | Límite de render del synth | `?synthlimit=0` / `ssw_set_render_limit_percent(0)` |
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |
 | Tope de robos por ciclo (25%) | `ssw_set_steal_cap_percent(0)` |
@@ -400,8 +408,9 @@ Mecanismos activos y cómo desactivarlos:
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
    Rev. 93: modos look-ahead y canción entera (como BPFA).
    Falta: cuadros del roll de solo lo visible (rev. 106) con GPU real; The Nuker 3 entero sin cierre (rev. 107) en las
-   PCs; los dos modos de la rev. 93 en las PCs
-   (canción entera de The Nuker 3 con 32 GB);
+   PCs; 7:14-7:29 de The Nuker 3 en las PCs con la rev. 111 (en el contenedor lo que queda es la decodificación de
+   3 helpers desde ~440 s); el barrido en colores por pista (lee cada palabra); los dos modos de la rev. 93 en las PCs
+   (canción entera de The Nuker 3: con `deviceMemory` limitado a 8 GB el tope es 4 GB y no entra, HANDOFF §108);
    el tiempo de carga (el usuario: sharkmidi abre mucho más rápido); The Nuker 3 en WASMIDI con 12288 voces (`helpers N% busy` de
    `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
    log de consola del cierre de WasmiSynth en pausa;

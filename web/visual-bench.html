@@ -55,6 +55,10 @@ runButton.addEventListener("click", () => {
   $("rows").hidden = false;
   const query = new URLSearchParams(location.search);
   query.set("bench", String(Date.now()));
+  // ?pertrack=1: colors per track, folded for a roll ?foldpx= pixels wide at note speed 1 (HANDOFF sec. 108).
+  const perTrack = query.get("pertrack") === "1";
+  const foldPixels = Number(query.get("foldpx")) || 1600;
+  let foldWindow = 0;
   const worker = new Worker("midi-parser-worker.js?" + query.toString());
   const t0 = performance.now();
   let loadMs = 0, songSeconds = 0, pausedMs = 0;
@@ -74,7 +78,7 @@ runButton.addEventListener("click", () => {
   let safeThrough = 0, rollReady = false, pending = null, requestId = 0, helpers = 0, helpersTimer = 0;
   const lines = [];
   let second = null;
-  const totals = { frames: 0, behind: 0, replies: 0, latency: 0, maxLatency: 0, minLead: Infinity };
+  const totals = { frames: 0, behind: 0, replies: 0, latency: 0, maxLatency: 0, minLead: Infinity, notes: 0 };
   const newSecond = index => ({ index, frames: 0, behind: 0, minLead: Infinity, replies: 0, latency: 0, maxLatency: 0 });
   function flushSecond() {
     if (!second) return;
@@ -104,7 +108,7 @@ runButton.addEventListener("click", () => {
       "total: frames " + totals.frames + ", roll behind " + totals.behind + ", min lead " +
         (Number.isFinite(totals.minLead) ? totals.minLead.toFixed(2) : "—") + " s, keyboard " +
         (totals.replies / duration).toFixed(1) + "/s, latency avg " + avg.toFixed(1) + " max " +
-        totals.maxLatency.toFixed(1) + " ms (" + text + ")"
+        totals.maxLatency.toFixed(1) + " ms, roll notes " + totals.notes + (perTrack ? " (per track)" : "") + " (" + text + ")"
     ].join("\n");
     statusBox.textContent = text;
     worker.terminate();
@@ -115,7 +119,7 @@ runButton.addEventListener("click", () => {
     const begin = performance.now();
     worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
       endTick: Math.ceil(tickAt(start + lookahead)), urgentThrough: Math.ceil(tickAt(start + 0.5)),
-      perTrack: false, reset: true });
+      perTrack, reset: true, foldWindow, foldPixels });
     // The playhead waits until the first visible window is ready, like the app after a seek.
     const waitReady = () => {
       if (!rollReady || safeThrough < tickAt(start + 0.1)) { setTimeout(waitReady, 5); return; }
@@ -150,7 +154,7 @@ runButton.addEventListener("click", () => {
         const tick = tickAt(s);
         worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
           endTick: Math.ceil(tickAt(s + lookahead)), urgentThrough: Math.ceil(tickAt(s + 0.5)),
-          perTrack: false, reset: false });
+          perTrack, reset: false });
         const lead = secondsAt(safeThrough) - s;
         second.frames++; totals.frames++;
         if (safeThrough < tick) { second.behind++; totals.behind++; }
@@ -186,11 +190,13 @@ runButton.addEventListener("click", () => {
       worker.postMessage({ type: "tick-at", seconds });
     } else if (m.type === "tick-at") {
       ticks = m.ticks;
+      if (perTrack) foldWindow = 2 * Math.ceil(tickAt(start + 1) - tickAt(start));
       // The helpers start with the first roll request; give them a moment, as playback
       // would after loading a file.
       statusBox.textContent = "Preparando el roll…";
       worker.postMessage({ type: "sharp-render", generation: 1, startTick: Math.floor(tickAt(start)),
-        endTick: Math.floor(tickAt(start)), urgentThrough: Math.floor(tickAt(start)), perTrack: false, reset: true });
+        endTick: Math.floor(tickAt(start)), urgentThrough: Math.floor(tickAt(start)), perTrack, reset: true,
+        foldWindow, foldPixels });
       // With a roll mode that prefills (HANDOFF sec. 89) the helpers started while loading.
       if (helpers) play();
       else helpersTimer = setTimeout(() => { helpersTimer = 0; play(); }, 8000);
@@ -202,6 +208,7 @@ runButton.addEventListener("click", () => {
       safeThrough = 0;
     } else if (m.type === "sharp-render-delta") {
       safeThrough = Math.max(safeThrough, m.safeThrough || 0);
+      totals.notes += m.appends ? m.appends.byteLength / 12 : 0;
     } else if (m.type === "live-state") {
       if (pending && (m.requestId >>> 0) === pending.id) {
         const ms = performance.now() - pending.at;

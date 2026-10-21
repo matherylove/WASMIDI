@@ -235,7 +235,8 @@ void wasmidi_visual_page_ready(
 
 EM_JS(void, wasmidi_sharp_render_request,
       (uint32_t generation, uint32_t startTick, uint32_t endTick,
-       uint32_t urgentThrough, int perTrack, int reset), {
+       uint32_t urgentThrough, int perTrack, int reset,
+       uint32_t foldWindow, uint32_t foldPixels), {
     const mapped = globalThis.__wasmidiMappedMidi;
     if (!mapped || !mapped.worker || !mapped.mappedStore)
         return;
@@ -246,7 +247,9 @@ EM_JS(void, wasmidi_sharp_render_request,
         endTick: endTick >>> 0,
         urgentThrough: urgentThrough >>> 0,
         perTrack: !!perTrack,
-        reset: !!reset
+        reset: !!reset,
+        foldWindow: foldWindow >>> 0,
+        foldPixels: foldPixels >>> 0
     });
 });
 
@@ -2182,6 +2185,7 @@ void GLRenderer::resetSharpRenderer(bool requestRemote)
     sharpRemoteBuildTarget_ = 0;
     sharpRemoteBuildWindowTicks_ = 0;
     sharpRemoteBuildPerTrack_ = false;
+    sharpRemoteBuildPixels_ = 0;
     sharpRemotePendingBase_ = 0;
     sharpRemotePreparedHead_ = 1;
     sharpRemotePendingAppends_.clear();
@@ -2564,10 +2568,15 @@ void GLRenderer::requestRemoteSharpSweep(
 #ifdef __EMSCRIPTEN__
     const bool requestPerTrack =
         sharpRemoteRebuilding_ ? sharpRemoteBuildPerTrack_ : sharpModePerTrack_;
+    // Colors per track send only the notes that cover a pixel centre (HANDOFF sec. 108).
+    const uint32_t foldWindow = requestPerTrack
+        ? (sharpRemoteRebuilding_ ? sharpRemoteBuildWindowTicks_ : sharpLastWindowTicks_)
+        : 0u;
     wasmidi_sharp_render_request(
         sharpRemoteGeneration_, startTick, endTick,
         sharpRemoteUrgentThrough_,
-        requestPerTrack ? 1 : 0, reset ? 1 : 0);
+        requestPerTrack ? 1 : 0, reset ? 1 : 0,
+        foldWindow, sharpRemoteBuildPixels_);
 #else
     (void)startTick;
     (void)endTick;
@@ -3207,12 +3216,16 @@ bool GLRenderer::renderRoll()
         sweepEnd >= static_cast<uint32_t>(sharpLastSweepEnd_);
 
     if (document_->remoteIndexed) {
+        // The notes per track were folded for one roll width: another width rebuilds.
+        const bool foldStale = perTrackColors_ &&
+            sharpRemoteBuildPixels_ != static_cast<uint32_t>(std::max(1, timePx()));
         const bool buildCompatible =
             sharpRemoteRebuilding_ &&
             sharpRemoteBuildWindowTicks_ == windowTicks &&
-            sharpRemoteBuildPerTrack_ == perTrackColors_;
+            sharpRemoteBuildPerTrack_ == perTrackColors_ &&
+            !foldStale;
 
-        bool needRebuild = !forwardIncremental;
+        bool needRebuild = !forwardIncremental || foldStale;
         if (sharpRemoteRebuilding_ && buildCompatible && !sharpForceReset_) {
             // The in-flight target, not the partial worker safe point, defines
             // whether normal playback is still the same transaction. Dense
@@ -3289,6 +3302,7 @@ bool GLRenderer::renderRoll()
                     sharpRemoteBuildTarget_ = sweepEnd;
                     sharpRemoteBuildWindowTicks_ = windowTicks;
             sharpRemoteBuildPerTrack_ = perTrackColors_;
+            sharpRemoteBuildPixels_ = static_cast<uint32_t>(std::max(1, timePx()));
             const uint64_t restart = uint64_t(viewStart) +
                 (catchUp ? uint64_t(sharpCatchUpLead_) * windowTicks : 0u);
             sharpRemoteStartTick_ = static_cast<uint32_t>(std::min<uint64_t>(
