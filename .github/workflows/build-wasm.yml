@@ -21,8 +21,38 @@ jobs:
   build-wasm:
     name: Qt 6.8 WebAssembly + SnappySynthV2
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
 
     steps:
+      - name: Prune old artifacts and PR caches
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let artifacts = 0, bytes = 0;
+            for await (const page of github.paginate.iterator(
+                github.rest.actions.listArtifactsForRepo, { owner, repo, per_page: 100 })) {
+              for (const a of page.data) {
+                if (a.workflow_run && a.workflow_run.id === context.runId) continue;
+                await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+                artifacts++; bytes += a.size_in_bytes;
+              }
+            }
+            let caches = 0;
+            for await (const page of github.paginate.iterator(
+                github.rest.actions.getActionsCacheList, { owner, repo, per_page: 100 })) {
+              for (const c of page.data) {
+                if (c.ref === 'refs/heads/main') continue;
+                await github.rest.actions.deleteActionsCacheById({ owner, repo, cache_id: c.id });
+                caches++;
+              }
+            }
+            core.info(`Deleted ${artifacts} artifacts (${(bytes / 1048576).toFixed(1)} MiB) and ${caches} non-main caches`);
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -286,16 +316,19 @@ jobs:
 
       - name: Upload reproducible WASM build
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: wasmidi-wasm-${{ github.sha }}
           path: site
           if-no-files-found: error
+          retention-days: 3
 
       - name: Upload Pages artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
+          retention-days: 1
 
   deploy-pages:
     name: Deploy GitHub Pages

@@ -339,6 +339,8 @@ Rendimiento medido por el usuario:
   segundo, mismas notas; Chromium: barrido 160-440 → 1-10 ms/s; codificar en los helpers cuesta +24%). Colores por
   pista: solo se mandan las notas que cubren un centro de píxel (ventana y ancho del roll; 278 M → 25 M notas en 25 s),
   mismos píxeles; ese barrido sigue leyendo cada palabra (300-700 ms/s en el contenedor).
+- Rev. 112 (HANDOFF §109): el almacenamiento de Actions se llenaba con un artifact `site/` de ~10 MB por corrida
+  retenido 90 días. Ahora se retiene 3 días y cada build de `main` borra los artifacts viejos y las caches de PR.
 
 Mecanismos activos y cómo desactivarlos:
 

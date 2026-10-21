@@ -7176,3 +7176,28 @@ aun con 32 GB de RAM y el roll queda en look-ahead. No se cambió: subirlo arrie
   note-on de otra pista da ~1 entrada por palabra); queda pendiente.
 - Saltos (reset) a mitad de un tramo con resumen: el barrido lee palabras hasta el borde del tramo siguiente; medido
   solo en host.
+
+## 109. Revisión 112 — espacio de GitHub Actions lleno
+
+**Pedido.** GitHub Actions llegó al límite de almacenamiento.
+
+**Causa.** Cada corrida del workflow (push a `main` y cada PR) subía `site/` como artifact
+`wasmidi-wasm-<sha>` (~10 MB) con la retención por defecto de 90 días. Con 221 corridas eso son
+~2 GB de artifacts vivos, y el almacenamiento de artifacts de un repo privado del plan gratuito es
+500 MB. El artifact `github-pages` ya vencía en 1 día. Las caches de Qt (aqt) y emsdk tienen clave
+estable por versión y no cuentan para ese límite (tienen su propio tope de 10 GB con desalojo).
+
+**Cambios** (`.github/workflows/build-wasm.yml`):
+- Primer paso del build (solo push/`workflow_dispatch`, no en PR): `actions/github-script` borra
+  todos los artifacts del repo que no sean de la corrida actual y las caches cuyo ref no sea
+  `refs/heads/main` (las de PR no las reutiliza nadie). Imprime cuántos borró. `continue-on-error`
+  para que nunca frene un despliegue. El job pide `actions: write`.
+- `wasmidi-wasm-<sha>`: `retention-days: 3` y `continue-on-error` (si la cuota sigue llena, el
+  despliegue a Pages sigue).
+- `upload-pages-artifact`: `retention-days: 1` explícito.
+
+**Verificación.** YAML válido. La API de borrar artifacts no está disponible desde este entorno,
+así que la limpieza ocurre en la primera corrida en `main` después de este cambio.
+
+**No verificado.** GitHub recalcula el uso de almacenamiento cada 6-12 h: el aviso de límite puede
+tardar en irse aunque los artifacts ya estén borrados.
