@@ -341,6 +341,10 @@ Rendimiento medido por el usuario:
   mismos píxeles; ese barrido sigue leyendo cada palabra (300-700 ms/s en el contenedor).
 - Rev. 112 (HANDOFF §109): el almacenamiento de Actions se llenaba con un artifact `site/` de ~10 MB por corrida
   retenido 90 días. Ahora se retiene 3 días y cada build de `main` borra los artifacts viejos y las caches de PR.
+- Rev. 113 (HANDOFF §110): modo GPU estilo Kestrel (MPL-2.0): pool de voces residente en la GPU, cinco pasadas por bloque
+  (robo por radix, creación, render, reducción, compactado); el CPU solo manda note-ons, note-offs por tecla, cortes y filas
+  de canal (`web/snappysynth-kestrel.js`, `kgpu_*` en `voice.c`). Chromium sin GPU: RMS igual al modo CPU (~1%).
+  Sin medir con GPU real.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -392,6 +396,7 @@ Mecanismos activos y cómo desactivarlos:
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |
 | WebGPU | botón CPU/GPU |
+| Motor GPU estilo Kestrel, pool en la GPU (rev. 113) | `?gpuengine=offload` (modo de la rev. 79); `?gpuvoices=N` tamaño del pool |
 | Trampolín de `worker_cycle` | `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` |
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |

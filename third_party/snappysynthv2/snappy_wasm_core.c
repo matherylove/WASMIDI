@@ -282,6 +282,11 @@ void ssw_wgpu_set_frame_cap(int frames) { voice_wgpu_set_frame_cap(frames); }
 void ssw_wgpu_set_frame_base(int frames) { g_wgpu_js_base = frames < 0 ? 0 : frames; }
 uintptr_t ssw_wgpu_requests_ptr(void) { return (uintptr_t)voice_wgpu_requests(); }
 int ssw_wgpu_request_count(void) { return voice_wgpu_request_count(); }
+int ssw_kgpu_set_enabled(int enabled, int capacity, int admit_sort) {
+    return voice_kgpu_set_enabled(enabled, capacity, admit_sort);
+}
+void ssw_kgpu_begin_block(int frames) { voice_kgpu_begin_block(frames); }
+uintptr_t ssw_kgpu_finish_block(void) { return (uintptr_t)voice_kgpu_finish_block(); }
 int ssw_wgpu_collect_samples(uintptr_t table, int max_entries, uintptr_t total) {
     return voice_wgpu_collect_samples((uint32_t*)table, max_entries, (uint32_t*)total);
 }

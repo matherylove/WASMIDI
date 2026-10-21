@@ -662,6 +662,75 @@ static inline LONG load_relaxed_long(volatile LONG* value) {
     return *value;
 }
 
+/* ---- Kestrel GPU mode (rev. 112, HANDOFF sec. 109) ---------------------------
+ * The voice pool lives on the GPU (web/snappysynth-kestrel.js). Per block the
+ * core only hands over data: the voices that start (kgpu_spawn), how many
+ * note-offs each (channel, key) has seen (gates), channel controllers per
+ * 64-frame tile and cuts (all sound off, exclusive groups). */
+#define KGPU_SLOTS (MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT)
+#define KGPU_CHAN_TILE 64
+#define KGPU_MAX_TILES 64
+#define KGPU_CHAN_WORDS 4
+#define KGPU_MAX_CUTS 4096
+typedef struct {
+    uint32_t phase_hi, phase_lo, step_hi, step_lo;
+    uint32_t smp_base, smp_info, loop_start, loop_end;
+    uint32_t smp_end, slot, ordinal, start_rel;
+    uint32_t hold, birth, pad0, pad1;
+    float gain_l, gain_r, attack_inc, decay_mul;
+    float sustain, release_alpha, b0, b1;
+    float b2, a1, a2, amp;
+    float pad2, pad3, pad4, pad5;
+} kgpu_spawn; /* 128 bytes; mirrored by the WGSL SpawnCmd in snappysynth-kestrel.js */
+typedef struct { uint32_t slot, count, frame; } kgpu_gate;
+typedef struct { uint32_t ch, group, frame; } kgpu_cut;
+typedef struct {
+    kgpu_spawn *spawns; int spawn_count, spawn_cap;
+    kgpu_gate *gates; int gate_count, gate_cap;
+    kgpu_cut *cuts; int cut_count, cut_cap;
+} kgpu_lists;
+static volatile LONG g_kgpu_enabled = 0;
+static kgpu_lists *g_kgpu_lists = NULL; /* one per worker, the last one for the calling thread */
+static int g_kgpu_list_count = 0;
+static __thread kgpu_lists *t_kgpu = NULL;
+static uint32_t g_kgpu_block = 0;
+static int g_kgpu_block_frames = 0;
+static int g_kgpu_capacity = 0;
+static int g_kgpu_admit_sort = 0;
+static uint32_t g_kgpu_chan[KGPU_MAX_TILES * MIDI_CHANNEL_COUNT * KGPU_CHAN_WORDS];
+
+static inline int kgpu_on(void) { return (int)load_relaxed_long(&g_kgpu_enabled); }
+static inline kgpu_lists *kgpu_list(void) {
+    if (t_kgpu) return t_kgpu;
+    return g_kgpu_lists ? &g_kgpu_lists[g_kgpu_list_count - 1] : NULL;
+}
+static int kgpu_grow(void **items, int *cap, int need, size_t size) {
+    if (need <= *cap) return 1;
+    int next = *cap > 0 ? *cap * 2 : 1024;
+    while (next < need) next *= 2;
+    void *grown = realloc(*items, size * (size_t)next);
+    if (!grown) return 0;
+    *items = grown;
+    *cap = next;
+    return 1;
+}
+static void kgpu_gate_add(int ch, int key, unsigned int count, int frame) {
+    kgpu_lists *l = kgpu_list();
+    if (!l || !kgpu_grow((void**)&l->gates, &l->gate_cap, l->gate_count + 1, sizeof(kgpu_gate))) return;
+    kgpu_gate *g = &l->gates[l->gate_count++];
+    g->slot = (uint32_t)(ch * MIDI_KEY_COUNT + key);
+    g->count = count;
+    g->frame = (uint32_t)(frame < 0 ? 0 : frame);
+}
+static void kgpu_cut_add(int ch, int group, int frame) {
+    kgpu_lists *l = kgpu_list();
+    if (!l || !kgpu_grow((void**)&l->cuts, &l->cut_cap, l->cut_count + 1, sizeof(kgpu_cut))) return;
+    kgpu_cut *c = &l->cuts[l->cut_count++];
+    c->ch = (uint32_t)ch;
+    c->group = (uint32_t)(group > 0 ? group : 0);
+    c->frame = (uint32_t)(frame < 0 ? 0 : frame);
+}
+
 static inline void selector_effective_banks(int ch, int bank_msb, int bank_lsb, int drum_part,
                                             int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
     int gs_part_mode = (int)load_relaxed_long(&g_gs_part_mode);
@@ -1786,6 +1855,8 @@ update_voice_steal_score((int)(v - voices), v);
 static inline void sync_note_off_counters_for_channel(int ch) {
                                                                                                                                                                                      if (ch < 0 || ch >= MIDI_CHANNEL_COUNT || !g_key_on_counter || !g_key_off_counter) return;
 for (int key = 0; key < MIDI_KEY_COUNT; ++key) {
+if (kgpu_on() && g_key_off_counter[ch][key] != g_key_on_counter[ch][key])
+    kgpu_gate_add(ch, key, g_key_on_counter[ch][key], g_wgpu_frame_base);
 g_key_off_counter[ch][key] = g_key_on_counter[ch][key];
 }
 InterlockedIncrement(&g_key_off_epoch);
@@ -1795,6 +1866,8 @@ InterlockedIncrement(&g_key_off_epoch);
                                                                                                                                                                                      if (ch < 0 || ch >= MIDI_CHANNEL_COUNT || !g_key_on_counter || !g_key_off_counter) return;
 for (int key = 0; key < MIDI_KEY_COUNT; ++key) {
 if (g_note_worker_map[ch][key] == worker_id) {
+if (kgpu_on() && g_key_off_counter[ch][key] != g_key_on_counter[ch][key])
+    kgpu_gate_add(ch, key, g_key_on_counter[ch][key], g_wgpu_frame_base);
 g_key_off_counter[ch][key] = g_key_on_counter[ch][key];
 }
 }
@@ -1836,6 +1909,7 @@ static inline void channel_release_all_held_voices(int ch) {
                                                                                                                                                                                  static inline void channel_all_sound_off(int ch) {
                                                                                                                                                                                      // Use key queues to avoid scanning all max_voices.
                                                                                                                                                                                      if (ch < 0 || ch >= MIDI_CHANNEL_COUNT) return;
+if (kgpu_on()) kgpu_cut_add(ch, 0, g_wgpu_frame_base);
                                                                                                                                                                                      for (int key = 0; key < MIDI_KEY_COUNT; ++key) {
                                                                                                                                                                                          int vid = g_key_head[ch][key];
                                                                                                                                                                                          int guard = 0;
@@ -2800,6 +2874,7 @@ if (g_voice_gen && g_use_fast_note_off_tail) {
     const unsigned int open_slots = on_order - off_order;
     const int n = (unsigned int)consume < open_slots ? consume : (int)open_slots;
     g_key_off_counter[e->ch][e->key] = off_order + (unsigned int)n;
+if (kgpu_on()) kgpu_gate_add(e->ch, e->key, off_order + (unsigned int)n, g_wgpu_frame_base + release_delay);
     keyqueue_apply_noteoff_batch(e->ch, e->key, off_order + 1u, n, release_delay);
     return;
 }
@@ -2810,6 +2885,7 @@ if (g_voice_gen && g_use_fast_note_off_tail) {
 g_key_off_counter[e->ch][e->key] = off_order;
 keyqueue_apply_noteoff_cutoff(wd, e->ch, e->key, off_order, release_delay);
                                                                                                                                                                                                                                                                 }
+if (kgpu_on()) kgpu_gate_add(e->ch, e->key, off_order, g_wgpu_frame_base + release_delay);
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 static inline int keyqueue_find_same_key_victim(int ch, int key) {
@@ -4381,6 +4457,98 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     return env_state == ENV_OFF ? 2 : 1;
 }
 
+/* Kestrel GPU mode: a voice the CPU just set up becomes a spawn command (rev. 112). */
+static int kgpu_emit_spawn(const voice *v) {
+    kgpu_lists *l = kgpu_list();
+    const sfz_region *region = v->region;
+    if (!l || !region) return 0;
+    const wav_data *sample = region->is_resampled ? region->resampled_data : region->sample_data;
+    if (!sample || !sample->data || sample->gpu_offset_plus_one <= 0) return 0;
+    const int s_num = sample->num_samples, s_ch = sample->num_channels;
+    const int ch = v->owner_channel;
+    if (s_num <= 0 || s_ch < 1 || s_ch > 2 || ch < 0 || ch >= MIDI_CHANNEL_COUNT) return 0;
+    if (v->key < 0 || v->key >= MIDI_KEY_COUNT) return 0;
+    if (fabsf(v->portamento_offset) > 0.0001f && fabsf(v->portamento_step) > 0.0f) return 0;
+    if (!kgpu_grow((void**)&l->spawns, &l->spawn_cap, l->spawn_count + 1, sizeof(kgpu_spawn))) return 0;
+    const channel_render_state *cr = &g_channel_render[ch];
+    const int sample_start = (v->sample_start >= 0 && v->sample_start < s_num) ? v->sample_start : 0;
+    const int sample_end = (v->sample_end > sample_start && v->sample_end <= s_num) ? v->sample_end : s_num;
+    const int loop_start = (v->loop_start >= sample_start && v->loop_start < sample_end) ? v->loop_start : sample_start;
+    const int loop_end = (v->loop_end > loop_start && v->loop_end <= sample_end) ? v->loop_end : sample_end;
+    const int loop_active = (v->loop_mode == 1 || v->loop_mode == 2) && loop_end > loop_start;
+    const int filter_enabled = v->region_filter_enabled || cr->filter_enabled;
+    kgpu_spawn *sp = &l->spawns[l->spawn_count++];
+    memset(sp, 0, sizeof(*sp));
+    const double pos = v->position < (float)sample_start ? (double)sample_start : (double)v->position;
+    const double step = v->pitch_multiplier > 0.0f ? (double)v->pitch_multiplier : 0.0;
+    const uint64_t phase = (uint64_t)(pos * 4294967296.0);
+    const uint64_t delta = (uint64_t)(step * 4294967296.0);
+    sp->phase_hi = (uint32_t)(phase >> 32);
+    sp->phase_lo = (uint32_t)phase;
+    sp->step_hi = (uint32_t)(delta >> 32);
+    sp->step_lo = (uint32_t)delta;
+    sp->smp_base = (uint32_t)(sample->gpu_offset_plus_one - 1);
+    sp->smp_info = (uint32_t)s_ch | (loop_active ? 4u : 0u) | (filter_enabled ? 8u : 0u);
+    sp->loop_start = (uint32_t)loop_start;
+    sp->loop_end = (uint32_t)loop_end;
+    sp->smp_end = (uint32_t)sample_end;
+    sp->slot = (uint32_t)(ch * MIDI_KEY_COUNT + v->key) | ((uint32_t)(v->group_id > 0 ? (v->group_id & 0x7FFF) : 0) << 16);
+#ifdef VOR
+    const unsigned int stack = v->vor_stack_count > 1 ? (unsigned int)v->vor_stack_count : 1u;
+#else
+    const unsigned int stack = 1u;
+#endif
+    sp->ordinal = v->key_order_id + stack - 1u;
+    sp->start_rel = (uint32_t)(g_wgpu_frame_base + (v->startup_samples > 0 ? v->startup_samples : 0));
+    sp->hold = (uint32_t)(v->env_hold_samples > 0 ? v->env_hold_samples : 0);
+    sp->birth = g_kgpu_block;
+    sp->gain_l = v->base_gain * v->region_pan_l;
+    sp->gain_r = v->base_gain * v->region_pan_r;
+    sp->attack_inc = v->env_attack_inc >= 0.0f ? v->env_attack_inc : cr->attack_inc;
+    sp->decay_mul = v->env_decay_mul >= 0.0f ? v->env_decay_mul : g_decay_mul;
+    sp->sustain = v->env_sustain_level;
+    sp->release_alpha = v->env_release_seconds >= 0.0f
+        ? region_release_seconds_to_alpha(clampf(v->env_release_seconds * cr->release_time_scale, 0.0f, 3.2f))
+        : (v->env_release_alpha >= 0.0f ? v->env_release_alpha : cr->release_alpha);
+    if (filter_enabled) {
+        sp->b0 = v->region_filter_enabled ? v->region_b0 : cr->b0;
+        sp->b1 = v->region_filter_enabled ? v->region_b1 : cr->b1;
+        sp->b2 = v->region_filter_enabled ? v->region_b2 : cr->b2;
+        sp->a1 = v->region_filter_enabled ? v->region_a1 : cr->a1;
+        sp->a2 = v->region_filter_enabled ? v->region_a2 : cr->a2;
+        if (v->region_filter_enabled && cr->filter_enabled) {
+            float cutoff = v->region_cutoff_hz, resonance = v->region_resonance_q;
+            if (cutoff <= 0.0f || cr->cutoff_hz < cutoff) cutoff = cr->cutoff_hz;
+            if (cr->resonance_q > resonance) resonance = cr->resonance_q;
+            compute_static_lpf(cutoff, resonance, &sp->b0, &sp->b1, &sp->b2, &sp->a1, &sp->a2);
+        }
+    }
+    {
+        const float l_amp = sp->gain_l * cr->pan_l, r_amp = sp->gain_r * cr->pan_r;
+        sp->amp = (l_amp > r_amp ? l_amp : r_amp) * cr->gain_mul;
+    }
+    return 1;
+}
+
+static void kgpu_fill_chan(int base, int frames) {
+    if (base < 0) base = 0;
+    const int end = base + frames;
+    for (int t = (base + KGPU_CHAN_TILE - 1) / KGPU_CHAN_TILE; t < KGPU_MAX_TILES && t * KGPU_CHAN_TILE < end; ++t) {
+        uint32_t *row = &g_kgpu_chan[(size_t)t * MIDI_CHANNEL_COUNT * KGPU_CHAN_WORDS];
+        for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
+            const channel_render_state *cr = &g_channel_render[ch];
+            const float gl = cr->gain_mul * cr->pan_l, gr = cr->gain_mul * cr->pan_r;
+            double bend = (double)cr->bend_pitch_mul * 16777216.0;
+            if (!(bend > 0.0)) bend = 16777216.0;
+            if (bend > 4294967295.0) bend = 4294967295.0;
+            memcpy(&row[ch * KGPU_CHAN_WORDS + 0], &gl, 4);
+            memcpy(&row[ch * KGPU_CHAN_WORDS + 1], &gr, 4);
+            row[ch * KGPU_CHAN_WORDS + 2] = (uint32_t)(bend + 0.5);
+            row[ch * KGPU_CHAN_WORDS + 3] = g_channel_sustain_snapshot[ch] ? 1u : 0u;
+        }
+    }
+}
+
 static int voice_age_less(const void *a, const void *b) {
     const int va = *(const int*)a, vb = *(const int*)b;
     if (va < 0 || vb < 0) return (va < 0) - (vb < 0);
@@ -4885,6 +5053,7 @@ static void voice_park_flush(float *mix, int frames, int *need_compact) {
 static int worker_cycle(int widx, worker_data *wd) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
 const int ss_profile = debug_metrics_on();
+t_kgpu = (g_kgpu_lists && widx < g_kgpu_list_count - 1) ? &g_kgpu_lists[widx] : NULL;
 const LONG admit_budget_us = load_relaxed_long(&g_admit_budget_us);
 LARGE_INTEGER admit_t0, admit_freq;
 admit_t0.QuadPart = 0;
@@ -5074,7 +5243,13 @@ if (admit_budget_us > 0) {
                                                                                                                                                                                                                                                                 for (int prior = 0; prior < layer_index; ++prior) {
                                                                                                                                                                                                                                                                 if (layer_regions[prior] && layer_regions[prior]->off_by == kill_region->off_by) kill_seen = 1;
                                                                                                                                                                                                                                                                 }
-                                                                                                                                                                                                                                                                if (!kill_seen) channel_kill_group(e.ch, kill_region->off_by);
+                                                                                                                                                                                                                                                                if (!kill_seen) {
+if (kgpu_on()) {
+float kill_frac = 0.0f;
+kgpu_cut_add(e.ch, kill_region->off_by, g_wgpu_frame_base + qpc_to_sample_offset_and_frac(e.timestamp_qpc, frames_this_block, &kill_frac));
+}
+channel_kill_group(e.ch, kill_region->off_by);
+}
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 for (int layer_index = 0; layer_index < layer_count; ++layer_index) {
                                                                                                                                                                                                                                                                 sfz_region *region = layer_regions[layer_index];
@@ -5363,6 +5538,13 @@ update_voice_steal_static_meta(vid, v);
 
 v->env_level = 0.0f;
 v->env_state = ENV_ATTACK;
+if (!stolen && kgpu_on() && kgpu_emit_spawn(v)) {
+v->env_state = ENV_OFF;
+v->kill_now = 1;
+v->region = NULL;
+free_push(wd, vid);
+continue;
+}
 if (g_steal_score) g_steal_score[vid] = FLT_MAX;
 keyqueue_append_voice(e.ch, e.key, vid);
 #if SSW_NOTEOFF_OPEN_LIST
@@ -8065,7 +8247,7 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
                                                                                                                                                                                                                                                                 static void mix_apply_gain_and_limit(float *buf, int samples) {
                                                                                                                                                                                                                                                                 const int ch = g_audio.num_channels;
                                                                                                                                                                                                                                                                 if (ch < 1) return;
-if (load_relaxed_long(&g_wgpu_enabled)) {
+if (load_relaxed_long(&g_wgpu_enabled) || kgpu_on()) {
     /* GPU mode: the core limiter runs after the GPU voices are added. */
     for (int i = 0; i < samples; ++i) buf[i] *= g_global_mix_gain;
     return;
@@ -8151,7 +8333,7 @@ if (load_relaxed_long(&g_wgpu_enabled)) {
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
-                                                                                                                                                                                                                                                                void voice_render_float(float *out_buffer, int num_frames) {
+                                                                                                                                                                                                                                                                static void voice_render_float_impl(float *out_buffer, int num_frames) {
 /* Debug-off must not maintain diagnostics in the audio path. Snapshot and
  * clear these only while a user is actively profiling. The first render after
  * enabling Debug clears both halves instead of publishing stale pre-toggle data. */
@@ -8442,6 +8624,14 @@ ss_game_mix_float(out_buffer, num_frames, channels, g_audio.sample_rate);
                                                                                                                                                                                                                                                                 #endif
                                                                                                                                                                                                                                                                 }
 
+void voice_render_float(float *out_buffer, int num_frames) {
+    voice_render_float_impl(out_buffer, num_frames);
+    if (kgpu_on() && num_frames > 0) {
+        rebuild_channel_render_cache();
+        kgpu_fill_chan(g_wgpu_frame_base, num_frames);
+    }
+}
+
                                                                                                                                                                                                                                                                 void voice_render(short *out_buffer, int num_frames) {
                                                                                                                                                                                                                                                                 if (!out_buffer || num_frames<=0) return;
 
@@ -8624,4 +8814,138 @@ int voice_wgpu_request_count(void) {
     const int n = (int)load_relaxed_long(&g_wgpu_count);
     return n < g_wgpu_capacity ? n : g_wgpu_capacity;
 }
-int voice_wgpu_enabled(void) { return (int)load_relaxed_long(&g_wgpu_enabled); }
+int voice_wgpu_enabled(void) { return (int)load_relaxed_long(&g_wgpu_enabled) || kgpu_on(); }
+
+/* ---- Kestrel GPU mode API (rev. 112) ---- */
+static kgpu_spawn *g_kgpu_spawn_out = NULL;
+static int g_kgpu_spawn_out_cap = 0;
+static uint32_t *g_kgpu_gate_out = NULL;
+static int g_kgpu_gate_out_cap = 0;
+static kgpu_cut g_kgpu_cut_out[KGPU_MAX_CUTS];
+static uint32_t g_kgpu_header[16];
+static uint32_t g_kgpu_gate_fill[KGPU_SLOTS];
+
+static void kgpu_free_lists(void) {
+    for (int i = 0; i < g_kgpu_list_count; ++i) {
+        free(g_kgpu_lists[i].spawns);
+        free(g_kgpu_lists[i].gates);
+        free(g_kgpu_lists[i].cuts);
+    }
+    free(g_kgpu_lists);
+    g_kgpu_lists = NULL;
+    g_kgpu_list_count = 0;
+}
+
+/* capacity: voices the GPU pool holds; admit_sort: spawn count past which a block's
+ * spawns are ranked loudest first (the GPU takes them in order). */
+int voice_kgpu_set_enabled(int enabled, int capacity, int admit_sort) {
+    InterlockedExchange(&g_kgpu_enabled, 0);
+    if (!enabled) return 0;
+    const int want = (g_worker_count > 0 ? g_worker_count : 1) + 1;
+    if (g_kgpu_list_count != want) {
+        kgpu_free_lists();
+        g_kgpu_lists = (kgpu_lists*)calloc((size_t)want, sizeof(kgpu_lists));
+        if (!g_kgpu_lists) return 0;
+        g_kgpu_list_count = want;
+    }
+    g_kgpu_capacity = capacity > 0 ? capacity : 1;
+    g_kgpu_admit_sort = admit_sort > 0 ? admit_sort : 1;
+    rebuild_channel_render_cache();
+    kgpu_fill_chan(0, KGPU_MAX_TILES * KGPU_CHAN_TILE);
+    InterlockedExchange(&g_kgpu_enabled, 1);
+    return 1;
+}
+
+void voice_kgpu_begin_block(int frames) {
+    if (frames < 1) frames = 1;
+    if (frames > KGPU_MAX_TILES * KGPU_CHAN_TILE) frames = KGPU_MAX_TILES * KGPU_CHAN_TILE;
+    g_kgpu_block_frames = frames;
+    ++g_kgpu_block;
+    for (int i = 0; i < g_kgpu_list_count; ++i) {
+        g_kgpu_lists[i].spawn_count = 0;
+        g_kgpu_lists[i].gate_count = 0;
+        g_kgpu_lists[i].cut_count = 0;
+    }
+    if (kgpu_grow((void**)&g_kgpu_gate_out, &g_kgpu_gate_out_cap, KGPU_SLOTS * 2 + 1, sizeof(uint32_t))) {
+        for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch)
+            for (int key = 0; key < MIDI_KEY_COUNT; ++key)
+                g_kgpu_gate_out[ch * MIDI_KEY_COUNT + key] = g_key_off_counter ? g_key_off_counter[ch][key] : 0u;
+    }
+    kgpu_fill_chan(0, frames);
+}
+
+static int kgpu_spawn_louder(const void *a, const void *b) {
+    const kgpu_spawn *x = (const kgpu_spawn*)a, *y = (const kgpu_spawn*)b;
+    if (x->amp != y->amp) return x->amp > y->amp ? -1 : 1;
+    if (x->start_rel != y->start_rel) return x->start_rel < y->start_rel ? -1 : 1;
+    return x->slot < y->slot ? -1 : (x->slot > y->slot ? 1 : 0);
+}
+
+/* Gathers the block; returns the 16-word header read by snappysynth-kestrel.js. */
+void *voice_kgpu_finish_block(void) {
+    memset(g_kgpu_header, 0, sizeof(g_kgpu_header));
+    int spawns = 0, gates = 0, cuts = 0;
+    for (int i = 0; i < g_kgpu_list_count; ++i) {
+        spawns += g_kgpu_lists[i].spawn_count;
+        gates += g_kgpu_lists[i].gate_count;
+        cuts += g_kgpu_lists[i].cut_count;
+    }
+    int spawn_out = 0;
+    if (spawns > 0 && kgpu_grow((void**)&g_kgpu_spawn_out, &g_kgpu_spawn_out_cap, spawns, sizeof(kgpu_spawn))) {
+        for (int i = 0; i < g_kgpu_list_count; ++i) {
+            memcpy(&g_kgpu_spawn_out[spawn_out], g_kgpu_lists[i].spawns, sizeof(kgpu_spawn) * (size_t)g_kgpu_lists[i].spawn_count);
+            spawn_out += g_kgpu_lists[i].spawn_count;
+        }
+        if (spawn_out > g_kgpu_admit_sort)
+            qsort(g_kgpu_spawn_out, (size_t)spawn_out, sizeof(kgpu_spawn), kgpu_spawn_louder);
+    }
+    /* gates: base[KGPU_SLOTS], run starts[KGPU_SLOTS + 1], runs of {count, frame} */
+    const int run_base = KGPU_SLOTS * 2 + 1;
+    int gate_words = 0;
+    if (g_kgpu_gate_out && kgpu_grow((void**)&g_kgpu_gate_out, &g_kgpu_gate_out_cap, run_base + gates * 2, sizeof(uint32_t))) {
+        uint32_t *starts = &g_kgpu_gate_out[KGPU_SLOTS];
+        uint32_t *runs = &g_kgpu_gate_out[run_base];
+        memset(starts, 0, sizeof(uint32_t) * (KGPU_SLOTS + 1));
+        for (int i = 0; i < g_kgpu_list_count; ++i)
+            for (int k = 0; k < g_kgpu_lists[i].gate_count; ++k)
+                ++starts[g_kgpu_lists[i].gates[k].slot + 1];
+        for (int s = 0; s < KGPU_SLOTS; ++s) starts[s + 1] += starts[s];
+        memcpy(g_kgpu_gate_fill, starts, sizeof(g_kgpu_gate_fill));
+        for (int i = 0; i < g_kgpu_list_count; ++i)
+            for (int k = 0; k < g_kgpu_lists[i].gate_count; ++k) {
+                const kgpu_gate *g = &g_kgpu_lists[i].gates[k];
+                uint32_t frame = g->frame;
+                if (frame >= (uint32_t)g_kgpu_block_frames) frame = (uint32_t)g_kgpu_block_frames - 1u;
+                /* each slot's runs stay ordered by count (several workers may add to one slot) */
+                uint32_t j = g_kgpu_gate_fill[g->slot]++;
+                while (j > starts[g->slot] && runs[(j - 1) * 2] > g->count) {
+                    runs[j * 2] = runs[(j - 1) * 2];
+                    runs[j * 2 + 1] = runs[(j - 1) * 2 + 1];
+                    --j;
+                }
+                runs[j * 2] = g->count;
+                runs[j * 2 + 1] = frame;
+            }
+        gate_words = run_base + gates * 2;
+    }
+    uint32_t cut_count = 0, cut_mask = 0;
+    for (int i = 0; i < g_kgpu_list_count && cuts > 0; ++i)
+        for (int k = 0; k < g_kgpu_lists[i].cut_count && cut_count < KGPU_MAX_CUTS; ++k) {
+            kgpu_cut c = g_kgpu_lists[i].cuts[k];
+            if (c.frame >= (uint32_t)g_kgpu_block_frames) c.frame = (uint32_t)g_kgpu_block_frames - 1u;
+            g_kgpu_cut_out[cut_count++] = c;
+            cut_mask |= 1u << (c.ch & 31u);
+        }
+    g_kgpu_header[0] = (uint32_t)(spawn_out < g_kgpu_capacity ? spawn_out : g_kgpu_capacity);
+    g_kgpu_header[1] = (uint32_t)spawn_out;
+    g_kgpu_header[2] = (uint32_t)gate_words;
+    g_kgpu_header[3] = cut_count;
+    g_kgpu_header[4] = cut_mask;
+    g_kgpu_header[5] = (uint32_t)((g_kgpu_block_frames + KGPU_CHAN_TILE - 1) / KGPU_CHAN_TILE);
+    g_kgpu_header[6] = g_kgpu_block;
+    g_kgpu_header[7] = (uint32_t)(uintptr_t)g_kgpu_spawn_out;
+    g_kgpu_header[8] = (uint32_t)(uintptr_t)g_kgpu_gate_out;
+    g_kgpu_header[9] = (uint32_t)(uintptr_t)g_kgpu_cut_out;
+    g_kgpu_header[10] = (uint32_t)(uintptr_t)g_kgpu_chan;
+    return g_kgpu_header;
+}
