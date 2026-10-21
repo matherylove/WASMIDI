@@ -38,13 +38,14 @@ function errorText(Module, fallback) {
 }
 
 // Synth feed helper (HANDOFF sec. 70): decodes spans of admission blocks for the parser
-// Worker from the compressed source slabs it shares (SharedArrayBuffers).
+// Worker from the compressed source slabs in its shared heap (HANDOFF sec. 114).
 async function feedMessage(m) {
     try {
         const Module = await loadCore(m.baseUrl || feedBase.baseUrl, m.version || feedBase.version);
         if (m.type === "feed-init") {
             feedBase.baseUrl = m.baseUrl;
             feedBase.version = m.version;
+            self.__wasmidiFeedHeap = m.heap;
             self.__wasmidiFeedSlabs = m.slabs;
             self.__wasmidiFeedSlabBytes = m.slabBytes;
             const image = new Uint8Array(m.image);

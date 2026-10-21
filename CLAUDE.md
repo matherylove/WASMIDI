@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§113). Este archivo resume el estado al cierre de la rev. 116 y dice
+`HANDOFF.md` (§1-§114). Este archivo resume el estado al cierre de la rev. 117 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 116)
+## Estado actual (rev. 117)
 
 Rendimiento medido por el usuario:
 
@@ -358,6 +358,11 @@ Rendimiento medido por el usuario:
   resumen de nuevo los helpers (`roll-summarize`). Host 436-448 s: barrido 0,32-0,70 → 0,04-0,06 s por segundo. Chromium
   desde 425 s: barrido 554-565 → 71-73 ms/s, teclado 28 → 34/s; el roll ahí sigue limitado por 3 helpers. El codificador
   en wasm costaba 40-59 ns por palabra por una llamada por nota que pasaba por JavaScript (`-fexceptions`): ~16 ns.
+- Rev. 117 (HANDOFF §114): menos RAM. Los helpers leen la fuente comprimida del heap del parser, ahora compartido
+  (`-pthread` sin hilos; antes había una copia: 1,28 GB en The Nuker 3), checkpoints de 21 → 10 bytes (−244 MB), sin la
+  copia entera del MIDI en JS al cargar (hasta 1 GiB; la tabla de pistas lee ventanas de 64 KiB-4 MiB) y helpers sin
+  pista/índice por palabra al ordenar. Chromium, The Nuker 3: pico de carga 8,2 → 6,9 GB, reproduciendo 7,5 → 5,9 GB,
+  mismo rendimiento. El parser necesita `crossOriginIsolated`.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -402,6 +407,8 @@ Mecanismos activos y cómo desactivarlos:
 | Teclado recibe pedazos por demanda (rev. 93) | sin interruptor (`liveForward`) |
 | Tope del rellenado: un tramo por vez pasada la mitad del plan (rev. 93) | `?refillcap=0` |
 | Barrido del roll cede con `MessageChannel` (rev. 93) | `?sweepyield=0` |
+| Helpers leen la fuente comprimida del heap compartido del parser (rev. 117) | sin interruptor (`-pthread` en `midi_parser_core`, `patch_parser_shared_memory.py`) |
+| Sin copia entera del MIDI en JS al cargar; tabla de pistas por ventanas (rev. 117) | `?fastsource=1` (vuelve la copia de hasta 1 GiB) |
 | Dibujo de notas del roll | `?rolldraw=0` (solo diagnóstico) |
 | Abrir desde .zip/.7z/.xz/.gz a OPFS (rev. 113) | sin interruptor; solo actúa con esas extensiones (`WasmidiArchive.resolve`) |
 | Reloj en cada cuadro mostrado y pedazo de tiles según la pantalla (rev. 98) | sin interruptor (`advanceFrame`, `framePeriodMs_`) |

@@ -7523,3 +7523,114 @@ de 0,5-0,7 s por segundo era lo que quedaba en el Worker del parser.
 - En las PCs de Dekx con GPU real: The Nuker 3 en 7:14-7:29 con colores por pista.
 - El recálculo en el navegador después de cambiar note speed o el ancho de la ventana (en host sí).
 - Note speed muy bajo en zonas densas: con más de 1 byte de resumen por palabra el tramo se barre leyendo palabras.
+
+## 114. Revisión 117 — menos RAM y carga sin la copia entera del MIDI
+
+### Pedido
+
+Dekx: bajar el consumo de RAM al mínimo sin afectar (o mejorando) el rendimiento de todo WASMIDI, y la carga lo más rápida
+posible sin dañar lo hecho para el tiempo real. "Si hay posibilidades de que tu método baje el rendimiento, no vale la pena
+considerarlo."
+
+### Medición de partida
+
+Chromium 141 del contenedor (4 hilos, sin GPU), WASMIDI con The Nuker 3 y MatheryLSD, `?helpers=3`, PSS de todos los
+procesos de Chromium (`browser_bench.py app ... --mem`, nuevo):
+
+- 1,1 GB antes de abrir el MIDI (página, Qt, WasmiSynth con 34 Workers del pool; ~315 MB son del proceso de GPU por
+  software del contenedor).
+- Pico de 8,2 GB al terminar la carga y 7,4-7,5 GB reproduciendo, con un store de 1,9 GB (host: fuente comprimida
+  1,28 GB, checkpoints 466 MB, snapshots 112 MB).
+- Por mapeo (`/proc/<renderer>/smaps`): heap del Worker del parser 2,8 GB (store + look-ahead de 1024 MB), cada helper
+  de decodificación 551 MB y, aparte, una copia de 1,28 GB de la fuente comprimida.
+
+Lo que sobraba:
+
+1. **La fuente comprimida estaba dos veces**: en el heap del parser y copiada a `SharedArrayBuffer`s para los helpers
+   (§70). En The Nuker 3, 1,28 GB; en The Nuker 4, 455 MB.
+2. **Checkpoints de 21 bytes** (offset u64, índice de evento u64, tick, running status) cada 256 eventos por pista: 23 M
+   en The Nuker 3. El índice es siempre k × 256 y el offset cabe en 40 bits.
+3. **Copia entera del MIDI en JS antes de parsear** (`fastSourceLimitBytes`, hasta 1 GiB, de la época del parser de
+   MPWGL2): una lectura completa antes de empezar y hasta 1 GiB más en el pico. El store BPFA lee ventanas de 8 MiB, así
+   que no la necesita; solo la tabla de pistas (lecturas de 8 bytes) se beneficiaba.
+4. **Helpers**: el ordenamiento de cada tramo guardaba una pista (u16) y un índice (u32) por palabra, y el buffer de
+   palabras crudas se duplicaba al crecer (129,5 MB de capacidad para ~70 MB usados con tramos de 8 M eventos). En wasm
+   el heap no se achica: lo más alto que llega un helper es lo que ocupa para siempre.
+
+### Cambios
+
+1. **Heap del parser compartido** (`CMakeLists.txt`: `-pthread` con `PTHREAD_POOL_SIZE=0`, también zstd; no se crea
+   ningún hilo). El Worker del parser manda a los helpers su `HEAPU8.buffer` (un `SharedArrayBuffer`) y la dirección de
+   cada slab; `wmp_copy_feed_slab` copia el bloque comprimido desde ahí, como antes desde la copia. Los slabs no se mueven
+   ni se liberan mientras vive el Worker (cada MIDI abre un Worker nuevo). Emscripten 3.1.56 crea la memoria compartida
+   Memory64 con la API vieja (`"index": "i64"` y tamaños Number), que V8 rechaza; `tools/patch_parser_shared_memory.py`
+   reescribe ese constructor en el JS enlazado (`"address": "i64"` y BigInt), como paso POST_BUILD. El smoke test
+   comprueba que el heap sea compartido y los helpers leen de él. El parser ahora necesita `crossOriginIsolated` (como
+   WasmiSynth, que ya lo necesitaba).
+2. **Checkpoints de 10 bytes** (`TrackSeekPoint`: tick, offset en 40 bits, running status); el índice sale de la
+   posición. `checkpointBefore()` reemplaza las cuatro búsquedas repetidas. Archivos de 1 TiB o más se rechazan.
+3. **Sin la copia entera del MIDI en JS** (`?fastsource=1` la vuelve a poner). La tabla de pistas lee ventanas de 64 KiB
+   que se duplican hasta 4 MiB mientras las cabeceras siguientes caen justo después de la ventana anterior.
+4. **Helpers más chicos, mismos bytes**: `visRaw_` va en corridas de una pista (`visRawRuns_`: fin y pista de cada
+   corrida) y el conteo por tick recorre las corridas dos veces sin índice por palabra (el mínimo y máximo de tick salen de
+   los extremos de cada corrida); `visOrder_` queda solo para el caso raro de ticks dispersos. `decodeTrackUntil` crece de
+   a un cuarto en vez de duplicar. `VisualMark` inicializa su relleno (antes 4 bytes de basura viajaban en cada resultado y
+   lo hacían no repetible byte a byte).
+5. Herramientas: `browser_bench.py --mem` (PSS por tipo de proceso cada segundo, pico y tiempo de carga en `app`),
+   `--memdetail=S`; `parser-bench.html` pasa su query al Worker y `browser_bench.py parser` elige el archivo antes de
+   esperar el botón (antes nunca arrancaba).
+
+### Medición
+
+Chromium del contenedor, mismos archivos, base = rev. 111 (antes del rebase):
+
+| The Nuker 3 entero, WASMIDI, `?helpers=3` | antes | después |
+|---|---|---|
+| Antes de abrir el MIDI | 1108 MiB | 1104 MiB |
+| Pico de la carga | 8177 MiB | 6922 MiB |
+| Recién cargado | 7373 MiB | 5756 MiB |
+| Reproduciendo (29 s) | 7548 MiB | 5855 MiB |
+| Cada helper (mapeo) | 551 MB | 473-506 MB |
+| Carga (selector → `result-end`) | 273 s | 230 s |
+
+Underruns, latencia del teclado y adelanto del roll iguales en los dos (el contenedor no alcanza el tiempo real de The
+Nuker 3 con 16384 voces en ninguno).
+
+Recorte de 118-140 s de The Nuker 3 (942 MB, 9679 pistas), `visual-bench.html` 20 s con `?helpers=3&rawlimit=0`, dos
+pasadas alternadas de cada uno: pico 2264/2272 → 2027/2045 MiB, al final 2205/2237 → 1984/2009 MiB; cuadros 1196-1203 →
+1200-1204, roll atrasado 0-3 → 2-3 cuadros, teclado 58,0-58,5 → 58,1-58,8/s (ruido entre corridas iguales).
+
+`parser-bench.html` con el mismo recorte (solo la carga):
+
+| | pico antes | pico después | total antes | total después |
+|---|---|---|---|---|
+| zstd (`rawlimit=0`) | 1528-1551 MiB | 577-602 MiB | 10,3-11,2 s | 10,2-11,1 s |
+| crudo | 2376-2440 MiB | 1408-1488 MiB | 9,6-10,2 s | 10,5-10,8 s |
+
+En crudo el Worker del parser ahora lee el archivo con `FileReaderSync` de a 8 MiB mientras los helpers escanean: en este
+contenedor cada llamada cuesta ~1-1,4 ms (Dekx midió ~0,3 ms en Windows, §60) y la lectura sale ~0,5 s más lenta que la
+copia entera; la tabla de pistas por ventanas tarda ~1,1 s (antes, con la copia, ~0 s después de ~1 s de copia). En las
+PCs la estimación con 0,3 ms por llamada da tabla 0,27 s contra ~0,4 s de copia. Con The Nuker 3 entero (que nunca tuvo
+copia, pasa 1 GiB) la tabla baja de 9679 lecturas a ~4130 (estimado en Windows 3,0 → 2,0 s).
+
+Host, decodificación de helper (recorte, tramos de 8 M eventos, todos los tramos y tres repeticiones): heap usado
+382,6 → 268,8 MB, resultados idénticos byte a byte; callgrind (recorte de 1 s) 13,95 G → 13,47 G instrucciones
+(`visualOrderRaw` −18%). Checkpoints de The Nuker 3: 466 → 222 MB.
+
+### Verificación
+
+- `tools/feeder_check/check.sh`: 29 IDENTICAL (después del rebase sobre la rev. 116).
+- `tools/local_build.sh`: pruebas de host del CI, compilación y `midi_parser_bootstrap_smoke.cjs` (helpers desde el
+  heap compartido) OK.
+- Chromium: WASMIDI con The Nuker 3 entero, visual-bench en colores por canal y por pista, WASMIDI Audio con el recorte.
+
+### No verificado / pendiente
+
+- En las PCs de Dekx: memoria y tiempo de carga, en especial MIDIs de menos de 1 GiB (crudos) donde la copia en JS se
+  usaba: si cargan más lento, `?fastsource=1` vuelve a la copia y decide.
+- Firefox/Safari: el parser usa memoria compartida Memory64.
+- Ideas medidas pero no hechas por riesgo de rendimiento o de carga: pasar a zstd los MIDIs crudos (menos RAM y con
+  helpers, pero comprimir alarga la carga); helpers que lean el MIDI crudo desde el heap compartido (crudo + helpers sin
+  copias); un pool de pthreads de WasmiSynth más chico (34 Workers vacíos; riesgo de bloqueo al crear hilos tarde); helpers
+  que escriban su ventana cruda en el heap del parser durante la carga en paralelo (el Worker del parser no leería el
+  archivo otra vez).

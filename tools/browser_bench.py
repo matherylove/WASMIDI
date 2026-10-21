@@ -26,6 +26,9 @@ Options: --url=http://127.0.0.1:8080  --headed  --log (every console message)
          --trace=S:D:OUT (app: Chromium trace from second S for D seconds, saved to OUT for
                    chrome://tracing; prints the main thread's top-level tasks by total time)
          --uncapped (Chromium draws frames as fast as it can, without vsync)
+         --memdetail=S (app: at second S, performance.measureUserAgentSpecificMemory() by Worker)
+         --mem (app, audio, visual, parser: print the PSS of all Chromium processes, by kind, every
+                second and the peak; app: also the MIDI load time from the file pick to the first frame)
          --hide=S (audio: from second S on, the page reports itself hidden, like a tab in
                    the background; the clock on the page must stop while the audio goes on)
 Chromium: $WASMIDI_CHROMIUM, else /opt/pw-browsers/chromium if present, else Playwright's. Headless
@@ -35,6 +38,7 @@ import collections
 import json
 import os
 import sys
+import time
 
 from playwright.async_api import async_playwright
 
@@ -42,12 +46,45 @@ args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = [a for a in sys.argv[1:] if a.startswith("--")]
 url = next((f.split("=", 1)[1] for f in flags if f.startswith("--url=")), "http://127.0.0.1:8080")
 headed = "--headed" in flags
+mem = "--mem" in flags
+memdetail = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--memdetail=")), None)
 log_all = "--log" in flags
 query = next((f.split("=", 1)[1] for f in flags if f.startswith("--query=")), "")
 qs = ("?" + query) if query else ""
 uncapped = ["--disable-frame-rate-limit", "--disable-gpu-vsync"] if "--uncapped" in flags else []
 chromium = os.environ.get("WASMIDI_CHROMIUM") or (
     "/opt/pw-browsers/chromium" if os.path.exists("/opt/pw-browsers/chromium") else None)
+
+
+def chromium_pss():
+    """PSS in MiB of every Chromium process of this machine, by --type= (browser, renderer, gpu...)."""
+    kinds = collections.Counter()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").split()
+            if not cmd or b"chrom" not in os.path.basename(cmd[0]).lower():
+                continue
+            kind = next((a.split(b"=", 1)[1].decode() for a in cmd if a.startswith(b"--type=")), "browser")
+            with open("/proc/%s/smaps_rollup" % pid) as f:
+                pss = next(int(l.split()[1]) for l in f if l.startswith("Pss:"))
+            kinds[kind] += pss / 1024.0
+        except (OSError, StopIteration, ValueError):
+            pass
+    return kinds
+
+
+mem_peak = {"total": 0.0}
+
+
+def mem_line():
+    kinds = chromium_pss()
+    total = sum(kinds.values())
+    mem_peak["total"] = max(mem_peak["total"], total)
+    return "PSS %6.0f MiB (peak %6.0f)  " % (total, mem_peak["total"]) + "  ".join(
+        "%s %.0f" % (k, v) for k, v in sorted(kinds.items()))
 
 
 async def main():
@@ -58,16 +95,19 @@ async def main():
         browser = await p.chromium.launch(
             headless=not headed, executable_path=chromium,
             # The Vulkan flag breaks the app's WebGL2 roll in headless Chromium; WebGPU needs it.
-            args=uncapped + (["--autoplay-policy=no-user-gesture-required"] if mode == "app" else
+            args=uncapped + ["--enable-blink-features=ForceEagerMeasureMemory"] + (["--autoplay-policy=no-user-gesture-required"] if mode == "app" else
                   ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--autoplay-policy=no-user-gesture-required"]))
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
         page.on("console", lambda m: print("[console]", m.type, m.text) if log_all or m.type in ("error", "warning") else None)
         page.on("pageerror", lambda e: print("[pageerror]", e))
         if mode == "parser":
-            await page.goto(url + "/parser-bench.html")
-            await page.wait_for_function("() => !document.getElementById('run').disabled", timeout=120000)
+            await page.goto(url + "/parser-bench.html" + qs)
             await page.set_input_files("#file", args[1])
+            await page.wait_for_function("() => !document.getElementById('run').disabled", timeout=120000)
             await page.click("#run")
+            while mem and not await page.evaluate("() => /total/.test(document.getElementById('report').textContent)"):
+                await page.wait_for_timeout(1000)
+                print(mem_line())
             await page.wait_for_function("() => /total/.test(document.getElementById('report').textContent)",
                                          timeout=3600000)
             print(await page.text_content("#report"))
@@ -120,6 +160,9 @@ async def main():
             await page.fill("#start", args[2] if len(args) > 2 else "0")
             await page.fill("#duration", args[3] if len(args) > 3 else "20")
             await page.click("#run")
+            while mem and not await page.evaluate("() => /total:/.test(document.getElementById('report').textContent)"):
+                await page.wait_for_timeout(1000)
+                print(mem_line())
             await page.wait_for_function("() => /total:/.test(document.getElementById('report').textContent)",
                                          timeout=3600000)
             print(await page.text_content("#report"))
@@ -184,8 +227,18 @@ async def main():
                 await page.keyboard.type(voices)
                 await page.keyboard.press("Enter")
                 await page.wait_for_timeout(1500)
+            if mem:
+                print("before the MIDI: " + mem_line())
+            picked = time.monotonic()
             await choose(800, 400, args[1])
+            if mem:
+                while not await page.evaluate("() => window.__wb.loaded"):
+                    await page.wait_for_timeout(1000)
+                    print("loading %5.0f s  %s" % (time.monotonic() - picked, mem_line()))
             await page.wait_for_function("() => window.__wb.loaded", timeout=3600000)
+            loaded_at = time.monotonic()
+            if mem:
+                print("MIDI loaded in %.1f s (file picker to result-end)  %s" % (loaded_at - picked, mem_line()))
             await page.wait_for_timeout(3000)
             await page.mouse.click(906, 88)  # play
             seek_at = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--seek=")), None)
@@ -256,6 +309,18 @@ async def main():
                         voices: globalThis.WasmidiSnappyBridge ? WasmidiSnappyBridge.state.activeVoices : -1,
                         underruns: globalThis.WasmidiSnappyBridge ? WasmidiSnappyBridge.state.underruns : -1 };
                     s.req = s.rep = s.deltas = 0; return r; }""")
+                if mem:
+                    print("      " + mem_line())
+                if memdetail is not None and second == memdetail:
+                    print(await page.evaluate("""async () => {
+                        const r = await performance.measureUserAgentSpecificMemory(), by = {};
+                        for (const b of r.breakdown) {
+                            const a = b.attribution[0], key = a ? (a.scope + " " + String(a.url).split("/").pop().split("?")[0]) : "shared/other";
+                            by[key] = (by[key] || 0) + b.bytes;
+                        }
+                        return "measureUserAgentSpecificMemory: " + (r.bytes / 1048576).toFixed(0) + " MiB; " + Object.entries(by)
+                            .sort((x, y) => y[1] - x[1]).map(([k, v]) => k + " " + (v / 1048576).toFixed(0)).join(", ");
+                    }"""))
                 print("%3d s  tick %8d  key-state %3d req %3d rep  latency avg %6.1f max %6.1f ms  roll lead %8d ticks  deltas %4d  voices %6s  underruns %s" % (
                     second + 1, st["tick"], st["req"], st["rep"], st["avg"], st["max"], st["lead"], st["deltas"],
                     st["voices"], st["underruns"]))

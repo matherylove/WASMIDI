@@ -271,6 +271,14 @@ private:
         uint32_t tick;
         uint8_t runningStatus;
     };
+    // Checkpoint i of a track resumes after i * CheckpointEventInterval events: 10 bytes, the
+    // byte offset in 40 bits.
+    struct TrackSeekPoint {
+        uint32_t tick;
+        uint32_t offsetLow;
+        uint8_t offsetHigh;
+        uint8_t runningStatus;
+    };
     struct SeekStateEvent {
         uint32_t tick;
         uint16_t track;
@@ -306,10 +314,13 @@ private:
         uint64_t byteEnd = 0;
         uint32_t maxTick = 0;
         uint64_t channelEnd = 0;  // just past the last channel event (rev. 82)
-        std::vector<TrackCheckpoint> checkpoints;
+        std::vector<TrackSeekPoint> checkpoints;
         std::vector<VisualSnapshot> snapshots;
         std::vector<LiveSnapshotPoint> liveSnapshots;
     };
+    static TrackSeekPoint seekPoint(uint64_t byteOffset, uint32_t tick, uint8_t runningStatus);
+    // The last checkpoint before `tick` (the first one if none is).
+    static TrackCheckpoint checkpointBefore(const TrackStorage& storage, uint32_t tick);
     // Cursors stop after the last channel event: a tempo-only tail is never re-read.
     static uint64_t cursorEnd(const TrackStorage& t) { return t.channelEnd ? t.channelEnd : t.byteEnd; }
     struct SysExRef {
@@ -548,7 +559,7 @@ private:
     // whole pieces (HANDOFF sec. 87). Each piece is run-encoded: a header per (tick, track)
     // group, then runs of words sharing status, data 2 and copy count, one byte per word, with
     // a mark every VisualMarkWords words for seeking (HANDOFF sec. 88).
-    struct VisualMark { uint64_t word; uint32_t byte, tick, track; };
+    struct VisualMark { uint64_t word; uint32_t byte, tick, track, reserved = 0; };
     // Roll summary (HANDOFF sec. 108): per segment of a piece, the copies count walk of each
     // (channel, key) it touches, so the sweep in channel colors applies the segment without its words.
     struct RollSegment {
@@ -655,7 +666,10 @@ private:
     MergeCursor visCursor_;
     uint32_t visCursorTick_ = ~0u;
     std::vector<FeedWord> visRaw_;
-    std::vector<uint16_t> visRawTrack_;
+    // visRaw_ comes in runs of one track: where each run ends and its track.
+    struct VisualRawRun { uint32_t end; uint32_t track; };
+    std::vector<VisualRawRun> visRawRuns_;
+    void visualMarkRun(std::size_t track);
     std::vector<uint32_t> visOrder_;
     std::vector<uint32_t> visTickCount_;
     std::vector<EventWord> visSpanEvents_;

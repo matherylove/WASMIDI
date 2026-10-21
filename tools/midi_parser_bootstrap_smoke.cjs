@@ -298,14 +298,14 @@ async function synthFeedSmoke(Module, createParser, denseMidi) {
     const image = Module.HEAPU8.slice(sizeNumber(Module._wmp_feed_buffer_ptr_js()),
         sizeNumber(Module._wmp_feed_buffer_ptr_js()) + sizeNumber(Module._wmp_feed_buffer_size_js()));
     const slabBytes = sizeNumber(Module._wmp_source_slab_bytes_js());
+    // Helpers read the slabs from the parser's shared heap (HANDOFF sec. 114).
+    if (!(Module.HEAPU8.buffer instanceof SharedArrayBuffer))
+        throw new Error("The parser heap is not shared");
     const slabs = [];
-    for (let i = 0; i < sizeNumber(Module._wmp_source_slab_count_js()); ++i) {
-        const ptr = sizeNumber(Module._wmp_source_slab_ptr_js(i));
-        const sab = new SharedArrayBuffer(slabBytes);
-        new Uint8Array(sab).set(Module.HEAPU8.subarray(ptr, ptr + slabBytes));
-        slabs.push(sab);
-    }
+    for (let i = 0; i < sizeNumber(Module._wmp_source_slab_count_js()); ++i)
+        slabs.push(sizeNumber(Module._wmp_source_slab_ptr_js(i)));
     const Helper = await createParser({ noInitialRun: true, noExitRuntime: true, print() {}, printErr() {} });
+    globalThis.__wasmidiFeedHeap = Module.HEAPU8.buffer;
     globalThis.__wasmidiFeedSlabs = slabs;
     globalThis.__wasmidiFeedSlabBytes = slabBytes;
     Helper.HEAPU8.set(image, sizeNumber(Helper._wmp_feed_buffer_js(image.length)));
@@ -400,13 +400,13 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
         throw new Error("Visual smoke: no helper image");
     const image = bufferBytes(Module);
     const slabBytes = sizeNumber(Module._wmp_source_slab_bytes_js());
+    // Helpers read the slabs from the parser's shared heap (HANDOFF sec. 114).
+    if (!(Module.HEAPU8.buffer instanceof SharedArrayBuffer))
+        throw new Error("The parser heap is not shared");
     const slabs = [];
-    for (let i = 0; i < sizeNumber(Module._wmp_source_slab_count_js()); ++i) {
-        const ptr = sizeNumber(Module._wmp_source_slab_ptr_js(i));
-        const sab = new SharedArrayBuffer(slabBytes);
-        new Uint8Array(sab).set(Module.HEAPU8.subarray(ptr, ptr + slabBytes));
-        slabs.push(sab);
-    }
+    for (let i = 0; i < sizeNumber(Module._wmp_source_slab_count_js()); ++i)
+        slabs.push(sizeNumber(Module._wmp_source_slab_ptr_js(i)));
+    globalThis.__wasmidiFeedHeap = Module.HEAPU8.buffer;
     globalThis.__wasmidiFeedSlabs = slabs;
     globalThis.__wasmidiFeedSlabBytes = slabBytes;
     const helper = async () => {
