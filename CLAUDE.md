@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§102). Este archivo resume el estado al cierre de la rev. 105 y dice
+`HANDOFF.md` (§1-§103). Este archivo resume el estado al cierre de la rev. 106 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 105)
+## Estado actual (rev. 106)
 
 Rendimiento medido por el usuario:
 
@@ -314,6 +314,12 @@ Rendimiento medido por el usuario:
   decay en dB hasta sustain, Q y filtro como SF2, loops 1/3, pan de potencia constante; las clases exclusivas no
   apagan capas de la misma nota. Arachno: niveles a ~1 dB de BASSMIDI (antes hasta -14 dB). Falta envolvente de
   modulación, LFOs, moduladores, reverb y chorus.
+- Rev. 106 (HANDOFF §103): el usuario pidió que el roll no dibuje superposiciones ni notas que no se ven. Cada tile
+  es ahora una trama con la nota de arriba por píxel (`RasterTile`, regla de capas igual) y se dibuja con un solo
+  cuadrilátero que la pinta con el mismo estilo: cada píxel una vez por cuadro (antes 8-246× más columnas en tiles
+  densos). Scroll en píxeles enteros (`sharpScrollPx_`, `uViewFrac` para lo crudo). Los tiles ya no recorren el ring
+  desde la cola: lista de notas largas (`longIds_`). The Nuker 3 a 2:00 con note speed 0,1 en el contenedor: armado
+  2-11 ms/s con 0,5-2,5 M notas residentes. Sin medir con GPU real.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -327,6 +333,8 @@ Mecanismos activos y cómo desactivarlos:
 | Fuente cruda / zstd en el navegador | `?rawlimit=MiB` (`0` fuerza zstd) |
 | Flujo visual plegado (roll + teclado) | `?visualstream=0`; `?visualdebug=1` mide en consola (Worker del parser y, en WASMIDI, `[WASMIDI app]`) |
 | Tiles culleados del roll | `?tiles=0` en la URL |
+| Tiles de solo lo visible: una celda por píxel con la nota de arriba, un cuadrilátero por tile; scroll en píxeles enteros (rev. 106) | `?tiles=0` (todo crudo, con sobredibujo) |
+| Lista de notas largas para armar tiles sin recorrer el ring desde la cola (rev. 106) | sin interruptor (`longIds_`) |
 | Límite de render del synth | `?synthlimit=0` / `ssw_set_render_limit_percent(0)` |
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |
 | Tope de robos por ciclo (25%) | `ssw_set_steal_cap_percent(0)` |
@@ -375,7 +383,8 @@ Mecanismos activos y cómo desactivarlos:
    rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
    Rev. 93: modos look-ahead y canción entera (como BPFA).
-   Falta: los dos modos de la rev. 93 en las PCs (canción entera de The Nuker 3 con 32 GB);
+   Falta: cuadros del roll de solo lo visible (rev. 106) con GPU real; los dos modos de la rev. 93 en las PCs
+   (canción entera de The Nuker 3 con 32 GB);
    el tiempo de carga (el usuario: sharkmidi abre mucho más rápido); The Nuker 3 en WASMIDI con 12288 voces (`helpers N% busy` de
    `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
    log de consola del cierre de WasmiSynth en pausa;

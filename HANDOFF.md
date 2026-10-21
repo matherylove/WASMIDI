@@ -6771,3 +6771,105 @@ Costo con MatheryLSD (una capa por nota), MIDI sintético de 3000 notas/s en 16 
 - Envolvente de modulación, LFOs y moduladores de SF2 (vibrato, filtro que se abre y se cierra): siguen sin
   implementarse. Reverb y chorus tampoco (BASSMIDI los aplica por defecto con los envíos de la SF2).
 - Con SFZ el decay ahora también es exponencial (como sfizz); no se comparó con otra implementación.
+
+## 103. Revisión 106 — el roll dibuja solo lo que se ve
+
+### Pedido
+
+Dekx, con una captura de The Nuker 3 a 2:05 en Brave (note speed 0,10 s, 6144 voces, roll 11 cuadros/s y
+teclado 12): "no tengo tiempo para hacer debug, tienes que hacer algo que basicamente ignore la polyphony en el
+visualizador, algo que basicamente no se moleste en dibujar overlaps ni en dibujar notas que no se van a ver, por
+ejemplo si hay una nota que dura dos ticks, y arriba hay una nota de un tick, el medio tick de la nota que queda
+abajo, solo se dibuja la mitad que si se puede ver".
+
+### Causa
+
+Los tiles culleados (§38, §73, §81, §84) quitaban solo las notas que no aportan ningún píxel; cada nota que
+quedaba se dibujaba entera, con la de arriba encima. Una nota larga tapada casi toda se pintaba completa, y en
+las zonas densas cada tile mandaba decenas o cientos de miles de instancias, la mayoría pintando píxeles que
+otra nota tapaba después. El trabajo de la GPU crecía con la polifonía, no con el tamaño del roll.
+
+Además, armar un tile recorría el ring desde la cola, y una sola nota larga sostiene la cola
+(`advanceSharpTail` para en la primera nota abierta o que termina después del borde izquierdo). Con note speed
+0,1 s hay 5 tiles por segundo de canción y cada uno recorría todas las notas residentes desde esa nota.
+
+### Cambios
+
+- Tile de solo lo visible (`RasterTile`, `RasterBegin`/`RasterAddReversed` en `note_raster_compositor`): de
+  adelante hacia atrás (orden inverso del ring, la misma regla de capas de siempre), cada celda (columna de píxel
+  × tecla) se queda con la primera nota que cubre el centro del píxel. En enteros exactos: la columna c está
+  cubierta si 2·(inicio − inicio del tile)·ancho ≤ (2c + 1)·ventana < 2·(fin − inicio del tile)·ancho, la regla
+  de centros de la GPU. La tabla del tile guarda solo las notas que ganaron al menos una celda. El ejemplo del
+  pedido queda así: de la nota de dos ticks se ven solo los píxeles de su primer tick.
+- Cada tile se sube como dos texturas: celdas `R32UI` (ancho del roll × 128 teclas, índice en la tabla + 1, 0
+  vacía; si el ancho pasa `GL_MAX_TEXTURE_SIZE`, sigue en bandas de 128 filas) y la tabla `RGB32UI` (inicio,
+  fin, datos). Se dibuja con un solo cuadrilátero recortado al tile (`tileFragment`): cada píxel busca su tecla
+  (inversa exacta de `keyEdge`), su celda y su nota, y la pinta como `noteVertex`/`noteFragment` (degradado por
+  fila, borde de 1 px solo si el lado mide ≥ 3 px, damero de 2 px, brillo mientras suena, nota abierta hasta
+  `viewEnd`). Cada píxel del roll se escribe una vez por cuadro, haya las notas que haya.
+- Scroll en píxeles enteros: `calculateSharpView` redondea el borde izquierdo a un píxel (`sharpScrollPx_`). El
+  tile k empieza en el píxel k × ancho desde el tick 0, así que sus columnas caen en columnas de la pantalla.
+  `uViewFrac` lleva la fracción de tick al dibujo crudo (`?tiles=0` o tiles que todavía no cubren), que queda
+  con el mismo corrimiento. La posición sale del tick exacto, no del entero: con PPQ bajo y note speed chico el
+  roll ya no avanza a saltos de un tick. Al empezar la canción `viewEnd` es el borde derecho de la pantalla
+  (antes, en la primera media ventana, el tick del cursor + media ventana).
+- Todos los tiles usan la trama (antes, con menos de 50 000 notas se subían las notas crudas).
+- Notas largas (`longIds_`, `scanLongNotes`): una nota que empieza una ventana o más antes de un tile y llega a él
+  dura más de una ventana o está abierta. Un cursor pasa una vez por cada nota del ring y anota esas. Un tile toma
+  las anotadas que lo alcanzan más el tramo del ring desde una ventana antes de su inicio (búsqueda binaria), sin
+  recorrer desde la cola. El tramo del ring se compone en su lugar, sin copiarlo; las notas largas se copian al
+  empezar el tile. La lista se poda de notas que terminaron antes del primer tile guardado.
+- Un tile visible que falta se arma al momento en un trabajo aparte (`cullSyncJob_`), sin tirar el tile que se
+  arma de a pedazos.
+- `browser_bench.py app --resize=S:WxH` cambia el tamaño de la página (diseño del celular con 420x860).
+- El contador "drawn max" de `[WASMIDI app]` cuenta ahora las notas que se ven en al menos un píxel.
+
+### Medición
+
+- Sobredibujo en tiles sintéticos de 1920 px × 128 teclas (los generadores de `note_raster_compositor_check`):
+  columnas de píxel que pintaban las notas que sobrevivían al cull, contra celdas que se pintan ahora.
+
+  | caso | antes | ahora | veces |
+  |---|---|---|---|
+  | denso, 100 k notas de ≤ 60 ticks | 1,30 M | 154 k | 8,5× |
+  | 1 M notas de ≤ 20 ticks | 2,25 M | 246 k | 9,2× |
+  | 50 k notas de ≤ 3000 ticks | 26,5 M | 245 k | 108× |
+  | 300 k notas de ≤ 1200 ticks | 60,5 M | 246 k | 246× |
+
+  Cada píxel del roll se pinta ahora una vez por cuadro.
+- Componer un tile en host (-O2, de a 4096 notas): 1 M notas 10-12 ms, 300-400 k notas 4-7 ms.
+- Chromium del contenedor (4 hilos, SwiftShader), WASMIDI con The Nuker 3 desde 1:58, note speed 0,10 s, 1024
+  voces, 30 s: 5 tiles por segundo, 2-11 ms de armado por segundo (máximo 4 ms por pedazo), ningún tile visible
+  armado al momento, nada dibujado crudo, 0 cuadros retenidos, 0 saltos, 0 underruns. Las notas residentes en el
+  ring subieron de 0,55 M a 2,5 M en esos 30 s (una nota larga sostiene la cola) y el armado no creció con ellas.
+  Los cuadros por segundo del contenedor no sirven (SwiftShader, §79).
+
+### Verificación
+
+- `tools/note_raster_compositor_check.cpp`, sección 5 (corre en el CI): siete casos (el ejemplo del pedido, 10 k a
+  1 M notas, tile desplazado de 1500 px, tile parcial con notas abiertas, 0,37 y 40 px por tick), agregados de a
+  4096 desde el final como en el renderer, comparados celda por celda con una referencia en enteros exactos (todas
+  las notas en orden, la de después encima): 0 diferencias.
+- La inversa de `keyEdge` del shader da la misma tecla que `keyEdge` para todas las alturas de 1 a 6000 px.
+- Pruebas de host del CI y compilación local con Emscripten 3.1.56 / Qt 6.8.3 (`tools/local_build.sh`).
+- Chromium, un mismo cuadro pausado dibujado con la trama y crudo:
+  - many30.mid horizontal (`?tiles=0` en otra corrida; los dos cuadros se repiten idénticos entre corridas):
+    56 914 píxeles de nota en ambos, iguales salvo 373 con ±1 en el degradado. 682 píxeles distintos, todos en
+    bordes corridos una columna. Con las notas del ring volcadas, esos bordes caen a menos de 1/32 px del centro de
+    un píxel (por ejemplo en 46,504 px: el dibujo crudo pinta la columna 46 y la trama no): SwiftShader redondea
+    los vértices a 1/16 px y la trama usa la cuenta exacta.
+  - many30.mid en el diseño del celular (420×860, `--resize`): 4755 píxeles de nota iguales y 194 en bordes en
+    empate (con 0,625 px por tick muchos bordes caen justo en un centro, y en vertical la GPU desempata del otro
+    lado).
+  - The Nuker 3 a 2:38 con note speed 0,1, trama y crudo alternando en la misma corrida (cambio temporal, no
+    quedó en el código): 1143 píxeles distintos de 660 000, todos bordes corridos una columna. Ninguna zona con
+    notas faltantes, que es lo que se vería si la lista de notas largas perdiera alguna.
+
+### No verificado
+
+- Los cuadros por segundo con GPU real en las PCs de Dekx, que es lo que pidió: el contenedor no tiene GPU.
+- Memoria de GPU: cada tile guarda ancho × 128 × 4 B de celdas (0,46 MB a 892 px, 2 MB a 3840 px) más su tabla,
+  hasta unos 33 tiles por delante del cursor.
+- Un navegador con `GL_MAX_TEXTURE_SIZE` menor que el largo del roll (las bandas no se probaron).
+- Donde el roll todavía dibuja crudo (sin tile que cubra la pantalla tras un salto, o `?tiles=0`) sigue el
+  sobredibujo de antes.

@@ -252,6 +252,95 @@ static int RunAll() {
         }
     }
 
+    std::printf("5. tile visible-only (HANDOFF sec. 102): cada celda = la nota de arriba\n");
+    {
+        struct Case { const char* name; int notes; int keys; int len; std::uint32_t tileStart;
+                      std::uint32_t span; int width; std::uint32_t coverage; int openEvery; };
+        const Case cases[] = {
+            { "dos ticks bajo uno",        2,   1,    2,     0,  960, 1920,     0, 0 },
+            { "disperso 10k",          10000,  80,  200,     0, 3840, 1920,     0, 0 },
+            { "crashpoint 1M",       1000000, 128,   20,     0, 3840, 1920,     0, 0 },
+            { "tile 7, 1500 px",      400000, 128,  900, 26880, 3840, 1500,     0, 50 },
+            { "parcial + abiertas",   300000, 128, 5000, 26880, 3840, 1500, 28000, 7 },
+            { "0,37 px por tick",     300000, 128,   40,     0, 5184, 1919,     0, 0 },
+            { "40 px por tick",         2000, 128,    6,   380,   38, 1520,     0, 0 },
+        };
+        for (const Case& c : cases) {
+            std::mt19937 rng(777);
+            std::uniform_int_distribution<int> pitch(0, c.keys - 1);
+            std::uniform_int_distribution<int> start(-(int)c.span, (int)c.span - 1);
+            std::uniform_int_distribution<int> len(1, c.len);
+            std::vector<CompositorNote> notes;
+            if (c.notes == 2) {
+                // The user's example: a two-tick note under a one-tick note.
+                notes = { { 100u, 102u, Pack(90, 64, 1) }, { 101u, 102u, Pack(90, 64, 2) } };
+            } else {
+                for (int i = 0; i < c.notes; ++i) {
+                    const int st = std::max(0, (int)c.tileStart + start(rng));
+                    const bool open = c.openEvery && i % c.openEvery == 0;
+                    notes.push_back({ (std::uint32_t)st, open ? 0u : (std::uint32_t)(st + len(rng)),
+                        Pack(60 + (i % 60), pitch(rng), i % 7) });
+                }
+                SortByStart(notes);
+            }
+            CompositorSettings s;
+            s.startTick = c.tileStart; s.spanTicks = c.span; s.rasterWidth = c.width;
+            s.firstKey = 0; s.keyCount = 128;
+            s.viewEndTick = c.coverage ? c.coverage : c.tileStart + c.span;
+
+            // Reference: every note in ring order over the cells whose centre it covers,
+            // later ones on top, in exact integers.
+            const std::int64_t w = c.width, span = c.span, ts = c.tileStart;
+            std::vector<int> owner((std::size_t)w * 128, -1);
+            for (std::size_t i = 0; i < notes.size(); ++i) {
+                const CompositorNote& n = notes[i];
+                const std::int64_t ns = n.startTick;
+                const std::int64_t ne = std::min<std::int64_t>(s.viewEndTick,
+                    n.endTick ? (std::int64_t)n.endTick : (std::int64_t)s.viewEndTick);
+                const int key = (int)((n.packedData >> 8) & 0xff);
+                for (std::int64_t col = 0; col < w; ++col) {
+                    const std::int64_t centre = (2 * col + 1) * span;
+                    if (2 * (ns - ts) * w <= centre && centre < 2 * (ne - ts) * w)
+                        owner[(std::size_t)key * w + col] = (int)i;
+                }
+            }
+
+            RasterTile tile;
+            CompositorScratch scratch;
+            const auto t0 = std::chrono::steady_clock::now();
+            RasterBegin(s, scratch, tile);
+            // In slices from the end, as the renderer does over frames.
+            for (std::size_t end = notes.size(); end > 0;) {
+                const std::size_t begin = end > 4096 ? end - 4096 : 0;
+                RasterAddReversed(notes.data() + begin, end - begin, s, scratch, tile);
+                end = begin;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::size_t diff = 0, shown = 0;
+            for (std::size_t i = 0; i < owner.size(); ++i) {
+                const std::uint32_t cell = tile.cells[i];
+                if (owner[i] < 0) { diff += cell != 0u; continue; }
+                ++shown;
+                if (cell == 0u || cell > tile.table.size()) { ++diff; continue; }
+                const CompositorNote& a = tile.table[cell - 1u];
+                const CompositorNote& b = notes[(std::size_t)owner[i]];
+                diff += a.startTick != b.startTick || a.endTick != b.endTick || a.packedData != b.packedData;
+            }
+            CHECK(diff == 0, "%s: %zu cells differ from the reference", c.name, diff);
+            if (c.notes == 2) {
+                // 2 px per tick: the lower note keeps only the two columns of its first tick.
+                const std::uint32_t* row = tile.cells.data() + (std::size_t)64 * c.width;
+                const auto at = [&](int col) { return row[col] ? tile.table[row[col] - 1u].packedData : 0u; };
+                CHECK(at(199) == 0u && at(200) == notes[0].packedData && at(201) == notes[0].packedData &&
+                      at(202) == notes[1].packedData && at(203) == notes[1].packedData && at(204) == 0u &&
+                      tile.table.size() == 2, "two ticks under one: wrong cells");
+            }
+            std::printf("   %-24s %8zu notas -> %6zu visibles, %7zu celdas  %6.2f ms\n",
+                c.name, notes.size(), tile.table.size(), shown, ms);
+        }
+    }
+
     return 0;
 }
 

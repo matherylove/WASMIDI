@@ -17,7 +17,8 @@ Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
          --seek=S (app: at second S click the position slider near the start; --seekx=X clicks at x=X)
          --setting=NAME=VALUE (app: a saved WASMIDI setting before the page loads, e.g. noteSpeed=0.1)
-         --shot=S:OUT (app: screenshot at second S)
+         --shot=S:OUT (app: screenshot at second S; repeatable)
+         --resize=S:WxH (app: at second S the page becomes W x H, e.g. 420x860 for the phone layout)
          --pause=S:D (app: pause at second S and resume D seconds later)
          --profile=S:D:OUT (app: CPU profile of the page's main thread from second S for D seconds,
                    saved to OUT for DevTools; prints the functions with the most self time.
@@ -185,14 +186,19 @@ async def main():
             cdp = await page.context.new_cdp_session(page) if profile or trace else None
             pause = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--pause=")), None)
             seek_x = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--seekx=")), 963)
-            shot = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--shot=")), None)
+            shots = [f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--shot=")]
+            resize = next((f.split("=", 1)[1].split(":", 1) for f in flags if f.startswith("--resize=")), None)
             for second in range(int(seconds)):
                 if pause and second in (int(pause[0]), int(pause[0]) + int(pause[1])):
                     await page.mouse.click(943 if second == int(pause[0]) else 906, 88)  # pause, then play
                 if seek_at is not None and second == seek_at:
                     await page.mouse.click(seek_x, 60)  # position slider, about 18% of the song by default
-                if shot and second == int(shot[0]):
-                    await page.screenshot(path=shot[1])
+                if resize and second == int(resize[0]):
+                    w, h = (int(v) for v in resize[1].split("x"))
+                    await page.set_viewport_size({"width": w, "height": h})
+                for shot in shots:
+                    if second == int(shot[0]):
+                        await page.screenshot(path=shot[1])
                 if trace and second == int(trace[0]):
                     await browser.start_tracing(page=page, path=trace[2], categories=[
                         "toplevel", "blink", "v8", "gpu", "devtools.timeline", "disabled-by-default-devtools.timeline",

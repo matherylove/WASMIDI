@@ -218,6 +218,93 @@ void CullFinish(CompositorProgress& progress, CompositorResult& out) {
     out.culledNotes = progress.noteCount - out.notes.size();
 }
 
+void RasterBegin(const CompositorSettings& settings, CompositorScratch& scratch, RasterTile& out) {
+    const int width = (std::max)(1, settings.rasterWidth);
+    const int keyCount = (std::max)(0, settings.keyCount);
+    const std::size_t wordsPerRow = (static_cast<std::size_t>(width) + 63u) / 64u;
+    scratch.occupancy.assign(wordsPerRow * static_cast<std::size_t>(keyCount), 0ull);
+    scratch.uncovered.assign(static_cast<std::size_t>(keyCount),
+        static_cast<std::uint32_t>(width));
+    out.width = width;
+    out.cells.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(keyCount), 0u);
+    out.table.clear();
+    out.rejectedByFullRow = 0;
+}
+
+void RasterAddReversed(const void* notes, std::size_t count, const CompositorSettings& settings,
+    CompositorScratch& scratch, RasterTile& out) {
+    const int width = out.width;
+    const int keyCount = (std::max)(0, settings.keyCount);
+    if (width <= 0 || keyCount == 0 || notes == nullptr)
+        return;
+    const std::size_t wordsPerRow = (static_cast<std::size_t>(width) + 63u) / 64u;
+    const std::int64_t tileStart = static_cast<std::int64_t>(settings.startTick);
+    const std::int64_t span = (std::max<std::int64_t>)(1, settings.spanTicks);
+    const std::int64_t viewEnd = settings.viewEndTick != 0
+        ? static_cast<std::int64_t>(settings.viewEndTick)
+        : tileStart + span;
+    // First column whose centre is at or right of a tick `d` past the tile start:
+    // (2c + 1) * span >= 2 * d * width, the GPU's pixel-centre rule in integers.
+    const std::int64_t twiceWidth = 2 * static_cast<std::int64_t>(width);
+    const auto column = [&](std::int64_t d) -> int {
+        const std::int64_t num = d * twiceWidth - span;
+        if (num <= 0) return 0;
+        return static_cast<int>((std::min<std::int64_t>)(width, (num + 2 * span - 1) / (2 * span)));
+    };
+    const unsigned char* bytes = static_cast<const unsigned char*>(notes);
+    for (std::size_t i = count; i-- > 0;) {
+        CompositorNote note;
+        std::memcpy(&note, bytes + i * sizeof(CompositorNote), sizeof(CompositorNote));
+        const int row = static_cast<int>((note.packedData >> 8) & 0xffu) - settings.firstKey;
+        if (row < 0 || row >= keyCount)
+            continue;
+        std::uint32_t& uncovered = scratch.uncovered[static_cast<std::size_t>(row)];
+        if (uncovered == 0u) {
+            ++out.rejectedByFullRow;
+            continue;
+        }
+        const std::int64_t noteStart = (std::max)(tileStart, static_cast<std::int64_t>(note.startTick));
+        const std::int64_t noteEnd = (std::min)(viewEnd,
+            note.endTick > 0u ? static_cast<std::int64_t>(note.endTick) : viewEnd);
+        if (noteEnd <= noteStart)
+            continue;
+        const int left = column(noteStart - tileStart);
+        const int right = column(noteEnd - tileStart);
+        if (right <= left)
+            continue;
+
+        std::uint64_t* rowWords = scratch.occupancy.data() + static_cast<std::size_t>(row) * wordsPerRow;
+        std::uint32_t* rowCells = out.cells.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(width);
+        const std::uint32_t slot = static_cast<std::uint32_t>(out.table.size()) + 1u;
+        int claimed = 0;
+        for (int word = left >> 6; word <= ((right - 1) >> 6); ++word) {
+            const int lo = word == (left >> 6) ? (left & 63) : 0;
+            const int hi = word == ((right - 1) >> 6) ? ((right - 1) & 63) : 63;
+            const std::uint64_t mask = (hi - lo) == 63 ? ~0ull : (((1ull << (hi - lo + 1)) - 1ull) << lo);
+            std::uint64_t fresh = ~rowWords[word] & mask;
+            if (fresh == 0ull)
+                continue;
+            rowWords[word] |= fresh;
+            claimed += PopCount64(fresh);
+            std::uint32_t* base = rowCells + (word << 6);
+            while (fresh != 0ull) {
+#if defined(__GNUC__) || defined(__clang__)
+                base[__builtin_ctzll(fresh)] = slot;
+#else
+                int bit = 0;
+                while (!((fresh >> bit) & 1ull)) ++bit;
+                base[bit] = slot;
+#endif
+                fresh &= fresh - 1ull;
+            }
+        }
+        if (claimed == 0)
+            continue;
+        out.table.push_back(note);
+        uncovered -= static_cast<std::uint32_t>(claimed);
+    }
+}
+
 void CullViewport(
     const CompositorNote* notes,
     std::size_t noteCount,
