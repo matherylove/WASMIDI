@@ -277,7 +277,7 @@ typedef struct {
     float b2;
     float a1;
     float a2;
-    /* Volume, expression, pan and pitch bend inside the block (HANDOFF sec. 110):
+    /* Volume, expression, pan and pitch bend inside the block (HANDOFF sec. 111):
      * state i holds from frame ctl_offset[i]; state 0 starts at frame 0. */
     int ctl_count;
     int ctl_pitch_varies;
