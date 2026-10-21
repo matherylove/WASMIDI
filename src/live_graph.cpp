@@ -39,6 +39,18 @@ void setPremultiplied(QSGGeometry::ColoredPoint2D* v, float x, float y, const QC
            uchar(std::lround(255.0f * a)));
 }
 
+// The next 1, 2 or 5 × 10^n at or above the value.
+float niceCeiling(float value)
+{
+    if (value <= 1.0f)
+        return 1.0f;
+    const float base = std::pow(10.0f, std::floor(std::log10(value)));
+    for (const float step : {1.0f, 2.0f, 5.0f, 10.0f})
+        if (base * step >= value)
+            return base * step;
+    return base * 10.0f;
+}
+
 } // namespace
 
 LiveGraph::LiveGraph(QQuickItem* parent)
@@ -104,6 +116,8 @@ void LiveGraph::setGridColor(const QColor& value)
 void LiveGraph::clear()
 {
     samples_.clear();
+    npsCeiling_ = polyCeiling_ = 1.0f;
+    emit ceilingChanged();
     update();
 }
 
@@ -140,6 +154,14 @@ void LiveGraph::sample()
     }
 
     samples_.push_back({time_, float(nps_), float(polyphony_)});
+    // The scale only grows, so the line rises and falls inside it.
+    const float npsCeiling = std::max(npsCeiling_, niceCeiling(float(nps_)));
+    const float polyCeiling = std::max(polyCeiling_, niceCeiling(float(polyphony_)));
+    if (npsCeiling != npsCeiling_ || polyCeiling != polyCeiling_) {
+        npsCeiling_ = npsCeiling;
+        polyCeiling_ = polyCeiling;
+        emit ceilingChanged();
+    }
     ++frames_;
     while (!samples_.empty() && samples_.front().time < time_ - span_ - 0.5)
         samples_.pop_front();
@@ -175,14 +197,8 @@ QSGNode* LiveGraph::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
     }
     gridNode->markDirty(QSGNode::DirtyGeometry);
 
-    float maxNps = 1.0f, maxPoly = 1.0f;
+    const float maxNps = npsCeiling_, maxPoly = polyCeiling_;
     const double since = samples_.empty() ? 0.0 : samples_.back().time - span_;
-    for (const auto& s : samples_) {
-        if (s.time < since)
-            continue;
-        maxNps = std::max(maxNps, s.nps);
-        maxPoly = std::max(maxPoly, s.polyphony);
-    }
 
     // Only the samples inside the span, plus the one just before it so the line reaches the left edge.
     int first = 0;

@@ -74,7 +74,7 @@ Item {
                 spacing: 6
                 Text {
                     Layout.fillWidth: true
-                    text: "<font color='" + Dk.accentLight + "'>■</font> NPS " + Dk.compact(dock.mw.nps)
+                    text: "<font color='" + Dk.accentLight + "'>■</font> NPS " + Dk.compact(dock.mw.nps) + " / " + Dk.compact(graph.npsCeiling)
                     textFormat: Text.StyledText
                     color: Dk.dim
                     font.family: Dk.term
@@ -82,7 +82,7 @@ Item {
                 }
                 Text {
                     Layout.fillWidth: true
-                    text: "<font color='" + Dk.pink + "'>■</font> POLY " + Dk.compact(dock.mw.activeVoices)
+                    text: "<font color='" + Dk.pink + "'>■</font> POLY " + Dk.compact(dock.mw.activeVoices) + " / " + Dk.compact(graph.polyCeiling)
                     textFormat: Text.StyledText
                     color: Dk.dim
                     font.family: Dk.term
