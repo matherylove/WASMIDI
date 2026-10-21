@@ -7060,3 +7060,119 @@ speed, ~1 s), así que la línea siempre tocaba el techo.
 ### No verificado
 
 - En las PCs del usuario con MIDIs grandes.
+
+## 108. Revisión 111 — el roll pasa la polifonía de millones
+
+### Pedido
+
+Dekx mandó el registro de lag de WASMIDI con The Nuker 3 y MatheryLSD (137 s tocados, 29 s con lag): los episodios
+de 7:20,7-7:28,7 y 7:22,7-7:29,6 fueron solo ROLL (FPS del roll 0/51,7/61). "Empieza a morir en 0 fps cuando el poly
+sube a más de 300k. Este MIDI puede llegar a tener hasta 5 millones de polifonía, y WASMIDI debe ser capaz de pasar
+sin lag esa polifonía, ya que se supone que la está básicamente ignorando."
+
+### Causa
+
+El roll dibuja solo lo que se ve desde la rev. 106, pero el barrido que arma sus notas (Worker del parser,
+`buildRenderSweepStream`) seguía leyendo cada palabra del flujo visual. Medido en host con The Nuker 3
+(`n3_stage`, colores por canal):
+
+| s | palabras/s | notas del roll/s | barrido (host) |
+|---|---|---|---|
+| 430 | 16,5 M | 208 k | 0,071 s |
+| 434 | 42,5 M | 4 k | 0,155 s |
+| 441 | 45,5 M | 2,9 k | 0,147 s |
+| 447 | 71,8 M | 2,8 k | 0,264 s |
+| 448 | 86,2 M | 77 k | 0,293 s |
+
+Desde 434 s (la polifonía pasa de 175 k a 347 k y sigue hasta 1,5 M a 447 s) cada tecla de cada canal tiene cientos
+de copias sonando: el roll recibe menos de 3000 notas por segundo pero el barrido lee 40-86 M palabras por segundo.
+En wasm, con pedidos de 131072-262144 palabras y el resto del trabajo del Worker del parser (anexar, teclado, feed),
+eso no alcanza: el roll se queda sin cuadros completos (0 fps = esperando notas).
+
+Con colores por pista es peor: el dueño de una tecla es (pista & 15, canal), así que cada note-on de otra pista
+cierra la nota y abre otra. En 436-440 s eso da 19,7 M notas del roll por segundo; el 64% dura cero ticks y el 98%
+menos de 64 ticks (un píxel con note speed 1 son ~84 ticks).
+
+### Cambios
+
+1. **Resumen del roll por tramo (colores por canal).** Los helpers (y la decodificación local) calculan, junto con
+   cada pedazo del flujo visual, un resumen por tramo de 64 marcas (4 M palabras): para cada (canal, tecla) tocada,
+   la suma de copias del tramo, su mínimo y máximo, las caídas a mínimos nuevos (con palabra y tick) y las aperturas
+   y cierres del recorrido que empieza en cero (con la velocidad de cada apertura), como varints. El barrido, al
+   llegar al comienzo de un tramo, aplica el tramo entero sin leer sus palabras:
+   - una tecla con c0 copias sonando cuyo mínimo no llega a -c0 no cambia de nota: solo suma;
+   - si llega, la nota se cierra en la primera caída a -c0 o menos, y desde ahí la tecla sigue el recorrido desde
+     cero (el mismo que con c0 = 0);
+   - se cae a leer palabras si c0 + máximo pasa de 65535 (el contador de 16 bits) o si el dueño no es el canal.
+   Las notas salen ordenadas por palabra, con ids en el mismo orden que el barrido crudo. Un tramo que termina después
+   del objetivo se aplica igual si tiene menos de 2^20 entradas que leer (el barrido termina adelantado; las notas
+   pasadas del objetivo esperan ocultas como cualquier lote parcial). Un tramo guarda su resumen solo si ocupa a lo
+   sumo medio byte por palabra; el resumen viaja en el resultado del helper (el campo reservado de `putVisualResult`
+   ahora indica si viene) y cuenta en la memoria del flujo visual. `?rollsummary=0` lo apaga.
+2. **Plegado por píxel (colores por pista).** El roll manda al Worker su ventana en ticks (W) y su ancho en píxeles
+   (L) con cada reset. Una nota [s, e) se ve si cubre un centro de columna: los centros están en (c + ½)·W/L ticks
+   desde el tick 0 (tile k empieza en k·W, scroll en píxeles enteros, regla `column()` del raster). El barrido guarda
+   cada nota nueva hasta pasar el primer centro después de su comienzo; si se cierra antes, no se manda nunca. Las
+   que siguen abiertas se mandan en orden de comienzo (los centros crecen con el tick), así que los ids y la regla de
+   capas no cambian. Las notas guardadas al final de un lote empiezan su primer píxel después del tick seguro del
+   lote. Cambiar el note speed ya reconstruía el roll; ahora también un ancho distinto con colores por pista.
+   `?rollfold=0` lo apaga.
+3. El codificador del flujo visual (helpers y decodificación local) escribe por puntero sobre un vector agrandado de
+   antemano y calcula el paso del resumen una vez por corrida (canal, ±copias, velocidad), no por palabra.
+4. `visual-bench.html`: `?pertrack=1` (y `?foldpx=`, por defecto 1600) mide los colores por pista con el plegado;
+   el total cuenta las notas del roll recibidas.
+
+### Medición
+
+Host, The Nuker 3 desde el estado real (`roll_compare`, colores por canal), barrido por segundo de canción:
+
+| s | barrido crudo | con resumen |
+|---|---|---|
+| 430 | 0,072 s | 0,031 s |
+| 434 | 0,165 s | 0,0007 s |
+| 440 | 0,218 s | 0,0004 s |
+| 446 | 0,261 s | 0,0005 s |
+| 447 | 0,368 s | 0,0010 s |
+| 448 | 0,375 s | 0,0126 s |
+
+Costo en los helpers (callgrind, 8,4 M palabras de 436 s): codificar el flujo visual costaba 609 M instrucciones; ahora
+419 M sin resumen y 755 M con resumen (+24% de la codificación, unos +3-4% de todo lo que hace un helper por tramo;
+descomprimir y fusionar las pistas no cambia). La primera versión del resumen costaba 1075 M.
+
+Chromium del contenedor (4 hilos, sin GPU, 3 helpers, `visual-bench.html` desde 425 s durante 25 s):
+
+- Colores por canal: el barrido del Worker del parser baja de 160-440 ms a 1-10 ms por segundo (`sweep` de
+  `[WASMIDI visual]`) y queda esperando datos en cada pedido (`starved`), con los helpers al 100%. En este contenedor
+  el límite pasa a ser la decodificación de 3 helpers (feed del synth y flujo visual), que deja de alcanzar a la
+  canción en 437-445 s con o sin resumen. Roll atrasado en 25 s: con resumen 376, 594 y 906 cuadros (475 con la codificación
+  más barata del cambio 3, atrasado desde 443 s); sin resumen 676 y 437. La diferencia entre corridas iguales es mayor que la del cambio: aquí no decide nada. En la PC de Dekx el
+  teclado, que lee el mismo flujo, no se atrasaba en 7:20-7:29: la decodificación alcanzaba y el límite era el barrido.
+- Colores por pista: 26,7 M notas del roll en 25 s (sin plegado, ~278 M). El barrido sigue leyendo cada palabra
+  (300-700 ms por segundo) y el roll se atrasa desde ~440 s.
+- Teclado 31-43 actualizaciones/s en todas las corridas.
+
+### Nota: Full song con The Nuker 3
+
+El modo Full song (rev. 93) no entra nunca con The Nuker 3 (4,78 GB de flujo): el tope es el menor entre lo que queda
+del heap y la mitad de `navigator.deviceMemory`, y los navegadores reportan como máximo 8 GB, así que el tope es 4 GB
+aun con 32 GB de RAM y el roll queda en look-ahead. No se cambió: subirlo arriesga el cierre por memoria de la rev. 107.
+
+### Verificación
+
+- `tools/feeder_check/check.sh`: todo IDENTICAL; nuevo `render fold W:L` (BPFA plegado = barrido viejo filtrado por
+  los mismos centros) con 4000:640, 40000:64 y 100000:32.
+- `midi_parser_bootstrap_smoke.cjs`: colores por pista con plegado, mismo resultado por fusión, flujo local y helper.
+- Host, The Nuker 3 430-449 s desde el estado real (`roll_compare`): resumen = barrido crudo (494 472 aperturas y
+  493 843 cierres idénticos), 242 tramos, 145,5 MiB de resumen para 977 MiB de flujo (0,18 B por palabra).
+- Host, 436 s desde cero (`offline_fold`, 42,3 M palabras): plegado = barrido crudo filtrado, aperturas y cierres
+  idénticos con (L, W) = (1600, 133632), (3840, 13364), (800, 133632) y (1000, 333).
+
+### No verificado
+
+- En las PCs de Dekx con GPU real: The Nuker 3 en 7:14-7:29 con colores por canal (lo esperado es que el roll no
+  dependa de la polifonía) y con colores por pista.
+- Colores por pista en la zona densa: el plegado manda 11× menos notas, pero el barrido todavía es proporcional a las
+  palabras. Un resumen por pista tendría que conocer el plegado en los helpers (con el dueño cambiando en cada
+  note-on de otra pista da ~1 entrada por palabra); queda pendiente.
+- Saltos (reset) a mitad de un tramo con resumen: el barrido lee palabras hasta el borde del tramo siguiente; medido
+  solo en host.

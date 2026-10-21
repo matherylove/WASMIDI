@@ -64,6 +64,8 @@ async function feedMessage(m) {
         if (!ptr)
             throw new Error(errorText(Module, "No memory for the synth feed request"));
         Module.HEAPU8.set(request, ptr);
+        if ((visual || joint) && typeof Module._wmp_roll_summary_js === "function")
+            Module._wmp_roll_summary_js(m.rollSummary === false ? 0 : 1);
         const decode = visual ? Module._wmp_visual_decode_js : joint ? Module._wmp_joint_decode_js : Module._wmp_feed_decode_js;
         if (!decode(request.length))
             throw new Error(errorText(Module, visual ? "Visual span decode failed" : joint ? "Joint span decode failed" : "Synth feed decode failed"));

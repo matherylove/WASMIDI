@@ -1780,6 +1780,33 @@ void wmp_visual_keep_all_js(int keepAll)
 #endif
 }
 
+// Roll summaries (HANDOFF sec. 108): off, the sweep reads every word of the visual stream.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_roll_summary_js(int enabled)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.setRollSummaryEnabled(enabled != 0);
+#else
+    (void)enabled;
+#endif
+}
+
+// Colors per track (HANDOFF sec. 108): the roll's window in ticks and width in pixels; 0 sends every note.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_render_fold_js(uint32_t windowTicks, uint32_t pixels)
+{
+#if WASMIDI_PARSER_BPFA
+    g_mappedStore.setRenderFold(windowTicks, pixels);
+#else
+    (void)windowTicks;
+    (void)pixels;
+#endif
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif

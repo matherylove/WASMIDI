@@ -355,6 +355,7 @@ private:
     uint32_t sharpRemoteBuildTarget_ = 0;
     uint32_t sharpRemoteBuildWindowTicks_ = 0;
     bool sharpRemoteBuildPerTrack_ = false;
+    uint32_t sharpRemoteBuildPixels_ = 0;
 
     uint32_t sharpRemotePendingBase_ = 0;
     // Appends are pre-staged into the CPU/GPU ring as soon as they arrive, but
