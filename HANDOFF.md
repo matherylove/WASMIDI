@@ -7345,3 +7345,72 @@ abajo (por un pedal en el mismo cuanto) queda en la última muestra del segmento
 (antes: al inicio del segmento). Más de 32 cambios por canal en un bloque: los que sobran se aplican
 juntos con el último. La GPU sigue aplicando volumen, expresión y paneo al inicio del segmento.
 Envolvente de modulación, LFOs, moduladores, reverb y chorus siguen pendientes.
+
+## 112. Revisión 115 — modo GPU de WasmiSynth estilo Kestrel, parte 1
+
+**Pedido.** Empezar el modo GPU basado en Kestrel (https://github.com/thtstickyboi/kestrel-midi,
+MPL-2.0).
+
+**Causa / diseño.** El modo GPU de la rev. 73-79 es un "offload": cada voz vive en el CPU, que
+avanza su estado y manda por bloque una petición por voz; con 24576 voces eso sigue costando CPU
+(fase de eventos y armado de peticiones). Kestrel guarda el pool de voces en la GPU (arreglo de
+estructuras por campo, campo f de la voz i en f·slots+i) y cada bloque son cinco pasadas: robar,
+crear, renderizar, reducir y compactar. El CPU solo manda lo nuevo del bloque. Adaptación a tiempo
+real:
+- Kestrel es offline y conoce el número de voces vivas; acá no se lee la GPU de vuelta antes de
+  mandar el bloque. Una pasada `plan` calcula en la GPU cuántas voces robar y cuántas crear a partir
+  de `state[LIVE]`. JS estima las voces vivas (última lectura + creadas desde entonces + las del
+  bloque) solo para elegir cuántos grupos de trabajo lanza el render. Hasta 8 bloques en vuelo; la
+  lectura de la salida y del estado es con `mapAsync`.
+- La fase de eventos del core no cambia: el note-on arma la voz del CPU como siempre (región,
+  muestra, loop, filtro, envolvente, paneo, ganancia) y `kgpu_emit_spawn` la convierte en un comando
+  de 128 B y libera la voz del CPU en el acto. Si la muestra no está en la GPU, o con portamento, la
+  voz se queda en el CPU y se renderiza como antes.
+- Note-offs: tabla por (canal, tecla) como en Kestrel. Cada voz lleva su ordinal (contador de
+  note-on de la tecla); el bloque manda la base de note-offs por tecla y corridas {conteo acumulado,
+  cuadro}, así la GPU sabe en qué cuadro se suelta cada voz (FIFO por tecla). La voz soltada con el
+  sustain del canal puesto espera a que se levante.
+- Filas de canal cada 64 cuadros (ganancia izq./der. con volumen, expresión y paneo; bend en Q24;
+  sustain): los cambios de CC y bend llegan a las voces ya creadas con una rampa de 64 cuadros.
+- Cortes: all sound off y grupos exclusivos como (canal, grupo, cuadro).
+- Robo: selección por radix de 4 bytes sobre la clave de Kestrel (raíz de nivel × ganancia en q16,
+  luego edad); las robadas se apagan en `min(64, cuadros/2)` cuadros. Admisión: si hay más note-on
+  que capacidad, el core los ordena del más fuerte al más débil y la GPU crea los que entran.
+- Render: un hilo por voz, 64 por grupo, tiles de 16 cuadros, reducción en memoria compartida a
+  columnas parciales por grupo y suma de columnas en orden fijo. Fase 32.32, interpolación lineal
+  de muestras int16, biquad SF2 por voz, envolvente attack/hold/decay/sustain/release.
+- El pool tiene capacidad + robo máximo (25%) ranuras; si no entra en el límite de binding del
+  dispositivo, la capacidad se parte a la mitad.
+
+**Cambios.**
+- `Voice/voice.c`: sección Kestrel (`kgpu_*`): listas por worker de spawns, gates y cortes (una
+  lista por hilo, sin escritor compartido; la última es la del hilo que llama), ganchos en note-on,
+  note-off (rápido y lento), sincronización de contadores, all sound off y grupos exclusivos;
+  `voice_kgpu_set_enabled`, `voice_kgpu_begin_block`, `voice_kgpu_finish_block` (devuelve una
+  cabecera de 16 palabras con punteros). El limitador del CPU no corre con el modo Kestrel (como con
+  el offload: la salida la arma la GPU).
+- `snappy_wasm_core.c`: `ssw_kgpu_set_enabled`, `ssw_kgpu_begin_block`, `ssw_kgpu_finish_block`
+  (en `EXPORTED_FUNCTIONS`).
+- `web/snappysynth-kestrel.js` (nuevo, MPL-2.0 con atribución a Kestrel): WGSL y `WasmiKestrelGpu`.
+  Layouts de bind group explícitos (con `layout: "auto"` un entry point que no usa un binding lo
+  pierde y el bind group compartido falla).
+- `web/snappysynth-worker.js`: el botón GPU usa este motor por defecto; `?gpuengine=offload` vuelve
+  al modo de la rev. 79 y `?gpuvoices=N` fija el tamaño del pool (por defecto el límite de voces).
+  Voces mostradas = CPU + vivas en la GPU (última lectura).
+- `tools/browser_bench.py --rms`: RMS máximo por segundo de la salida (AnalyserNode).
+- CI y manifest: copia de `snappysynth-kestrel.js` a `site/`.
+
+**Medición / verificación.** Chromium del contenedor (SwiftShader, sin GPU real), MIDI sintético
+(acordes, batería, sustain, bend, fade de CC7 y una ráfaga en otro canal) con MatheryLSD, WASMIDI
+Audio, `--gpu --rms`: los WGSL compilan, 0 underruns, RMS por segundo igual al modo CPU dentro de
+~1% (p. ej. 0,1653 / 0,1648, 0,0410 / 0,0410), también con `?gpuvoices=64` donde la ráfaga roba.
+Host: `gcc -fsyntax-only` sin advertencias nuevas, `node --check` de `web/*.js`, build local y
+pruebas de host del CI pasan.
+
+**No verificado / falta.**
+- Nada medido con GPU real (rendimiento, voces por segundo, latencia de `mapAsync`), ni en la app
+  WASMIDI con un MIDI negro.
+- Portamento (se queda en el CPU), cambios de CC74 (filtro) y CC72 (release) después del note-on,
+  bajada de ganancia por copia de las pilas VOR/eco (la voz se suelta con el note-off de su última
+  copia), modo mono, orden de voces por región.
+- La suma no es la del CPU bit a bit (orden de suma y filtro en float32).

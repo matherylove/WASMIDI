@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§111). Este archivo resume el estado al cierre de la rev. 114 y dice
+`HANDOFF.md` (§1-§112). Este archivo resume el estado al cierre de la rev. 115 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 114)
+## Estado actual (rev. 115)
 
 Rendimiento medido por el usuario:
 
@@ -348,6 +348,10 @@ Rendimiento medido por el usuario:
 - Rev. 114 (HANDOFF §111): CC7/10/11 y pitch bend se aplican en su muestra dentro del bloque (línea de tiempo por
   canal en el render, sin cortar el bloque): escalones de volumen y paneo de -5,2 ms medio (peor -15) a 0,02 ms del render
   exacto, mismo costo de CPU. Paneo de potencia constante como GM2/BASSMIDI. Dos CC iguales se fusionan solo a < 32 cuadros.
+- Rev. 115 (HANDOFF §112): modo GPU estilo Kestrel (MPL-2.0): pool de voces residente en la GPU, cinco pasadas por bloque
+  (robo por radix, creación, render, reducción, compactado); el CPU solo manda note-ons, note-offs por tecla, cortes y filas
+  de canal (`web/snappysynth-kestrel.js`, `kgpu_*` en `voice.c`). Chromium sin GPU: RMS igual al modo CPU (~1%).
+  Sin medir con GPU real.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -400,6 +404,7 @@ Mecanismos activos y cómo desactivarlos:
 | Tiles de render de 256 voces y suma en orden fijo | sin rollback (rev. 69) |
 | Modo determinístico | `ssw_set_deterministic(1)` (para pruebas) |
 | WebGPU | botón CPU/GPU |
+| Motor GPU estilo Kestrel, pool en la GPU (rev. 115) | `?gpuengine=offload` (modo de la rev. 79); `?gpuvoices=N` tamaño del pool |
 | Trampolín de `worker_cycle` | `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` |
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |

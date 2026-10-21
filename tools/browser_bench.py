@@ -2,7 +2,7 @@
 """Headless Chromium checks against a served site/ (tools/serve_site.py running).
 
   python3 tools/browser_bench.py parser FILE.mid        parser-bench.html report
-  python3 tools/browser_bench.py audio FILE.mid SF.sf2 [SECONDS] [--gpu]
+  python3 tools/browser_bench.py audio FILE.mid SF.sf2 [SECONDS] [--gpu] [--rms]
         WASMIDI Audio: load both, play SECONDS (default 20) and print the synth
         telemetry every second (voices, render load, buffer fill, underruns).
   python3 tools/browser_bench.py shot PAGE OUT.png      screenshot (e.g. audio.html)
@@ -88,6 +88,11 @@ async def main():
             await page.set_input_files("#midi-input", args[1])
             await page.wait_for_function("() => !document.getElementById('play').disabled", timeout=3600000)
             await page.click("#play")
+            if "--rms" in flags:
+                await page.evaluate("""() => { const o = WasmidiSnappyBridge.getOutput(); const an = o.context.createAnalyser();
+                    an.fftSize = 32768; o.node.connect(an); const buf = new Float32Array(an.fftSize); globalThis.__rms = [];
+                    setInterval(() => { an.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x;
+                        __rms.push(Math.sqrt(s / buf.length)); }, 250); }""")
             hide = next((float(f.split("=", 1)[1]) for f in flags if f.startswith("--hide=")), None)
             for second in range(int(seconds)):
                 if hide is not None and second == int(hide):
@@ -100,11 +105,14 @@ async def main():
                     t: WasmidiSnappyBridge.getAudioClock(), voices: s.activeVoices, load: s.renderLoadPercent,
                     buffer: s.ringFillPercent, underruns: s.underruns, dropped: s.droppedNotes, gpu: s.gpuStatus,
                     caught: s.catchUpSeconds || 0, late: s.lateDropped || 0,
-                    shown: document.getElementById("clock").textContent }; }""")
+                    shown: document.getElementById("clock").textContent,
+                    rms: globalThis.__rms ? globalThis.__rms.splice(0).reduce((a, b) => Math.max(a, b), 0) : null }; }""")
                 print("%3d s  clock %7.2f  shown %s  voices %6s  load %5s%%  buffer %5s%%  underruns %s  caught up %5.0f ms"
                       "  late notes %s  dropped %s  gpu %s" % (
                     second + 1, st["t"] or 0, st["shown"], st["voices"], round(st["load"] or 0), round(st["buffer"] or 0),
                     st["underruns"], st["caught"] * 1000, st["late"], st["dropped"], st["gpu"]))
+                if st["rms"] is not None:
+                    print("      rms max %.4f" % st["rms"])
             print(await page.text_content("#log"))
         elif mode == "visual":
             await page.goto(url + "/visual-bench.html" + qs)

@@ -18,6 +18,9 @@ let gpuPending = [];
 let gpuPendingFrames = 0;
 let gpuWriteFrame = -1;
 let gpuSetupSerial = 0;
+// "kestrel": voice pool on the GPU (HANDOFF sec. 109); "offload": CPU voices rendered on the GPU (sec. 63).
+let gpuEngineKind = "kestrel";
+let gpuVoicesOverride = 0;
 
 function setGpuStatus(status) {
     if (status === gpuStatus) return;
@@ -27,6 +30,7 @@ function setGpuStatus(status) {
 
 function disableGpu(status) {
     if (Module && coreReady && Module._ssw_wgpu_set_enabled) Module._ssw_wgpu_set_enabled(0);
+    if (Module && coreReady && Module._ssw_kgpu_set_enabled) Module._ssw_kgpu_set_enabled(0, 0, 0);
     gpuActive = false;
     setGpuStatus(status || "off");
 }
@@ -36,6 +40,7 @@ async function setupGpu() {
     if (!gpuWanted) { disableGpu("off"); return; }
     if (!Module || !coreReady || !soundfontLoaded || !Module._ssw_wgpu_set_enabled) return;
     try {
+        if (gpuEngineKind === "kestrel" && Module._ssw_kgpu_set_enabled) { await setupKestrelGpu(serial); return; }
         if (!self.WasmiSynthGpu)
             importScripts("./snappysynth-webgpu.js?v=13.12.0");
         const voices = Math.max(1, Number(maxVoices) | 0);
@@ -60,7 +65,45 @@ async function setupGpu() {
     }
 }
 
+async function setupKestrelGpu(serial) {
+    if (!self.WasmiKestrelGpu)
+        importScripts("./snappysynth-kestrel.js?v=13.12.0");
+    Module._ssw_wgpu_set_enabled(0);
+    const voices = Math.max(1, gpuVoicesOverride > 0 ? gpuVoicesOverride : Number(maxVoices) | 0);
+    const steal = Math.max(1, Math.floor(voices / 4));
+    const frames = Math.max(1, preferredRenderFrames() | 0);
+    if (!gpuEngine || gpuEngine.lost || !(gpuEngine instanceof self.WasmiKestrelGpu) ||
+        gpuEngine.capacity > voices || gpuEngine.requested !== voices || gpuEngine.blockFrames < frames) {
+        if (gpuEngine) { try { gpuEngine.destroy(); } catch (_) {} }
+        gpuEngine = null;
+        const made = await self.WasmiKestrelGpu.create(voices, steal, Math.max(frames, 2048));
+        if (serial !== gpuSetupSerial) { if (made.gpu) made.gpu.destroy(); return; }
+        if (!made.gpu) { disableGpu("unavailable: " + made.reason); return; }
+        gpuEngine = made.gpu;
+        gpuEngine.requested = voices;
+    }
+    const reason = gpuEngine.uploadSamples(Module, n => Module._malloc(n), p => Module._free(p));
+    if (reason) { disableGpu("unavailable: " + reason); return; }
+    if (!Module._ssw_kgpu_set_enabled(1, gpuEngine.maxSpawn, gpuEngine.maxSteal)) {
+        disableGpu("unavailable: out of memory");
+        return;
+    }
+    gpuActive = true;
+    setGpuStatus("active (Kestrel pool, " + gpuEngine.capacity + " voices, " +
+                 Math.round(gpuEngine.poolBytes / 1048576) + " MB of samples on the GPU)");
+}
+
+function kestrelActive() {
+    return gpuActive && gpuEngine && self.WasmiKestrelGpu && gpuEngine instanceof self.WasmiKestrelGpu;
+}
+
+function activeVoiceCount() {
+    if (!coreReady || !Module) return 0;
+    return Module._ssw_active_voices() + (kestrelActive() ? gpuEngine.stats.live : 0);
+}
+
 function dropGpuPending() {
+    if (kestrelActive()) gpuEngine.reset();
     gpuPending = [];
     gpuPendingFrames = 0;
     gpuWriteFrame = -1;
@@ -101,7 +144,9 @@ function renderOneBlockGpu(frames) {
     catchUpToClock(header);
     const blockStart = renderSongTime;
     const outPtr = audioRingPcmPtr + writeFrame * Math.max(1, synthChannels) * 4;
-    if (gpuActive) Module._ssw_wgpu_begin_block();
+    const kestrel = kestrelActive();
+    if (kestrel) Module._ssw_kgpu_begin_block(frames);
+    else if (gpuActive) Module._ssw_wgpu_begin_block();
     if (!renderQueuedWithSysex(outPtr, blockStart, frames))
         throw new Error("SnappySynthV2 shared-ring render failed.");
     if (generation !== Atomics.load(header, RING_GENERATION)) return false;
@@ -111,7 +156,8 @@ function renderOneBlockGpu(frames) {
     gpuWriteFrame = writeFrame + frames >= audioRingCapacityFrames ? 0 : writeFrame + frames;
     let work;
     try {
-        work = gpuActive && gpuEngine ? gpuEngine.submit(Module, frames) : Promise.resolve(null);
+        work = kestrel ? gpuEngine.submit(Module, frames, Module._ssw_global_mix_gain())
+            : gpuActive && gpuEngine ? gpuEngine.submit(Module, frames) : Promise.resolve(null);
     } catch (error) {
         work = Promise.reject(error);
     }
@@ -127,7 +173,7 @@ function renderOneBlockGpu(frames) {
     const now = performance.now();
     if (now - lastStatsReport > 250) {
         lastStatsReport = now;
-        postState("stats", { activeVoices: Module._ssw_active_voices(), renderSongTime, gpu: gpuStatus,
+        postState("stats", { activeVoices: activeVoiceCount(), renderSongTime, gpu: gpuStatus,
                              ...catchUpStats() });
     }
     return true;
@@ -242,8 +288,7 @@ function postState(type, extra = {}) {
     postMessage(Object.assign({
         type,
         sampleRate: sampleRateHz,
-        activeVoices:
-            coreReady && Module ? Module._ssw_active_voices() : 0,
+        activeVoices: activeVoiceCount(),
         freeVoices:
             coreReady && Module ? Module._ssw_free_voices() : 0,
         steals: sampleStealRate(),
@@ -838,6 +883,7 @@ function initCore() {
     dropGpuPending();
     // The engine must not offload voices until setupGpu() re-enables it.
     if (Module._ssw_wgpu_set_enabled) Module._ssw_wgpu_set_enabled(0);
+    if (Module._ssw_kgpu_set_enabled) Module._ssw_kgpu_set_enabled(0, 0, 0);
     gpuActive = false;
     if (gpuWanted) void setupGpu();
     if (pendingSoundfonts.length) {
@@ -1606,6 +1652,8 @@ onmessage = async event => {
 
         if (data.type === "gpu") {
             gpuWanted = !!data.enabled;
+            if (data.engine === "offload" || data.engine === "kestrel") gpuEngineKind = data.engine;
+            gpuVoicesOverride = Math.max(0, Number(data.voices) | 0);
             void setupGpu();
             return;
         }

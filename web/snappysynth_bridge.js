@@ -1128,10 +1128,19 @@
         return { context, node };
     }
 
+    // ?gpuengine=offload keeps the rev. 79 GPU mode; ?gpuvoices=N sizes the GPU pool.
+    function gpuMessage() {
+        let params = null;
+        try { params = new URLSearchParams(self.location ? self.location.search : ""); } catch (_) {}
+        return { type: "gpu", enabled: state.gpu,
+                 engine: params && params.get("gpuengine") === "offload" ? "offload" : "kestrel",
+                 voices: params ? Number(params.get("gpuvoices")) || 0 : 0 };
+    }
+
     function setGpu(enabled) {
         state.gpu = !!enabled;
         if (worker)
-            worker.postMessage({ type: "gpu", enabled: state.gpu });
+            worker.postMessage(gpuMessage());
     }
 
     function setOverlapGain(enabled) {

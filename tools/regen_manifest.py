@@ -94,6 +94,7 @@ FILES = [
     "web/visual-bench.html",
     "web/midi-parser-helper.js",
     "web/snappysynth-webgpu.js",
+    "web/snappysynth-kestrel.js",
     "web/audio.html",
     "web/audio.css",
     "web/wasmidi-audio.js",
