@@ -33,11 +33,12 @@ EM_JS(void, wasmidi_roll_debug_count, (int catchUp), {
     else
         globalThis.__wasmidiRollHeld = (globalThis.__wasmidiRollHeld | 0) + 1;
 });
-EM_JS(void, wasmidi_roll_debug_drawn, (double instances, double raw, double resident), {
+EM_JS(void, wasmidi_roll_debug_drawn, (double instances, double raw, double resident, double held), {
     const root = globalThis;
     root.__wasmidiRollDrawnMax = Math.max(root.__wasmidiRollDrawnMax || 0, instances);
     root.__wasmidiRollRawMax = Math.max(root.__wasmidiRollRawMax || 0, raw);
     root.__wasmidiRollResident = resident;
+    root.__wasmidiRollLongNotes = held;
     root.__wasmidiAppMemory = HEAP8.length;
 });
 // Cull tile work on the page thread, read by ?visualdebug=1: kind 0 is a slice of a
@@ -55,7 +56,7 @@ static int wasmidi_tile_slice_disabled() { return 0; }
 static int wasmidi_tiles_disabled() { return 0; }
 static int wasmidi_roll_draw_disabled() { return 0; }
 static void wasmidi_roll_debug_count(int) {}
-static void wasmidi_roll_debug_drawn(double, double, double) {}
+static void wasmidi_roll_debug_drawn(double, double, double, double) {}
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -347,6 +348,10 @@ GLuint linkProgram(const char* vertexSource,
 
 constexpr std::size_t InitialRingCapacity =
     std::size_t(1) << 18;
+
+// Ring notes the horizon may keep ahead, and the ring's largest size (HANDOFF sec. 104).
+constexpr std::size_t kSharpResidentBudget = (std::size_t(1) << 23) * 11u / 20u;
+constexpr std::size_t kSharpRingMax = std::size_t(1) << 26;
 
 
 } // namespace
@@ -890,6 +895,8 @@ bool GLRenderer::initialize()
     regenerateSharpPalette();
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize_);
     maxTextureSize_ = std::max(maxTextureSize_, 2048);
+    glGenBuffers(1, &heldVbo_);
+    heldVboCapacity_ = 0;
 
     // SharpMIDI-raylib starts with a 2^23-note persistent ring. Reserving the
     // same capacity avoids CPU-vector + VBO realloc/copy stalls exactly when a
@@ -906,7 +913,8 @@ void GLRenderer::destroy()
     const GLuint buffers[] = {
         noteVbo_,
         carryVbo_,
-        denseVbo_
+        denseVbo_,
+        heldVbo_
     };
 
     for (GLuint buffer : buffers) {
@@ -945,6 +953,9 @@ void GLRenderer::destroy()
     noteVbo_ = 0;
     carryVbo_ = 0;
     denseVbo_ = 0;
+    heldVbo_ = 0;
+    heldVboCapacity_ = 0;
+    clearHeldNotes();
 
     noteVao_ = 0;
     carryVao_ = 0;
@@ -1787,6 +1798,9 @@ void GLRenderer::allocateRing(std::size_t capacity)
 
 void GLRenderer::ensureRingCapacity(std::size_t required)
 {
+    // A bigger ring (and the copy while it grows) does not fit in the 4 GiB heap;
+    // the oldest notes are dropped instead (HANDOFF sec. 104).
+    required = std::min(required, kSharpRingMax);
     if (required <= ringCapacity_)
         return;
 
@@ -2103,7 +2117,8 @@ void GLRenderer::syncVisualCache(
 }
 
 void GLRenderer::setInstanceBase(
-    std::size_t physicalIndex)
+    std::size_t physicalIndex,
+    GLuint buffer)
 {
     const std::size_t base =
         physicalIndex *
@@ -2111,7 +2126,7 @@ void GLRenderer::setInstanceBase(
 
     glBindBuffer(
         GL_ARRAY_BUFFER,
-        noteVbo_);
+        buffer ? buffer : noteVbo_);
 
     glVertexAttribIPointer(
         0, 1,
@@ -2148,6 +2163,7 @@ void GLRenderer::resetSharpRenderer(bool requestRemote)
 {
     sharpHead_ = 1;
     sharpTail_ = 1;
+    clearHeldNotes();
     ++sharpRingEpoch_;
     sharpLastSweepEnd_ = -1;
     sharpLastWindowTicks_ = 0;
@@ -2255,8 +2271,7 @@ void GLRenderer::calculateSharpView(
         : 0.0;
     const double estimatedPerScreen =
         std::max(1.0, notesPerTick * double(windowTicks));
-    const double residentBudget =
-        double(std::max<std::size_t>(ringCapacity_, std::size_t(1) << 23)) * 0.55;
+    const double residentBudget = double(kSharpResidentBudget);
     // Keep a healthy multi-screen reserve, but do not let speculative
     // preprocessing consume the same CPU/Worker budget needed by audio and
     // live-state updates.  Pass 13.8 raised this to 12..96 screens and then
@@ -2277,6 +2292,8 @@ void GLRenderer::appendSharpNote(
 {
     const std::size_t active = std::size_t(sharpHead_ - sharpTail_);
     ensureRingCapacity(active + 2u);
+    if (active + 1u > ringCapacity_)
+        sharpTail_ = sharpHead_ + 1u - static_cast<uint32_t>(ringCapacity_);
 
     const uint32_t id = sharpHead_++;
     ring_[std::size_t(id) & ringMask_] = {
@@ -2293,8 +2310,17 @@ void GLRenderer::closeSharpNote(
     uint32_t endTick,
     std::vector<uint32_t>* closeIds)
 {
-    if (noteId < sharpTail_ || noteId >= sharpHead_ || ringCapacity_ == 0)
+    if (noteId >= sharpHead_ || ringCapacity_ == 0)
         return;
+    if (noteId < sharpTail_) {
+        const auto it = std::lower_bound(heldIds_.begin(), heldIds_.end(), noteId);
+        if (it != heldIds_.end() && *it == noteId) {
+            const std::size_t index = std::size_t(it - heldIds_.begin());
+            held_[index].endTick = endTick;
+            heldUploaded_ = std::min(heldUploaded_, index);
+        }
+        return;
+    }
 
     ring_[std::size_t(noteId) & ringMask_].endTick = endTick;
     if (closeIds)
@@ -2478,7 +2504,7 @@ void GLRenderer::uploadSharpCloseIds(std::vector<uint32_t>& closeIds)
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
-void GLRenderer::advanceSharpTail(uint32_t viewStart)
+void GLRenderer::advanceSharpTail(uint32_t viewStart, uint32_t windowTicks)
 {
     if (ringCapacity_ == 0)
         return;
@@ -2489,14 +2515,45 @@ void GLRenderer::advanceSharpTail(uint32_t viewStart)
     if (sharpTail_ < safeTail)
         sharpTail_ = safeTail;
 
+    // A note still on screen a window after it began kept every later note in the
+    // ring until it ended (HANDOFF sec. 104); it moves to held_ instead.
+    const uint32_t holdBefore = viewStart > windowTicks ? viewStart - windowTicks : 0u;
     while (sharpTail_ < sharpHead_) {
         const VisualNote& note = ring_[std::size_t(sharpTail_) & ringMask_];
-        const bool open = note.endTick == 0;
-        if (!open && note.endTick < viewStart)
-            ++sharpTail_;
-        else
-            break;
+        if (note.endTick == 0 || note.endTick >= viewStart) {
+            if (note.startTick >= holdBefore)
+                break;
+            held_.push_back(note);
+            heldIds_.push_back(sharpTail_);
+        }
+        ++sharpTail_;
     }
+
+    if (!held_.empty() && (viewStart < heldPrunedAt_ || viewStart - heldPrunedAt_ >= windowTicks)) {
+        heldPrunedAt_ = viewStart;
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < held_.size(); ++i) {
+            if (held_[i].endTick != 0 && held_[i].endTick < viewStart)
+                continue;
+            if (kept != i) {
+                held_[kept] = held_[i];
+                heldIds_[kept] = heldIds_[i];
+                heldUploaded_ = std::min(heldUploaded_, kept);
+            }
+            ++kept;
+        }
+        held_.resize(kept);
+        heldIds_.resize(kept);
+        heldUploaded_ = std::min(heldUploaded_, kept);
+    }
+}
+
+void GLRenderer::clearHeldNotes()
+{
+    held_.clear();
+    heldIds_.clear();
+    heldUploaded_ = 0;
+    heldPrunedAt_ = 0;
 }
 
 void GLRenderer::requestRemoteSharpSweep(
@@ -2529,6 +2586,7 @@ void GLRenderer::receiveSharpRenderReset(uint32_t generation)
     sharpRemoteWaitingReset_ = false;
     sharpHead_ = 1u;
     sharpTail_ = 1u;
+    clearHeldNotes();
     ++sharpRingEpoch_;
     sharpRemotePreparedHead_ = 1u;
     sharpRemotePendingBase_ = 1u;
@@ -2641,6 +2699,10 @@ void GLRenderer::flushRemoteSharpBatches(
                     ? std::size_t(required - sharpTail_) + 1u
                     : 2u;
                 ensureRingCapacity(resident);
+                if (std::size_t(required - sharpTail_) > ringCapacity_) {
+                    sharpTail_ = required - static_cast<uint32_t>(ringCapacity_);
+                    sharpHead_ = std::max(sharpHead_, sharpTail_);
+                }
                 // WebGL2 cannot expose SharpMIDI's persistently mapped VBO,
                 // but the CPU ring can still receive each Worker delta as at
                 // most two contiguous memcpy operations instead of one C++
@@ -2792,6 +2854,30 @@ uint32_t GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
         drawEnd = lo;
     }
 
+    // Held notes began before every note in the ring: they go underneath.
+    uint32_t heldCount = 0;
+    if (notesReady && !held_.empty() && heldVbo_ != 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, heldVbo_);
+        if (held_.size() > heldVboCapacity_) {
+            heldVboCapacity_ = std::max<std::size_t>(held_.size() * 2u, 4096u);
+            glBufferData(GL_ARRAY_BUFFER,
+                static_cast<GLsizeiptr>(heldVboCapacity_ * sizeof(VisualNote)), nullptr, GL_DYNAMIC_DRAW);
+            heldUploaded_ = 0;
+        }
+        if (heldUploaded_ < held_.size()) {
+            glBufferSubData(GL_ARRAY_BUFFER,
+                static_cast<GLintptr>(heldUploaded_ * sizeof(VisualNote)),
+                static_cast<GLsizeiptr>((held_.size() - heldUploaded_) * sizeof(VisualNote)),
+                held_.data() + heldUploaded_);
+            heldUploaded_ = held_.size();
+        }
+        heldCount = static_cast<uint32_t>(held_.size());
+        glBindVertexArray(noteVao_);
+        setInstanceBase(0, heldVbo_);
+        drawNoteInstances(static_cast<GLsizei>(heldCount));
+        setInstanceBase(0);
+    }
+
     const uint32_t count = drawEnd - sharpTail_;
     if (count != 0 && ringCapacity_ != 0) {
         const std::size_t start = std::size_t(sharpTail_) & ringMask_;
@@ -2809,7 +2895,7 @@ uint32_t GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
             drawNoteInstances(static_cast<GLsizei>(second));
         }
     }
-    return count;
+    return count + heldCount;
 }
 
 void GLRenderer::drawSharpRing(
@@ -2924,7 +3010,7 @@ void GLRenderer::drawSharpRing(
     }
     if (!drewTiles)
         raw += double(drawSharpRingRange(viewEnd, notesReady));
-    wasmidi_roll_debug_drawn(drawn + raw, raw, double(sharpHead_ - sharpTail_));
+    wasmidi_roll_debug_drawn(drawn + raw, raw, double(sharpHead_ - sharpTail_), double(held_.size()));
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -3089,6 +3175,17 @@ bool GLRenderer::renderRoll()
     sharpRemoteUrgentThrough_ = static_cast<uint32_t>(std::min<uint64_t>(
         urgent64, document_->maxTick));
 
+    // The horizon comes from the song's average density; in a part many times denser
+    // it asked for tens of millions of notes (HANDOFF sec. 104). With the ring past the
+    // budget it stays where it was asked, never short of the urgent screens.
+    if (document_->remoteIndexed &&
+        std::size_t(std::max(sharpHead_, sharpRemotePreparedHead_) - sharpTail_) >= kSharpResidentBudget) {
+        const uint32_t asked = sharpRemoteRebuilding_ ? sharpRemoteBuildTarget_ : sharpRemoteRequestedEnd_;
+        const uint32_t floorTick = std::max<uint32_t>(sharpRemoteUrgentThrough_,
+            sharpLastSweepEnd_ > 0 ? static_cast<uint32_t>(sharpLastSweepEnd_) : 0u);
+        sweepEnd = std::min(sweepEnd, std::max(asked, floorTick));
+    }
+
     // Drain completed background work after both the visible and future
     // endpoints are known. Do this *before* issuing another extension request
     // so already-generated frames are installed first instead of allowing a
@@ -3185,6 +3282,7 @@ bool GLRenderer::renderRoll()
             // keeps animating while complete ticks from the replacement arrive.
             sharpHead_ = 1u;
             sharpTail_ = 1u;
+            clearHeldNotes();
             ++sharpRingEpoch_;
             sharpRemotePreparedHead_ = 1u;
             sharpRemotePendingBase_ = 1u;
@@ -3235,11 +3333,10 @@ bool GLRenderer::renderRoll()
         }
     }
 
-    // Never age/cull the old ring against a seek destination while a remote
-    // replacement is still being built. That was the direct cause of notes
-    // disappearing before their EndTick and of the all-black seek state.
-    if (!document_->remoteIndexed || !sharpRemoteRebuilding_)
-        advanceSharpTail(viewStart);
+    // A rebuild drops the old ring when it starts, so the tail advances during one
+    // too: a rebuild whose target kept moving ahead never finished, and the ring grew
+    // until the heap ran out (HANDOFF sec. 104).
+    advanceSharpTail(viewStart, windowTicks);
 
     // Never expose a half-generated visible window. This is the contingency
     // path only; the primary strategy is the multi-screen prefetch above.
@@ -3514,10 +3611,13 @@ void GLRenderer::startCullJob(CullJob& job, uint32_t index, uint32_t windowTicks
     const uint32_t rangeBegin = firstStartingAt(sharpTail_, tileStart > windowTicks ? tileStart - windowTicks : 0u);
     const uint32_t rangeEnd = firstStartingAt(rangeBegin, collectEnd);
 
-    // Before rangeBegin only the long notes can reach the tile; drop the ones that
-    // ended before every tile still kept.
+    // Before rangeBegin only the long notes can reach the tile, held ones first (they
+    // began earlier); drop the ones that ended before every tile still kept.
     scanLongNotes(rangeBegin, windowTicks);
     job.longNotes.clear();
+    for (const VisualNote& note : held_)
+        if (note.endTick == 0 || note.endTick > tileStart)
+            job.longNotes.push_back({ note.startTick, note.endTick, note.packedData });
     std::size_t kept = 0;
     for (const uint32_t id : longIds_) {
         if (id < sharpTail_) continue;
