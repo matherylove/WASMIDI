@@ -253,6 +253,13 @@ typedef struct {
     volatile LONG scale_tune_cents[12];
 } channel_state;
 
+#ifndef SSW_CTL_MERGE_FRAMES
+#define SSW_CTL_MERGE_FRAMES 32
+#endif
+#ifndef SSW_CTL_TIMELINE_MAX
+#define SSW_CTL_TIMELINE_MAX 32
+#endif
+
 typedef struct {
     float gain_mul;
     float pan_l;
@@ -270,7 +277,27 @@ typedef struct {
     float b2;
     float a1;
     float a2;
+    /* Volume, expression, pan and pitch bend inside the block (HANDOFF sec. 111):
+     * state i holds from frame ctl_offset[i]; state 0 starts at frame 0. */
+    int ctl_count;
+    int ctl_pitch_varies;
+    int ctl_offset[SSW_CTL_TIMELINE_MAX];
+    float ctl_gain_l[SSW_CTL_TIMELINE_MAX];
+    float ctl_gain_r[SSW_CTL_TIMELINE_MAX];
+    float ctl_pitch[SSW_CTL_TIMELINE_MAX];
 } channel_render_state;
+
+enum { CTL_KIND_VOLUME = 0, CTL_KIND_EXPRESSION = 1, CTL_KIND_PAN = 2, CTL_KIND_BEND = 3 };
+
+/* Changes of those controllers after frame 0 of the block, in order, written only by
+ * the worker that owns the channel's events and read after the producer barrier. */
+typedef struct {
+    int count;
+    LONG volume0, expression0, pan0, bend0;
+    int offset[SSW_CTL_TIMELINE_MAX];
+    unsigned char kind[SSW_CTL_TIMELINE_MAX];
+    unsigned short value[SSW_CTL_TIMELINE_MAX];
+} channel_ctl_log;
 
 typedef struct {
     sfz_instrument *instrument_ptr;
@@ -642,6 +669,7 @@ static inline void vor_break_channel_sequence(int ch) {
 // Channel states
 static channel_state g_channels[MIDI_CHANNEL_COUNT];
 static channel_render_state g_channel_render[MIDI_CHANNEL_COUNT];
+static channel_ctl_log g_ctl_log[MIDI_CHANNEL_COUNT];
 static volatile LONG g_channel_render_dirty[MIDI_CHANNEL_COUNT];
 static volatile LONG g_channel_clear_generation[MIDI_CHANNEL_COUNT];
 static volatile LONG g_channel_clear_processed_generation[MIDI_CHANNEL_COUNT];
@@ -1502,7 +1530,8 @@ e.vor_token = 0;
                                                                                                                                                                                           LONG prev_slot = (head - 1 + CH_EVENT_QUEUE_SIZE) & CH_EVENT_QUEUE_MASK;
                                                                                                                                                                                           if (prev_slot != tail) {
                                                                                                                                                                                               ch_event *prev = &q->events[prev_slot];
-                                                                                                                                                                                             if (prev->type == EVT_PITCH_BEND && prev->ch == e.ch) {
+                                                                                                                                                                                             if (prev->type == EVT_PITCH_BEND && prev->ch == e.ch &&
+                                                                                                                                                         e.timestamp_qpc - prev->timestamp_qpc < SSW_CTL_MERGE_FRAMES) {
                                                                                                                                                                                                  prev->value = e.value;
                                                                                                                                                                                                  prev->timestamp_qpc = e.timestamp_qpc;
                                                                                                                                                                                                  return;
@@ -1517,7 +1546,8 @@ e.vor_token = 0;
                                                                                                                                                                                           LONG prev_slot = (head - 1 + CH_EVENT_QUEUE_SIZE) & CH_EVENT_QUEUE_MASK;
                                                                                                                                                                                           if (prev_slot != tail) {
                                                                                                                                                                                               ch_event *prev = &q->events[prev_slot];
-                                                                                                                                                                                              if (prev->type == EVT_CONTROL_CHANGE && prev->ch == e.ch && prev->key == e.key) {
+                                                                                                                                                                                              if (prev->type == EVT_CONTROL_CHANGE && prev->ch == e.ch && prev->key == e.key &&
+                                                                                                                                                          e.timestamp_qpc - prev->timestamp_qpc < SSW_CTL_MERGE_FRAMES) {
                                                                                                                                                                                                   prev->value = e.value;
                                                                                                                                                                                                   prev->timestamp_qpc = e.timestamp_qpc;
                                                                                                                                                                                                   return;
@@ -1802,6 +1832,29 @@ InterlockedIncrement(&g_key_off_epoch);
 }
 
                                                                                                                                                                                  static inline void keyqueue_clear_corrupt(int ch, int key, const char *reason, int vid);
+
+/* Called by the channel's event owner before it applies a volume, expression, pan or
+ * pitch-bend change; changes after frame 0 are kept for the in-block timeline. */
+static inline void ctl_log_change(int ch, int kind, int value, LONGLONG timestamp_qpc, int frames) {
+    channel_ctl_log *log = &g_ctl_log[ch];
+    int offset = qpc_to_sample_offset_clamped(timestamp_qpc, frames);
+    if (offset >= frames) offset = frames - 1;
+    if (offset <= 0 && log->count == 0) return;
+    if (log->count == 0) {
+        const channel_state *cs = &g_channels[ch];
+        log->volume0 = cs->volume;
+        log->expression0 = cs->expression;
+        log->pan0 = cs->pan;
+        log->bend0 = cs->bend14;
+    } else if (offset < log->offset[log->count - 1]) {
+        offset = log->offset[log->count - 1];
+    }
+    if (log->count >= SSW_CTL_TIMELINE_MAX) return;
+    log->offset[log->count] = offset;
+    log->kind[log->count] = (unsigned char)kind;
+    log->value[log->count] = (unsigned short)value;
+    ++log->count;
+}
 
 static inline void channel_release_all_held_voices(int ch) {
                                                                                                                                                                                      // Walk per-key queues instead of scanning the entire voice array.
@@ -2244,10 +2297,29 @@ if (v->env_state == ENV_RELEASE || v->note_off_received) return 0;
 return steal_priority_volume_from_voice(v) > incoming_volume * 1.35f;
 }
 
+                                                                                                                                                                                                                                                                /* GM2 (RP-036) constant-power pan, scaled so the centre keeps unity gain. */
+                                                                                                                                                                                                                                                                static inline void channel_pan_gains(LONG pan_raw, float *out_l, float *out_r) {
+                                                                                                                                                                                                                                                                    int pan = (int)pan_raw;
+                                                                                                                                                                                                                                                                    if (pan == 64) { *out_l = 1.0f; *out_r = 1.0f; return; }
+                                                                                                                                                                                                                                                                    if (pan < 1) pan = 1;
+                                                                                                                                                                                                                                                                    if (pan > 127) pan = 127;
+                                                                                                                                                                                                                                                                    const float angle = (float)(pan - 1) * (0.5f * 3.14159265f / 126.0f);
+                                                                                                                                                                                                                                                                    *out_l = pan == 127 ? 0.0f : 1.41421356f * cosf(angle);
+                                                                                                                                                                                                                                                                    *out_r = 1.41421356f * sinf(angle);
+                                                                                                                                                                                                                                                                }
+
+                                                                                                                                                                                                                                                                static inline float channel_bend_mul(int bend_fixed, LONG bend_raw, float pb_range, float fine_tune, float coarse_tune) {
+                                                                                                                                                                                                                                                                    if (bend_fixed) return 1.0f;
+                                                                                                                                                                                                                                                                    const float bend = ((float)bend_raw - 8192.0f) * (1.0f/8192.0f);
+                                                                                                                                                                                                                                                                    return powf(2.0f, ((bend * pb_range) + fine_tune + coarse_tune) * (1.0f/12.0f));
+                                                                                                                                                                                                                                                                }
+
                                                                                                                                                                                                                                                                 static inline void rebuild_channel_render_cache(void) {
                                                                                                                                                                                                                                                                 for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
                                                                                                                                                                                                                                                                 g_channel_sustain_snapshot[ch] = (int)load_relaxed_long(&g_channels[ch].sustain);
+                                                                                                                                                                                                                                                                g_channel_render[ch].ctl_count = 0;
                                                                                                                                                                                                                                                                 if (!InterlockedExchange(&g_channel_render_dirty[ch], 0)) {
+                                                                                                                                                                                                                                                                g_ctl_log[ch].count = 0;
                                                                                                                                                                                                                                                                 continue;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 channel_state *cs = &g_channels[ch];
@@ -2272,26 +2344,45 @@ return steal_priority_volume_from_voice(v) > incoming_volume * 1.35f;
                                                                                                                                                                                                                                                                 rc->scale_tune_mul[st] = (cents != 0) ? powf(2.0f, ((float)cents) * (1.0f / 1200.0f)) : 1.0f;
                                                                                                                                                                                                                                                                 }
 
-                                                                                                                                                                                                                                                                const float vol  = midi_cc_to_gain((int)vol_raw);
-                                                                                                                                                                                                                                                                const float expr = midi_cc_to_gain((int)expr_raw);
-                                                                                                                                                                                                                                                                rc->gain_mul = vol * expr * clampf((float)master_volume_raw * (1.0f / 16383.0f), 0.0f, 1.0f);
-
-                                                                                                                                                                                                                                                                float pan_l = 1.0f;
-                                                                                                                                                                                                                                                                float pan_r = 1.0f;
-                                                                                                                                                                                                                                                                float pan = ((float)pan_raw - 64.0f) * (1.0f/64.0f);
-                                                                                                                                                                                                                                                                pan_l = (pan <= 0.0f) ? 1.0f : (1.0f - pan);
-                                                                                                                                                                                                                                                                pan_r = (pan >= 0.0f) ? 1.0f : (1.0f + pan);
-                                                                                                                                                                                                                                                                rc->pan_l = pan_l;
-                                                                                                                                                                                                                                                                rc->pan_r = pan_r;
+                                                                                                                                                                                                                                                                const float master_gain = clampf((float)master_volume_raw * (1.0f / 16383.0f), 0.0f, 1.0f);
+                                                                                                                                                                                                                                                                rc->gain_mul = midi_cc_to_gain((int)vol_raw) * midi_cc_to_gain((int)expr_raw) * master_gain;
+                                                                                                                                                                                                                                                                channel_pan_gains(pan_raw, &rc->pan_l, &rc->pan_r);
 
                                                                                                                                                                                                                                                                 const LONG bank_msb_raw = load_relaxed_long(&cs->applied_bank_msb) & 0x7F;
-                                                                                                                                                                                                                                                                if (drum_part_raw > 0 || bank_msb_raw == 120 || bank_msb_raw == 126 || bank_msb_raw == 127 || (!load_relaxed_long(&g_gs_part_mode) && ch == 9)) {
-                                                                                                                                                                                                                                                                rc->bend_pitch_mul = 1.0f;
-                                                                                                                                                                                                                                                                } else {
-                                                                                                                                                                                                                                                                float bend = ((float)bend_raw - 8192.0f) * (1.0f/8192.0f);
-                                                                                                                                                                                                                                                                float bend_semi = (bend * pb_range) + fine_tune + coarse_tune;
-                                                                                                                                                                                                                                                                rc->bend_pitch_mul = powf(2.0f, bend_semi * (1.0f/12.0f));
+                                                                                                                                                                                                                                                                const int bend_fixed = drum_part_raw > 0 || bank_msb_raw == 120 || bank_msb_raw == 126 || bank_msb_raw == 127 || (!load_relaxed_long(&g_gs_part_mode) && ch == 9);
+                                                                                                                                                                                                                                                                rc->bend_pitch_mul = channel_bend_mul(bend_fixed, bend_raw, pb_range, fine_tune, coarse_tune);
+                                                                                                                                                                                                                                                                if (g_ctl_log[ch].count > 0) {
+                                                                                                                                                                                                                                                                channel_ctl_log *log = &g_ctl_log[ch];
+                                                                                                                                                                                                                                                                LONG vol = log->volume0, expr = log->expression0, pan = log->pan0, bend = log->bend0;
+                                                                                                                                                                                                                                                                int n = 0;
+                                                                                                                                                                                                                                                                for (int i = -1; i < log->count; ++i) {
+                                                                                                                                                                                                                                                                if (i >= 0) {
+                                                                                                                                                                                                                                                                if (log->kind[i] == CTL_KIND_VOLUME) vol = log->value[i];
+                                                                                                                                                                                                                                                                else if (log->kind[i] == CTL_KIND_EXPRESSION) expr = log->value[i];
+                                                                                                                                                                                                                                                                else if (log->kind[i] == CTL_KIND_PAN) pan = log->value[i];
+                                                                                                                                                                                                                                                                else bend = log->value[i];
                                                                                                                                                                                                                                                                 }
+                                                                                                                                                                                                                                                                const int offset = i >= 0 ? log->offset[i] : 0;
+                                                                                                                                                                                                                                                                if (n > 0 && rc->ctl_offset[n - 1] == offset) --n;
+                                                                                                                                                                                                                                                                float pl, pr;
+                                                                                                                                                                                                                                                                channel_pan_gains(pan, &pl, &pr);
+                                                                                                                                                                                                                                                                const float gain = midi_cc_to_gain((int)vol) * midi_cc_to_gain((int)expr) * master_gain;
+                                                                                                                                                                                                                                                                rc->ctl_offset[n] = offset;
+                                                                                                                                                                                                                                                                rc->ctl_gain_l[n] = gain * pl;
+                                                                                                                                                                                                                                                                rc->ctl_gain_r[n] = gain * pr;
+                                                                                                                                                                                                                                                                rc->ctl_pitch[n] = channel_bend_mul(bend_fixed, bend, pb_range, fine_tune, coarse_tune);
+                                                                                                                                                                                                                                                                ++n;
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                /* The block ends in the state the channel holds now, also when the log was full. */
+                                                                                                                                                                                                                                                                rc->ctl_gain_l[n - 1] = rc->gain_mul * rc->pan_l;
+                                                                                                                                                                                                                                                                rc->ctl_gain_r[n - 1] = rc->gain_mul * rc->pan_r;
+                                                                                                                                                                                                                                                                rc->ctl_pitch[n - 1] = rc->bend_pitch_mul;
+                                                                                                                                                                                                                                                                rc->ctl_pitch_varies = 0;
+                                                                                                                                                                                                                                                                for (int i = 1; i < n; ++i) if (rc->ctl_pitch[i] != rc->ctl_pitch[0]) rc->ctl_pitch_varies = 1;
+                                                                                                                                                                                                                                                                rc->ctl_count = n > 1 ? n : 0;
+                                                                                                                                                                                                                                                                log->count = 0;
+                                                                                                                                                                                                                                                                }
+
                                                                                                                                                                                                                                                                 rc->attack_inc = clampf(g_dt / midi_cc_time_seconds(attack_raw, DEFAULT_ATTACK_TIME, 7.0f, 0.0001f, 0.250f), 0.000001f, 1.0f);
                                                                                                                                                                                                                                                                 rc->release_time_scale = midi_release_time_scale((int)release_raw);
                                                                                                                                                                                                                                                                 rc->release_alpha = region_release_seconds_to_alpha(
@@ -3825,7 +3916,7 @@ static inline int render_fast_stereo_sustain_batch(LONG queue_start,
         int ch = v->owner_channel;
         if (ch < 0 || ch >= MIDI_CHANNEL_COUNT) break;
         const channel_render_state *ch_render = &g_channel_render[ch];
-        if (ch_render->filter_enabled ||
+        if (ch_render->filter_enabled || ch_render->ctl_count > 0 ||
             (fabsf(v->portamento_offset) > 0.0001f &&
              fabsf(v->portamento_step) > 0.0f) ||
             fabsf(v->pitch_multiplier * ch_render->bend_pitch_mul - 1.0f) >=
@@ -3971,7 +4062,7 @@ static inline int render_fast_stereo_sustain_batch_wasm(LONG queue_start,
         int ch = v->owner_channel;
         if (ch < 0 || ch >= MIDI_CHANNEL_COUNT) break;
         const channel_render_state *ch_render = &g_channel_render[ch];
-        if (ch_render->filter_enabled ||
+        if (ch_render->filter_enabled || ch_render->ctl_count > 0 ||
             (fabsf(v->portamento_offset) > 0.0001f &&
              fabsf(v->portamento_step) > 0.0f) ||
             fabsf(v->pitch_multiplier * ch_render->bend_pitch_mul - 1.0f) >=
@@ -4457,7 +4548,25 @@ typedef struct voice_park {
 #ifdef VOR
     float vor_gain_scale, vor_target;
 #endif
+    const channel_render_state *ctl;   /* in-block controller timeline, or NULL */
+    int ctl_idx;
+    float ctl_voice_l, ctl_voice_r, ctl_voice_pitch;
 } voice_park;
+
+/* Applies the timeline states of p->ctl that start at or before frame f. */
+static inline void voice_park_ctl_apply(voice_park *p, int f) {
+    const channel_render_state *c = p->ctl;
+    while (p->ctl_idx < c->ctl_count && c->ctl_offset[p->ctl_idx] <= f) {
+        p->gainL = p->ctl_voice_l * c->ctl_gain_l[p->ctl_idx];
+        p->gainR = p->ctl_voice_r * c->ctl_gain_r[p->ctl_idx];
+        p->pitch_mult = p->ctl_voice_pitch * c->ctl_pitch[p->ctl_idx];
+        ++p->ctl_idx;
+    }
+}
+
+static inline int voice_park_ctl_next(const voice_park *p, int frames) {
+    return (p->ctl && p->ctl_idx < p->ctl->ctl_count) ? p->ctl->ctl_offset[p->ctl_idx] : frames;
+}
 
 static __thread voice_park g_voice_park[RENDER_TILE_VOICES];
 static __thread int g_voice_park_count = 0;
@@ -4471,7 +4580,8 @@ static int voice_run_scalar(voice_park *p, float *mix, int frames) {
     float pos = p->pos, env = p->env;
     int env_state = p->env_state, pending = p->pending_note_off_samples, dc = p->decimate_counter;
     float last_baseL = p->last_baseL, last_baseR = p->last_baseR;
-    const float gainL = p->gainL, gainR = p->gainR, pitch_mult = p->pitch_mult;
+    float gainL = p->gainL, gainR = p->gainR, pitch_mult = p->pitch_mult;
+    int ctl_next = voice_park_ctl_next(p, frames);
     const float c_b0 = p->c_b0, c_b1 = p->c_b1, c_b2 = p->c_b2, c_a1 = p->c_a1, c_a2 = p->c_a2;
     const float playback_end_f = (float)p->playback_end;
 #ifdef VOR
@@ -4483,6 +4593,11 @@ static int voice_run_scalar(voice_park *p, float *mix, int frames) {
 #endif
     int ended = 0;
     for (int f = p->f; f < frames; ++f) {
+        if (f >= ctl_next) {
+            voice_park_ctl_apply(p, f);
+            gainL = p->gainL; gainR = p->gainR; pitch_mult = p->pitch_mult;
+            ctl_next = voice_park_ctl_next(p, frames);
+        }
         if (!advance_voice_sample_state(v, p->sustain_down, &pending, &env_state, &env,
                                         p->attack_inc, p->decay_mul, p->sustain_level,
                                         p->release_alpha)) {
@@ -4659,7 +4774,23 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
     for (int k = 0; k < nl; ++k) dptr[k] = lane[k]->data;
     const vq_f4 relthr = vq_sel(decim, decim_start, silence);
     const int any_fade = vq_any(fade);
+    int cnext[4] = {frames, frames, frames, frames}, ctl_min = frames;
+    for (int k = 0; k < nl; ++k) {
+        cnext[k] = voice_park_ctl_next(lane[k], frames);
+        if (cnext[k] < ctl_min) ctl_min = cnext[k];
+    }
     for (int f = first; f < frames; ++f) {
+        if (f >= ctl_min) {
+            ctl_min = frames;
+            for (int k = 0; k < nl; ++k) {
+                if (cnext[k] <= f) {
+                    voice_park_ctl_apply(lane[k], f);
+                    gl[k] = lane[k]->gainL; gr[k] = lane[k]->gainR; pitch[k] = lane[k]->pitch_mult;
+                    cnext[k] = voice_park_ctl_next(lane[k], frames);
+                }
+                if (cnext[k] < ctl_min) ctl_min = cnext[k];
+            }
+        }
         const vq_i4 fv = {f, f, f, f};
         vq_i4 act = alive & (fv >= start) & (fv < stop);
         /* Lanes at their pending note-off frame leave here for the scalar loop. */
@@ -4673,7 +4804,7 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
         }
         /* A run of frames in which no lane starts, stops, reaches the end of its sample
          * (next index stays inside) or crosses an envelope boundary. */
-        int run = frames - f;
+        int run = ctl_min - f;
         for (int k = 0; k < nl; ++k) {
             if (!alive[k]) continue;
             const int b = f < start[k] ? start[k] - f : stop[k] - f;
@@ -5409,14 +5540,17 @@ break;
                                                                                                                                                                                                                                                                 case 4:  cs->foot = val; break;
                                                                                                                                                                                                                                                                 case 5:  cs->portamento_time = val; break;
                                                                                                                                                                                                                                                                 case 7:
+                                                                                                                                                                                                                                                                ctl_log_change(e.ch, CTL_KIND_VOLUME, val, e.timestamp_qpc, frames_this_block);
                                                                                                                                                                                                                                                                 cs->volume = val;
                                                                                                                                                                                                                                                                 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 break;
                                                                                                                                                                                                                                                                 case 10:
+                                                                                                                                                                                                                                                                ctl_log_change(e.ch, CTL_KIND_PAN, val, e.timestamp_qpc, frames_this_block);
                                                                                                                                                                                                                                                                 cs->pan = val;
                                                                                                                                                                                                                                                                 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 break;
                                                                                                                                                                                                                                                                 case 11:
+                                                                                                                                                                                                                                                                ctl_log_change(e.ch, CTL_KIND_EXPRESSION, val, e.timestamp_qpc, frames_this_block);
                                                                                                                                                                                                                                                                 cs->expression = val;
                                                                                                                                                                                                                                                                 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 break;
@@ -5567,6 +5701,7 @@ InterlockedAdd(&g_cc_us[cc],
 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_PITCH_BEND) {
                                                                                                                                                                                                                                                                 int raw14 = e.value & 0x3FFF;
+                                                                                                                                                                                                                                                                ctl_log_change(e.ch, CTL_KIND_BEND, raw14, e.timestamp_qpc, frames_this_block);
                                                                                                                                                                                                                                                                 g_channels[e.ch].bend14 = raw14; // single-writer
                                                                                                                                                                                                                                                                 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 }
@@ -5773,23 +5908,34 @@ if (wgpu_tile_open) {
                                                                                                                                                                                                                                                                 #endif
 
                                                                                                                                                                                                                                                                 // Precompute scalar gains and L/R factors
+                                                                                                                                                                                                                                                                const int ctl_timeline = ch_render->ctl_count > 0;
                                                                                                                                                                                                                                                                 #ifdef VOR
                                                                                                                                                                                                                                                                 const float base_gain = v->base_gain * ch_render->gain_mul * (vor_gain_fading ? 1.0f : vor_gain_scale);
-                                                                                                                                                                                                                                                                const int vor_fast_ok = !vor_gain_fading;
+                                                                                                                                                                                                                                                                const int vor_fast_ok = !vor_gain_fading && !ctl_timeline;
+                                                                                                                                                                                                                                                                const float ctl_voice_gain = v->base_gain * (vor_gain_fading ? 1.0f : vor_gain_scale);
                                                                                                                                                                                                                                                                 #else
                                                                                                                                                                                                                                                                 const float base_gain = v->base_gain * ch_render->gain_mul;
-                                                                                                                                                                                                                                                                const int vor_fast_ok = 1;
+                                                                                                                                                                                                                                                                const int vor_fast_ok = !ctl_timeline;
+                                                                                                                                                                                                                                                                const float ctl_voice_gain = v->base_gain;
                                                                                                                                                                                                                                                                 #endif
-                                                                                                                                                                                                                                                                const float gainL = base_gain * ch_render->pan_l * v->region_pan_l;
-                                                                                                                                                                                                                                                                const float gainR = base_gain * ch_render->pan_r * v->region_pan_r;
+                                                                                                                                                                                                                                                                const float ctl_voice_l = ctl_voice_gain * v->region_pan_l;
+                                                                                                                                                                                                                                                                const float ctl_voice_r = ctl_voice_gain * v->region_pan_r;
+                                                                                                                                                                                                                                                                float gainL = ctl_timeline ? ctl_voice_l * ch_render->ctl_gain_l[0] : base_gain * ch_render->pan_l * v->region_pan_l;
+                                                                                                                                                                                                                                                                float gainR = ctl_timeline ? ctl_voice_r * ch_render->ctl_gain_r[0] : base_gain * ch_render->pan_r * v->region_pan_r;
 
                                                                                                                                                                                                                                                                  // PITCH BEND
                                                                                                                                                                                                                                                                  float porta_offset = v->portamento_offset;
                                                                                                                                                                                                                                                                  float porta_step = v->portamento_step;
                                                                                                                                                                                                                                                                  const int porta_active = (fabsf(porta_offset) > 0.0001f && fabsf(porta_step) > 0.0f);
-                                                                                                                                                                                                                                                                 float pitch_mult = v->pitch_multiplier * ch_render->bend_pitch_mul;
-                                                                                                                                                                                                                                                                 if (porta_active) pitch_mult *= powf(2.0f, porta_offset * (1.0f / 12.0f));
-                                                                                                                                                                                                                                                                 const int no_interp = (!porta_active && fabsf(pitch_mult - 1.0f) < FASTPATH_NO_INTERP_EPS);
+                                                                                                                                                                                                                                                                 float ctl_voice_pitch = v->pitch_multiplier;
+                                                                                                                                                                                                                                                                float pitch_mult = v->pitch_multiplier * (ctl_timeline ? ch_render->ctl_pitch[0] : ch_render->bend_pitch_mul);
+                                                                                                                                                                                                                                                                 if (porta_active) {
+                                                                                                                                                                                                                                                                const float porta_mul = powf(2.0f, porta_offset * (1.0f / 12.0f));
+                                                                                                                                                                                                                                                                pitch_mult *= porta_mul;
+                                                                                                                                                                                                                                                                ctl_voice_pitch *= porta_mul;
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                 const int no_interp = (!porta_active && fabsf(pitch_mult - 1.0f) < FASTPATH_NO_INTERP_EPS &&
+                                                                                                                                                                                                                                                                !(ctl_timeline && ch_render->ctl_pitch_varies));
                                                                                                                                                                                                                                                                  const int release_allow_no_interp = (!v->region->is_resampled || no_interp);
                                                                                                                                                                                                                                                                  const int release_allow_decimate = (!v->region->is_resampled || no_interp);
 
@@ -6818,10 +6964,21 @@ continue;
                                                                                                                                                                                                                                                                 #ifdef VOR
                                                                                                                                                                                                                                                                     pk->vor_gain_scale = vor_gain_scale; pk->vor_target = vor_gain_target;
                                                                                                                                                                                                                                                                 #endif
+                                                                                                                                                                                                                                                                    pk->ctl = ctl_timeline ? ch_render : NULL; pk->ctl_idx = 1;
+                                                                                                                                                                                                                                                                    pk->ctl_voice_l = ctl_voice_l; pk->ctl_voice_r = ctl_voice_r; pk->ctl_voice_pitch = ctl_voice_pitch;
                                                                                                                                                                                                                                                                     continue;
                                                                                                                                                                                                                                                                 }
 
+                                                                                                                                                                                                                                                                int ctl_idx = 1;
                                                                                                                                                                                                                                                                 for (int f=f_start; f<frames; ++f) {
+                                                                                                                                                                                                                                                                if (ctl_timeline) {
+                                                                                                                                                                                                                                                                while (ctl_idx < ch_render->ctl_count && ch_render->ctl_offset[ctl_idx] <= f) {
+                                                                                                                                                                                                                                                                gainL = ctl_voice_l * ch_render->ctl_gain_l[ctl_idx];
+                                                                                                                                                                                                                                                                gainR = ctl_voice_r * ch_render->ctl_gain_r[ctl_idx];
+                                                                                                                                                                                                                                                                pitch_mult = ctl_voice_pitch * ch_render->ctl_pitch[ctl_idx];
+                                                                                                                                                                                                                                                                ++ctl_idx;
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                }
                                                                                                                                                                                                                                                                 if (!advance_voice_sample_state(v,
                                                                                                                                                                                                                                                                 sustain_down,
                                                                                                                                                                                                                                                                 &pending_note_off_samples,

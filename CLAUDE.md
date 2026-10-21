@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§110). Este archivo resume el estado al cierre de la rev. 113 y dice
+`HANDOFF.md` (§1-§111). Este archivo resume el estado al cierre de la rev. 114 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 113)
+## Estado actual (rev. 114)
 
 Rendimiento medido por el usuario:
 
@@ -345,6 +345,9 @@ Rendimiento medido por el usuario:
   sólidos) y .xz/.gz. `web/archive-worker.js` descomprime en streaming a OPFS (≤ 256 MiB a memoria) y el `File` resultante
   entra al camino normal; LZMA/LZMA2 en `wasmidi-archive-core.wasm` (LZMA SDK, dominio público). Ventana para elegir si hay
   varios. The Nuker 4 F2.7z: 752 MB/s de decodificación en Chromium; en el contenedor limita la escritura a OPFS.
+- Rev. 114 (HANDOFF §111): CC7/10/11 y pitch bend se aplican en su muestra dentro del bloque (línea de tiempo por
+  canal en el render, sin cortar el bloque): escalones de volumen y paneo de -5,2 ms medio (peor -15) a 0,02 ms del render
+  exacto, mismo costo de CPU. Paneo de potencia constante como GM2/BASSMIDI. Dos CC iguales se fusionan solo a < 32 cuadros.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -400,6 +403,8 @@ Mecanismos activos y cómo desactivarlos:
 | Trampolín de `worker_cycle` | `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` |
 | Render de 4 voces a la vez (vectores) | `-DSSW_VOICE_QUAD=0` |
 | Note-off FIFO / lista abierta | `-DSSW_NOTEOFF_FIFO=0` / `-DSSW_NOTEOFF_OPEN_LIST=0` |
+| Línea de tiempo de CC7/10/11 y pitch bend dentro del bloque (rev. 114) | sin interruptor (`ctl_count` 0 sin cambios en el bloque) |
+| Fusión de CC iguales solo a < 32 cuadros (rev. 114) | `-DSSW_CTL_MERGE_FRAMES=` grande |
 
 ## Pendientes abiertos (lista completa en HANDOFF §90)
 
@@ -428,7 +433,7 @@ Mecanismos activos y cómo desactivarlos:
 2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
    ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
    (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.
-3. Anteriores: que el hilo coordinador también tome tiles de render; GUI cosmética; precisión de CC;
+3. Anteriores: que el hilo coordinador también tome tiles de render; GUI cosmética;
    envolvente de modulación, LFOs, moduladores, reverb y chorus de SF2 (HANDOFF §102).
 
 ## Errores a no repetir (detalle en HANDOFF §7)
