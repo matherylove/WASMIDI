@@ -7033,3 +7033,30 @@ izquierdo). Una muestra vieja más alta que el máximo quedaba por encima del re
 ### No verificado
 
 - Con un MIDI que baje de golpe la densidad en las PCs del usuario (el caso que se salía).
+
+## 107. Revisión 110 — escala del gráfico que solo crece
+
+### Pedido
+
+Dekx: los gráficos no parecen gráficos; la velocidad está bien, pero siempre están al máximo. La escala sigue
+al último segundo en vez de tener mínimos y subir solo cuando el valor pasa el límite.
+
+### Causa
+
+Desde la rev. 108 la escala vertical de `LiveGraph` era el máximo de las muestras visibles (la ventana del note
+speed, ~1 s), así que la línea siempre tocaba el techo.
+
+### Cambios
+
+- `live_graph.cpp`: un techo por serie (NPS y polifonía) que empieza en 1 y solo sube, redondeado al siguiente
+  1, 2 o 5 × 10^n. Se vuelve a 1 al abrir otro MIDI (`clear()` con `documentRevision`, como antes).
+- `Dock.qml`: la leyenda muestra valor y techo ("NPS 64 / 100").
+
+### Verificación
+
+- Compilación wasm local OK. Chromium con `burst.mid`: NPS 64 / 100 al inicio; tras la ráfaga el techo queda en
+  1.000 / 500 y la línea baja cerca del fondo al volver a 64 NPS.
+
+### No verificado
+
+- En las PCs del usuario con MIDIs grandes.

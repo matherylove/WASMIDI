@@ -16,6 +16,8 @@ class LiveGraph : public QQuickItem {
     Q_PROPERTY(double polyphony READ polyphony WRITE setPolyphony NOTIFY valuesChanged)
     Q_PROPERTY(bool sampling READ sampling WRITE setSampling NOTIFY valuesChanged)
     Q_PROPERTY(double span READ span WRITE setSpan NOTIFY valuesChanged)
+    Q_PROPERTY(double npsCeiling READ npsCeiling NOTIFY ceilingChanged)
+    Q_PROPERTY(double polyCeiling READ polyCeiling NOTIFY ceilingChanged)
     Q_PROPERTY(QColor accent READ accent WRITE setAccent NOTIFY styleChanged)
     Q_PROPERTY(QColor lineColor READ lineColor WRITE setLineColor NOTIFY styleChanged)
     Q_PROPERTY(QColor polyColor READ polyColor WRITE setPolyColor NOTIFY styleChanged)
@@ -44,6 +46,9 @@ public:
     void setPolyColor(const QColor& value);
     void setGridColor(const QColor& value);
 
+    double npsCeiling() const { return npsCeiling_; }
+    double polyCeiling() const { return polyCeiling_; }
+
     Q_INVOKABLE void clear();
     // Samples drawn since the last call (the graph's own frame count).
     Q_INVOKABLE int takeFrames();
@@ -51,6 +56,7 @@ public:
 signals:
     void valuesChanged();
     void styleChanged();
+    void ceilingChanged();
 
 protected:
     QSGNode* updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* data) override;
@@ -66,6 +72,8 @@ private:
     void sample();
 
     std::deque<Sample> samples_;
+    float npsCeiling_ = 1.0f;
+    float polyCeiling_ = 1.0f;
     int frames_ = 0;
     double time_ = 0.0;
     double nps_ = 0.0;
