@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§105). Este archivo resume el estado al cierre de la rev. 108 y dice
+`HANDOFF.md` (§1-§106). Este archivo resume el estado al cierre de la rev. 109 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 108)
+## Estado actual (rev. 109)
 
 Rendimiento medido por el usuario:
 
@@ -330,6 +330,7 @@ Rendimiento medido por el usuario:
   al lado. El gráfico NPS/polifonía muestra solo los segundos del note speed. El aviso de lag cuenta su
   duración; "Lag log" (Advanced… → View) guarda totales por fuente, FPS mín/prom/máx y episodios con su
   segundo del MIDI, y "Download" lo baja como texto. Se borra al cambiar el MIDI o la SoundFont.
+- Rev. 109 (HANDOFF §106): el gráfico dibuja solo las muestras de la ventana del note speed y no se sale del recuadro.
 
 Mecanismos activos y cómo desactivarlos:
 

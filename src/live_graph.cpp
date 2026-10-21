@@ -184,14 +184,18 @@ QSGNode* LiveGraph::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
         maxPoly = std::max(maxPoly, s.polyphony);
     }
 
-    const int count = int(samples_.size());
+    // Only the samples inside the span, plus the one just before it so the line reaches the left edge.
+    int first = 0;
+    while (first + 1 < int(samples_.size()) && samples_[first + 1].time <= since)
+        ++first;
+    const int count = int(samples_.size()) - first;
     const double now = samples_.empty() ? 0.0 : samples_.back().time;
     const float top = 3.0f, bottom = h - 1.0f;
     const auto xOf = [&](const Sample& s) {
         return std::clamp(float(w * (1.0 - (now - s.time) / span_)), 0.0f, w);
     };
     const auto yOf = [&](float value, float maxValue) {
-        return bottom - (value / maxValue) * (bottom - top);
+        return std::clamp(bottom - (value / maxValue) * (bottom - top), top, bottom);
     };
 
     QSGGeometry* area = areaNode->geometry();
@@ -200,7 +204,8 @@ QSGNode* LiveGraph::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
     line->allocate(count * 2);
     auto* av = area->vertexDataAsColoredPoint2D();
     auto* lv = line->vertexDataAsColoredPoint2D();
-    for (const auto& s : samples_) {
+    for (int i = first; i < int(samples_.size()); ++i) {
+        const Sample& s = samples_[i];
         const float x = xOf(s);
         const float y = yOf(s.nps, maxNps);
         // Vertical gradient of the fill: .75 at the top of the chart, .05 at the bottom.
@@ -214,7 +219,7 @@ QSGNode* LiveGraph::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
 
     // Dashed polyphony line: 3 px on, 2 px off along x.
     std::vector<QPointF> dashes;
-    for (int i = 1; i < count; ++i) {
+    for (int i = first + 1; i < int(samples_.size()); ++i) {
         const float xa = xOf(samples_[i - 1]), xb = xOf(samples_[i]);
         const float ya = yOf(samples_[i - 1].polyphony, maxPoly);
         const float yb = yOf(samples_[i].polyphony, maxPoly);

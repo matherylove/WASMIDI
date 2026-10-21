@@ -7006,3 +7006,30 @@ cambiar el MIDI o la SoundFont.
 ### No verificado
 
 - En las PCs del usuario y en el celular.
+
+## 106. Revisión 109 — el gráfico no se sale del recuadro
+
+### Pedido
+
+Dekx: con la rev. 108 los gráficos se salen del recuadro.
+
+### Causa
+
+Desde la rev. 108 la escala vertical toma el máximo solo de las muestras de la ventana del note speed, pero
+`LiveGraph` seguía dibujando las muestras guardadas de antes (hasta 0,5 s más viejas, pegadas al borde
+izquierdo). Una muestra vieja más alta que el máximo quedaba por encima del recuadro.
+
+### Cambios
+
+- `live_graph.cpp`: dibuja solo las muestras de la ventana y la anterior (para llegar al borde izquierdo); la altura
+  se limita al recuadro.
+- `Dock.qml`: el gráfico recorta lo que dibuja (`clip`).
+
+### Verificación
+
+- Compilación wasm local OK; Chromium 1280×900 con `burst.mid` y note speed 1 s: el gráfico queda dentro del
+  recuadro en 8 capturas.
+
+### No verificado
+
+- Con un MIDI que baje de golpe la densidad en las PCs del usuario (el caso que se salía).
