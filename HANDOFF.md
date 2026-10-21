@@ -7201,3 +7201,90 @@ así que la limpieza ocurre en la primera corrida en `main` después de este cam
 
 **No verificado.** GitHub recalcula el uso de almacenamiento cada 6-12 h: el aviso de límite puede
 tardar en irse aunque los artifacts ya estén borrados.
+
+## 110. Revisión 113 — abrir MIDIs y SoundFonts desde .zip, .7z, .xz y .gz
+
+### Pedido
+
+Dekx: "Añade soporte de apertura de archivos .zip, .7z y .xz". Sus MIDIs de prueba vienen en .7z (The Nuker 4 F2.7z:
+32 MB que se vuelven 20,4 GiB; The Nuker 3 Ultimate F4.7z: 80 MB → 15,5 GiB), así que no se puede descomprimir en
+memoria.
+
+### Diseño
+
+El parser lee el `File` por ventanas y sus helpers leen pistas distintas a la vez (acceso aleatorio), y el store BPFA
+guarda su propia copia (cruda o zstd) al indexar. En vez de tocar el parser, el archivo elegido se descomprime en
+streaming a un archivo del almacenamiento privado del navegador (OPFS, `navigator.storage.getDirectory()`, carpeta
+`wasmidi-archive/`) con `createSyncAccessHandle` dentro de un Worker, y el `File` de OPFS (envuelto en un `File` con
+el nombre de la entrada, sin copiar) entra al mismo camino que un MIDI suelto. Hasta 256 MiB (tamaño conocido) se
+descomprime a memoria (`Blob`).
+
+- `web/archive-worker.js`: lee los contenedores en JS.
+  - zip: directorio central, Zip64, nombres UTF-8 o CP-1252; métodos Store, Deflate (`DecompressionStream`
+    `deflate-raw`, nativo del navegador), LZMA (14) y XZ (95). Cifrado y otros métodos: error con el nombre del
+    método.
+  - 7z: encabezado plano o codificado (EncodedHeader), carpetas sólidas (salta las entradas anteriores dentro de la
+    carpeta) y no sólidas; Copy, LZMA, LZMA2 y Deflate de un solo codificador. BCJ/BCJ2/PPMd/BZip2/AES: error con el
+    nombre.
+  - xz: bloques LZMA2 sin filtros, varios streams concatenados con relleno; el tamaño sale de los índices leídos
+    desde el final. No verifica los CRC/SHA-256 (un dato roto lo detecta el decodificador o el parser).
+  - gz (bonus, nativo): un solo miembro; el tamaño no se conoce (ISIZE es módulo 2^32).
+- `src/archive/archive_codec.c` → `wasmidi-archive-core.{js,wasm}` (wasm32, 20 KB, sin pthreads): `wa_dec_*`
+  sobre `LzmaDec`/`Lzma2Dec` del LZMA SDK de 7-Zip 26.05 (`third_party/lzma/`, dominio público). Decodifica al
+  diccionario (máx(diccionario, 4 MiB) o el tamaño real si es menor) y el JS escribe directo desde la memoria del wasm
+  a OPFS, sin copia intermedia. Al terminar un bloque LZMA2 con tamaño conocido pide la marca de fin
+  (`LZMA_FINISH_END`) para saber cuántos bytes comprimidos consumió (xz necesita la posición exacta del bloque
+  siguiente).
+- `web/wasmidi-archive.js` (página): `WasmidiArchive.open(file, { kind })` y `resolve(file, kind)`. Ventana con el
+  estilo de la ventana de carga (dekx): lista para elegir si el paquete trae varios MIDIs (o SoundFonts), barra de
+  progreso con MB/s y Cancel (termina el Worker). Si no hay ninguna entrada con la extensión buscada, lista todas.
+  Errores (método no soportado, falta de espacio: `QuotaExceededError` del `truncate` previo al tamaño final) en la
+  misma ventana.
+- Limpieza: cada archivo de OPFS tiene un Web Lock `wasmidi-archive:<nombre>` que la página tiene mientras lo usa.
+  Al abrir otro paquete del mismo tipo se suelta y borra el anterior; los archivos sin lock (pestañas cerradas) se
+  borran al abrir la página (a los 3 s) y antes de cada extracción. Nunca quedan más de un MIDI y una SoundFont por
+  pestaña.
+- Cableado: selector de MIDI y de SF2 de WASMIDI (`wasmidi_browser_open_file_picker`, no SFZ), selector de SF2 del
+  bridge, WASMIDI Audio (selectores y soltar archivos: un paquete soltado ofrece MIDIs y SoundFonts juntos, `kind:
+  "any"`) y `parser-bench.html` (fila "Extracción de …" en el reporte). El CI copia los tres archivos nuevos e inyecta
+  `wasmidi-archive.js?v=` en `index.html`; `audio.html` lo trae con `?v=dev`.
+
+### Medición
+
+| Qué | Resultado |
+|---|---|
+| The Nuker 4 F2.7z, LZMA2 nativo (gcc -O2, host) | 21 953 584 745 bytes en 17,3 s = 1266 MB/s |
+| Mismo, wasm en Node 24 (`archive_smoke.cjs … big.7z`) | 19,5 s = 1128 MB/s |
+| Chromium del contenedor, Worker, primeros 4 GB sin escribir | 752 MB/s |
+| Mismo escribiendo a OPFS | 124-299 MB/s (varía con el disco del contenedor; `truncate` previo al tamaño final no cambia nada) |
+
+El límite en el contenedor es la escritura de OPFS (el disco del contenedor da ~440 MB/s con `dd`). En una PC con NVMe
+debería quedar cerca de la decodificación; sin medir.
+
+The Nuker 3 Ultimate F4.7z entero en Chromium del contenedor (4 hilos, perfil persistente, `parser-bench.html`):
+extracción de 15,51 GiB a OPFS en 97,4 s (~170 MB/s, limitada por la escritura) y después la carga normal del
+parser desde el `File` de OPFS (paginada, 2 Workers) en 226 s: total 323,9 s, "Listo". `navigator.storage.estimate()`
+al final: 16,66 GB usados en `fileSystem` (el MIDI extraído, que queda hasta el próximo paquete o hasta cerrar la
+pestaña).
+
+### Verificación
+
+- `tools/archive_smoke.cjs` (CI, paso "Validate generated MIDI parser runtime"): 9 paquetes en
+  `tools/archive_fixtures/` (los genera `tools/make_archive_fixtures.py` con py7zr; 572 KB en total): 7z LZMA2/LZMA/
+  Deflate/Copy con encabezado codificado y sólidos (se extrae la última entrada primero), zip con Store/Deflate/LZMA,
+  Zip64, xz con diccionario de 64 KiB (el buffer de 4 MiB da la vuelta) y xz de dos streams con relleno y checks
+  SHA-256/ninguno, gz. Todas las entradas idénticas byte a byte.
+- The Nuker 4 F2.7z (encabezado plano de 7-Zip real) extraído entero en Node: tamaño exacto.
+- Chromium (perfil persistente, `parser-bench.html`): zip con dos MIDIs → ventana de elección → el elegido se extrae a
+  memoria y se parsea.
+- WASMIDI (`browser_bench.py app one.mid.xz sf2.zip 4`): MatheryLSD desde un .zip (Deflate, a memoria) y un MIDI desde un
+  .xz por los selectores de la app; suena (voces 3-4, 0 underruns) y el roll avanza.
+
+### No verificado
+
+- En las PCs de Dekx: velocidad de escritura de OPFS, y la cuota (Chrome da a un origen hasta ~60% del disco; un MIDI de
+  20 GB necesita esos 20 GB libres).
+- Firefox/Safari: sin `createSyncAccessHandle` en Workers de algunas versiones el paquete grande cae a memoria y
+  fallaría; WASMIDI apunta a Chrome/Brave.
+- Mejoras posibles: alimentar al parser mientras se descomprime (sin pasar por disco) o decodificar y escribir en hilos
+  separados; .tar.xz/.tar.gz (tar adentro) no se listan.

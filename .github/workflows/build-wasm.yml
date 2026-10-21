@@ -160,6 +160,10 @@ jobs:
           python3 -m py_compile tools/patch_emscripten_memory64_growth.py
           python3 tools/patch_emscripten_memory64_growth.py --check "$(command -v em++)"
           node tools/midi_parser_bootstrap_smoke.cjs build/wasmidi-midi-parser.js
+          # Archive reader (HANDOFF sec. 110): every fixture entry byte for byte.
+          node --check web/archive-worker.js
+          node --check web/wasmidi-archive.js
+          node tools/archive_smoke.cjs build/wasmidi-archive-core.js
 
       - name: Prepare Pages artifact
         shell: bash
@@ -174,6 +178,8 @@ jobs:
           test -s build/snappysynth-core.wasm
           test -s build/snappysynth-core.worker.js
           test -s build/wasmidi-midi-parser.js
+          test -s build/wasmidi-archive-core.js
+          test -s build/wasmidi-archive-core.wasm
 
           cp build/wasmidi.html site/index.html
           cp build/wasmidi.js site/
@@ -206,6 +212,8 @@ jobs:
           cp web/synth-feeder-worker.js site/
           cp web/snappysynth-audio-worklet.js site/
           cp web/wasmidi-app-debug.js site/
+          cp build/wasmidi-archive-core.js build/wasmidi-archive-core.wasm site/
+          cp web/archive-worker.js web/wasmidi-archive.js site/
 
           # Load the isolation helper and bridge before Qt's generated bootstrap.
           # Fingerprint executable assets with the commit SHA so a successful
@@ -222,6 +230,7 @@ jobs:
           <script src="coi-serviceworker.js?v={version}"></script>
           <script src="snappysynth_bridge.js?v={version}"></script>
           <script src="wasmidi-app-debug.js?v={version}"></script>
+          <script src="wasmidi-archive.js?v={version}"></script>
           """
           if "snappysynth_bridge.js" not in html:
               if "</head>" in html:
@@ -292,6 +301,11 @@ jobs:
           test -s site/build-id.txt
           test -s site/wasmidi-app-debug.js
           grep -q 'wasmidi-app-debug.js?v=' site/index.html
+          grep -q 'wasmidi-archive.js?v=' site/index.html
+          grep -q 'wasmidi-archive.js?v=' site/audio.html
+          test -s site/wasmidi-archive-core.js
+          test -s site/wasmidi-archive-core.wasm
+          test -s site/archive-worker.js
 
           # Pass 13 mapped-store validation. Keep deployment checks in sync with
           # the actual worker source instead of retaining the old Pass 12.9 pin.

@@ -996,18 +996,19 @@ void main() {
     }
 
     // ---- Wiring ----------------------------------------------------------------
-    function pick(input, handler) {
-        input.addEventListener("change", () => {
-            const file = input.files && input.files[0];
+    function pick(input, handler, kind) {
+        input.addEventListener("change", async () => {
+            let file = input.files && input.files[0];
             input.value = "";
+            if (file && globalThis.WasmidiArchive) file = await globalThis.WasmidiArchive.resolve(file, kind);
             if (file) handler(file);
         });
     }
 
     function init() {
         writeConfigForm();
-        pick($("midi-input"), loadMidi);
-        pick($("sf2-input"), loadSf2);
+        pick($("midi-input"), loadMidi, "midi");
+        pick($("sf2-input"), loadSf2, "soundfont");
         $("open-midi").addEventListener("click", () => $("midi-input").click());
         $("open-sf2").addEventListener("click", () => $("sf2-input").click());
         $("sfz-input").addEventListener("change", () => {
@@ -1058,8 +1059,12 @@ void main() {
             const files = Array.from(e.dataTransfer.files || []);
             const items = Array.from(e.dataTransfer.items || []);
             const hasFolder = items.some(item => { const en = item.webkitGetAsEntry && item.webkitGetAsEntry(); return en && en.isDirectory; });
-            for (const file of files) {
-                if (/\.(mid|midi|smf|kar)$/i.test(file.name)) void loadMidi(file);
+            for (let file of files) {
+                if (globalThis.WasmidiArchive && globalThis.WasmidiArchive.isArchive(file)) {
+                    file = await globalThis.WasmidiArchive.open(file, { kind: "any" });
+                    if (!file) continue;
+                }
+                if (/\.(mid|midi|smf|kar|rmi)$/i.test(file.name)) void loadMidi(file);
                 else if (/\.(sf2|sf3)$/i.test(file.name)) void loadSf2(file);
             }
             if (hasFolder) void loadSfzFolder(await droppedFiles(items));

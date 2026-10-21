@@ -825,7 +825,7 @@
 
         input.type = "file";
         input.accept =
-            ".sf2,audio/x-soundfont,application/octet-stream";
+            ".sf2,audio/x-soundfont,application/octet-stream,.zip,.7z,.xz,.txz,.gz";
 
         input.style.position = "fixed";
         input.style.left = "-10000px";
@@ -837,13 +837,16 @@
         document.body.appendChild(input);
 
         input.onchange = async () => {
-            const file =
+            let file =
                 input.files &&
                 input.files.length
                     ? input.files[0]
                     : null;
 
             input.value = null;
+
+            if (file && globalThis.WasmidiArchive)
+                file = await globalThis.WasmidiArchive.resolve(file, "soundfont");
 
             if (!file)
                 return;
