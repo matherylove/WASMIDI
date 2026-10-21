@@ -94,6 +94,7 @@ extern sfz_instrument* instrument;
 #define STEAL_RELEASE_RAMP_SEC 0.005f // ~5ms forced release on steals
 
 #define VOICE_SILENCE          (1.0f/65536.0f)
+#define DECAY_FLOOR_LEVEL      0.00001f
 #define VELO_EXPONENT          1.7f
 #define SF2_DEFAULT_ATTENUATION_CB 960.0f
 #define SYNTH_PRE_LIMITER_GAIN 0.50f
@@ -179,8 +180,11 @@ typedef enum {
     EVT_PITCH_BEND = 4,
     EVT_PROGRAM_CHANGE = 5,
     EVT_DRUM_PART = 6,
-    EVT_SCALE_TUNE = 7
+    EVT_SCALE_TUNE = 7,
+    EVT_SELECTOR_COPY = 8   // key: SELECTOR_*; worker-local selector state only
 } ch_event_type;
+
+enum { SELECTOR_BANK_MSB = 0, SELECTOR_BANK_LSB = 1, SELECTOR_PROGRAM = 2, SELECTOR_DRUM_PART = 3 };
 
 typedef struct {
     uint8_t type;
@@ -338,12 +342,12 @@ typedef struct {
     LONG last_key_off_epoch;
     uint32_t voice_age_counter;
 
-    LONG selector_cache_version[MIDI_CHANNEL_COUNT];
     int selector_program[MIDI_CHANNEL_COUNT];
-    int selector_bank_combined[MIDI_CHANNEL_COUNT];
     int selector_bank_msb[MIDI_CHANNEL_COUNT];
     int selector_bank_lsb[MIDI_CHANNEL_COUNT];
-    int selector_is_drum[MIDI_CHANNEL_COUNT];
+    int selector_applied_msb[MIDI_CHANNEL_COUNT];
+    int selector_applied_lsb[MIDI_CHANNEL_COUNT];
+    int selector_drum_part[MIDI_CHANNEL_COUNT];
 
     note_region_cache_entry *note_region_cache;
     note_single_region_cache_entry *note_single_region_cache;
@@ -441,6 +445,7 @@ static int    g_final_cap = 0;
 static float  g_global_mix_gain = 1.0f;
 static volatile LONG g_output_soft_clip_enabled = 1;
 static volatile LONG g_steal_cap_percent = 25;
+static int g_selector_copies = 0;  /* note events are not routed to the channel's worker */
 static int g_event_worker_count = 1; /* workers that process events: 1 in "single" sharding */
 void voice_set_steal_cap_percent(int percent) { InterlockedExchange(&g_steal_cap_percent, percent < 0 ? 0 : percent); }
 
@@ -491,7 +496,7 @@ typedef struct {
     int32_t pending_off;
     uint32_t pad0, pad1, pad2;
     float position, pitch, gain_l, gain_r;
-    float env, decay_dec, sustain, attack_inc;
+    float env, decay_mul, sustain, attack_inc;
     float release_alpha, loop_start, loop_end, playback_end;
     float b0, b1, b2, a1;
     float a2, z1l, z2l, z1r;
@@ -657,10 +662,8 @@ static inline LONG load_relaxed_long(volatile LONG* value) {
     return *value;
 }
 
-static inline void channel_effective_banks(int ch, int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
-    int bank_msb = (int)load_relaxed_long(&g_channels[ch].applied_bank_msb) & 0x7F;
-    int bank_lsb = (int)load_relaxed_long(&g_channels[ch].applied_bank_lsb) & 0x7F;
-    int drum_part = (int)load_relaxed_long(&g_channels[ch].drum_part);
+static inline void selector_effective_banks(int ch, int bank_msb, int bank_lsb, int drum_part,
+                                            int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
     int gs_part_mode = (int)load_relaxed_long(&g_gs_part_mode);
     /* Channel 10 remains a rhythm channel across drum-kit Program Changes.
        XG uses bank MSB 127 for drum kits and 126 for SFX kits; GM2 uses 120
@@ -681,11 +684,35 @@ static inline void channel_effective_banks(int ch, int* out_combined, int* out_m
         if (combined < 128) {
             combined = 128 + bank_lsb;
         }
-        }
+    } else if (instrument && instrument->format == SOUND_FONT_FORMAT_SF2) {
+        combined = bank_msb ? bank_msb : bank_lsb;
+    }
         if (out_combined) *out_combined = combined;
         if (out_msb) *out_msb = bank_msb;
         if (out_lsb) *out_lsb = bank_lsb;
         if (out_is_drum_part) *out_is_drum_part = is_drum_part ? 1 : 0;
+}
+
+static inline void channel_effective_banks(int ch, int* out_combined, int* out_msb, int* out_lsb, int* out_is_drum_part) {
+    selector_effective_banks(ch,
+                             (int)load_relaxed_long(&g_channels[ch].applied_bank_msb) & 0x7F,
+                             (int)load_relaxed_long(&g_channels[ch].applied_bank_lsb) & 0x7F,
+                             (int)load_relaxed_long(&g_channels[ch].drum_part),
+                             out_combined, out_msb, out_lsb, out_is_drum_part);
+}
+
+static inline void worker_apply_selector(worker_data *wd, int ch, int kind, int value) {
+    switch (kind) {
+        case SELECTOR_BANK_MSB: wd->selector_bank_msb[ch] = value & 0x7F; break;
+        case SELECTOR_BANK_LSB: wd->selector_bank_lsb[ch] = value & 0x7F; break;
+        case SELECTOR_PROGRAM:
+            wd->selector_program[ch] = value & 0x7F;
+            wd->selector_applied_msb[ch] = wd->selector_bank_msb[ch];
+            wd->selector_applied_lsb[ch] = wd->selector_bank_lsb[ch];
+            break;
+        case SELECTOR_DRUM_PART: wd->selector_drum_part[ch] = value & 0x7F; break;
+        default: break;
+    }
 }
 
 static inline void worker_get_channel_selector(worker_data *wd, int ch,
@@ -694,30 +721,18 @@ static inline void worker_get_channel_selector(worker_data *wd, int ch,
                                                int *out_msb,
                                                int *out_lsb,
                                                int *out_is_drum_part) {
-    LONG version = load_relaxed_long(&g_channel_selector_version[ch]);
-    if (wd && wd->selector_cache_version[ch] == version) {
-        *out_program = wd->selector_program[ch];
-        *out_combined = wd->selector_bank_combined[ch];
-        *out_msb = wd->selector_bank_msb[ch];
-        *out_lsb = wd->selector_bank_lsb[ch];
-        *out_is_drum_part = wd->selector_is_drum[ch];
+    if (!wd) {
+        *out_program = (int)load_relaxed_long(&g_channels[ch].program);
+        channel_effective_banks(ch, out_combined, out_msb, out_lsb, out_is_drum_part);
         return;
     }
+    *out_program = wd->selector_program[ch];
+    selector_effective_banks(ch, wd->selector_applied_msb[ch], wd->selector_applied_lsb[ch],
+                             wd->selector_drum_part[ch],
+                             out_combined, out_msb, out_lsb, out_is_drum_part);
+}
 
-    *out_program = (int)load_relaxed_long(&g_channels[ch].program);
-    channel_effective_banks(ch, out_combined, out_msb, out_lsb, out_is_drum_part);
-
-    if (wd) {
-        wd->selector_program[ch] = *out_program;
-        wd->selector_bank_combined[ch] = *out_combined;
-        wd->selector_bank_msb[ch] = *out_msb;
-        wd->selector_bank_lsb[ch] = *out_lsb;
-        wd->selector_is_drum[ch] = *out_is_drum_part;
-        wd->selector_cache_version[ch] = version;
-    }
-                                               }
-
-                                               static inline int get_active_voice_count_estimate(void) {
+static inline int get_active_voice_count_estimate(void) {
                                                    return (int)load_relaxed_long(&g_active_voice_count);
                                                }
 
@@ -812,7 +827,7 @@ static inline void worker_get_channel_selector(worker_data *wd, int ch,
                                                // Sampling-time constants (updated on init/format change)
                                                static float g_dt = 1.0f;                 // seconds per sample
                                                static float g_attack_inc = 0.0f;         // linear to 1.0
-                                               static float g_decay_dec = 0.0f;          // linear to sustain
+                                               static float g_decay_mul = 0.0f;          // linear to sustain
                                                static float g_release_alpha = 0.0f;      // exponential factor per sample
                                                static float g_kill_release_alpha = 0.0f; // exponential factor per sample for steals
                                                static float g_limiter_attack_coeff = 0.0f;
@@ -914,6 +929,24 @@ static inline void worker_get_channel_selector(worker_data *wd, int ch,
                                                    return expf(logf(VOICE_SILENCE) * (g_dt / seconds));
                                                }
 
+                                               /* Per-sample multiplier of the exponential decay that reaches `sustain` (or the
+                                                * -100 dB floor) after `seconds`; 0 jumps straight to sustain. */
+                                               static inline float decay_seconds_to_mul(float seconds, float sustain) {
+                                                   const float floor_level = sustain > DECAY_FLOOR_LEVEL ? sustain : DECAY_FLOOR_LEVEL;
+                                                   if (seconds <= 0.0f || floor_level >= 1.0f) return 0.0f;
+                                                   return expf(logf(floor_level) * (g_dt / seconds));
+                                               }
+
+                                               /* Decay multiplier for one block: 1 (level held) while the hold stage lasts. */
+                                               static inline float voice_block_decay_mul(const voice *v, int env_state, float decay_mul) {
+                                                   return (v->env_hold_samples > 0 && (env_state == ENV_ATTACK || env_state == ENV_DECAY)) ? 1.0f : decay_mul;
+                                               }
+
+                                               static inline void voice_consume_hold(voice *v, int env_state, int frames) {
+                                                   if (v->env_hold_samples > 0 && env_state == ENV_DECAY)
+                                                       v->env_hold_samples = v->env_hold_samples > frames ? v->env_hold_samples - frames : 0;
+                                               }
+
                                                static inline float midi_vel_to_norm(int vel) {
                                                    if (vel <= 0) return 0.0f;
                                                    if (vel >= 127) return 1.0f;
@@ -983,7 +1016,7 @@ static inline void worker_get_channel_selector(worker_data *wd, int ch,
                                                                                                      int layer_count = 0;
                                                                                                      if (!instrument || !out_regions || max_regions <= 0) return 0;
 
-                                                                                                     if (instrument->format == SOUND_FONT_FORMAT_SFZ) {
+                                                                                                     if (instrument->format == SOUND_FONT_FORMAT_SFZ || instrument->format == SOUND_FONT_FORMAT_SF2) {
                                                                                                          layer_count = sfz_collect_exact_regions_for_program(instrument, key, vel,
                                                                                                                                                              midi_bank_combined, midi_bank_msb,
                                                                                                                                                              midi_bank_lsb, midi_program,
@@ -1004,7 +1037,7 @@ static inline void worker_get_channel_selector(worker_data *wd, int ch,
                                                                                                              int vel_distance = abs(vel - vel_center);
                                                                                                              int found = -1;
 
-                                                                                                             for (int j = 0; j < selected_count; ++j) {
+                                                                                                             for (int j = 0; j < selected_count && instrument->format != SOUND_FONT_FORMAT_SF2; ++j) {
                                                                                                                  if (selected_regions[j]->cache_entry == candidate->cache_entry &&
                                                                                                                      selected_regions[j]->sample_data == candidate->sample_data) {
                                                                                                                      found = j;
@@ -1182,9 +1215,8 @@ static inline void refresh_region_runtime_cache(sfz_region* region) {
                                                                                                                                                                                      region->cached_attack_inc = (region->ampeg_attack >= 0.0f)
                                                                                                                                                                                      ? ((region->ampeg_attack > 0.0f) ? clampf(g_dt / region->ampeg_attack, 0.000001f, 1.0f) : 1.0f)
                                                                                                                                                                                      : -1.0f;
-    region->cached_decay_dec = (region->ampeg_decay >= 0.0f && region->ampeg_sustain >= 0.0f)
-    ? ((1.0f - region->ampeg_sustain) *
-    ((region->ampeg_decay > 0.0f) ? clampf(g_dt / region->ampeg_decay, 0.000001f, 1.0f) : 1.0f))
+    region->cached_decay_mul = (region->ampeg_decay >= 0.0f && region->ampeg_sustain >= 0.0f)
+    ? decay_seconds_to_mul(region->ampeg_decay, region->ampeg_sustain)
     : -1.0f;
     region->cached_release_alpha = region_release_seconds_to_alpha(region->ampeg_release);
 }
@@ -1230,7 +1262,7 @@ static volatile LONG g_voices_recycled_total = 0;
                                                                                                                                                                                                                               int *env_state,
                                                                                                                                                                                                                               float *env,
                                                                                                                                                                                                                               float attack_inc,
-                                                                                                                                                                                                                              float decay_dec,
+                                                                                                                                                                                                                              float decay_mul,
                                                                                                                                                                                                                               float sustain_level,
                                                                                                                                                                                                                               float release_alpha);
 
@@ -1302,7 +1334,8 @@ static volatile LONG g_voices_recycled_total = 0;
                                                                                                                                                                                      v->loop_end = 0;
                                                                                                                                                                                      v->group_id = 0;
                                                                                                                                                                                      v->env_attack_inc = -1.0f;
-                                                                                                                                                                                     v->env_decay_dec = -1.0f;
+                                                                                                                                                                                     v->env_decay_mul = -1.0f;
+                                                                                                                                                                                     v->env_hold_samples = 0;
                                                                                                                                                                                      v->env_sustain_level = DEFAULT_SUSTAIN_LEVEL;
                                                                                                                                                                                      v->env_release_alpha = -1.0f;
                                                                                                                                                                                      v->env_release_seconds = -1.0f;
@@ -1364,7 +1397,49 @@ out->vor_token = 0;
                                                                                                                                                                                        return 1;
                                                                                                                                                                                    }
 
-                                                                                                                                                                                   static void enqueue_event(int ch, ch_event e) {
+                                                                                                                                                                                   static int selector_copy_kind(const ch_event *e) {
+    if (e->type == EVT_PROGRAM_CHANGE) return SELECTOR_PROGRAM;
+    if (e->type == EVT_DRUM_PART) return SELECTOR_DRUM_PART;
+    if (e->type == EVT_CONTROL_CHANGE && e->key == 0) return SELECTOR_BANK_MSB;
+    if (e->type == EVT_CONTROL_CHANGE && e->key == 32) return SELECTOR_BANK_LSB;
+    return -1;
+}
+
+static void enqueue_selector_copies(int owner, int qch, const ch_event *src) {
+    int kind;
+    if (!g_selector_copies) return;
+    kind = selector_copy_kind(src);
+    if (kind < 0) return;
+    for (int w = 0; w < g_worker_count; ++w) {
+        if (w == owner) continue;
+        event_queue *q = &g_workers[w].queues[qch];
+        LONG head = q->head;
+        LONG next = (head + 1) & CH_EVENT_QUEUE_MASK;
+        LONG tail = q->tail;
+        if (head != tail) {
+            LONG prev_slot = (head - 1 + CH_EVENT_QUEUE_SIZE) & CH_EVENT_QUEUE_MASK;
+            ch_event *prev = &q->events[prev_slot];
+            if (prev_slot != tail && prev->type == EVT_SELECTOR_COPY &&
+                prev->ch == qch && prev->key == kind) {
+                prev->value = src->value;
+                prev->timestamp_qpc = src->timestamp_qpc;
+                continue;
+            }
+        }
+        if (next == tail) continue;
+        ch_event copy = *src;
+        copy.type = EVT_SELECTOR_COPY;
+        copy.ch = (uint8_t)qch;
+        copy.key = (uint8_t)kind;
+        copy.clear_generation = 0;
+        copy.stack_count = 0;
+        copy.vor_token = 0;
+        q->events[head] = copy;
+        q->head = next;
+    }
+}
+
+static void enqueue_event(int ch, ch_event e) {
                                                                                                                                                                                      int qch = ch & 0x0F;
                                                                                                                                                                                      if (!load_relaxed_long(&g_voice_ready) || !g_workers || g_worker_count <= 0) {
                                                                                                                                                                                          return;
@@ -1411,6 +1486,7 @@ e.vor_token = 0;
                                                                                                                                                                                          }
                                                                                                                                                                                          if (w < 0) w = 0;
                                                                                                                                                                                          worker_data *wd = &g_workers[w];
+                                                                                                                                                                                         enqueue_selector_copies(w, qch, &e);
 
                                                                                                                                                                                      // NOTE-OFF PRIMARY PATH: always try the main event queue first.
                                                                                                                                                                                      // The overflow queue is a secondary spillway, not a primary route.
@@ -4098,8 +4174,8 @@ __attribute__((noinline))
 #endif
 /* Advances the envelope `frames` samples in closed form; returns the samples
  * the voice kept sounding (fewer than `frames` only when it reached OFF). */
-static int wgpu_env_advance(int *state, float *env, int frames, float attack_inc, float decay_dec,
-                            float release_alpha) {
+static int wgpu_env_advance(int *state, float *env, int frames, float attack_inc, float decay_mul,
+                            float sustain_level, float release_alpha) {
     int done = 0;
     while (done < frames) {
         const int left = frames - done;
@@ -4108,9 +4184,10 @@ static int wgpu_env_advance(int *state, float *env, int frames, float attack_inc
             if (need > left) { *env += attack_inc * (float)left; return frames; }
             *env = 1.0f; *state = ENV_DECAY; done += need > 0 ? need : 1;
         } else if (*state == ENV_DECAY) {
-            const int need = decay_dec > 0.0f ? (int)ceilf((*env - DEFAULT_SUSTAIN_LEVEL) / decay_dec) : left + 1;
-            if (need > left) { *env -= decay_dec * (float)left; return frames; }
-            *env = DEFAULT_SUSTAIN_LEVEL; *state = ENV_SUSTAIN; done += need > 0 ? need : 1;
+            const int need = (decay_mul > 0.0f && decay_mul < 1.0f && *env > sustain_level)
+                ? (int)ceilf(logf(sustain_level / *env) / logf(decay_mul)) : (decay_mul >= 1.0f ? left + 1 : 1);
+            if (need > left) { *env *= powf(decay_mul, (float)left); return frames; }
+            *env = sustain_level; *state = ENV_SUSTAIN; done += need > 0 ? need : 1;
         } else if (*state == ENV_RELEASE) {
             if (release_alpha <= 0.0f || release_alpha >= 1.0f || *env <= VOICE_SILENCE) {
                 if (*env <= VOICE_SILENCE || release_alpha <= 0.0f) { *state = ENV_OFF; return done; }
@@ -4187,7 +4264,8 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     const float base_gain = v->base_gain * ch_render->gain_mul;
 #endif
     const float attack_inc = v->env_attack_inc >= 0.0f ? v->env_attack_inc : ch_render->attack_inc;
-    const float decay_dec = v->env_decay_dec >= 0.0f ? v->env_decay_dec : g_decay_dec;
+    const float decay_mul = voice_block_decay_mul(v, env_state, v->env_decay_mul >= 0.0f ? v->env_decay_mul : g_decay_mul);
+    const float sustain_level = v->env_sustain_level;
     const float release_alpha = v->env_release_seconds >= 0.0f
         ? region_release_seconds_to_alpha(clampf(v->env_release_seconds * ch_render->release_time_scale, 0.0f, 3.2f))
         : (v->env_release_alpha >= 0.0f ? v->env_release_alpha : ch_render->release_alpha);
@@ -4226,8 +4304,8 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     r->gain_l = base_gain * ch_render->pan_l * v->region_pan_l;
     r->gain_r = base_gain * ch_render->pan_r * v->region_pan_r;
     r->env = v->env_level;
-    r->decay_dec = decay_dec;
-    r->sustain = DEFAULT_SUSTAIN_LEVEL;
+    r->decay_mul = decay_mul;
+    r->sustain = sustain_level;
     r->attack_inc = attack_inc;
     r->release_alpha = release_alpha;
     r->loop_start = (float)loop_start;
@@ -4251,12 +4329,12 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     int advanced = 0;
     if (pending > 0) {
         if (pending - 1 >= remaining) {
-            advanced = wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_dec, release_alpha);
+            advanced = wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_mul, sustain_level, release_alpha);
             pending -= remaining;
             remaining = 0;
         } else {
             const int before = pending - 1;
-            advanced = wgpu_env_advance(&env_state, &env, before, attack_inc, decay_dec, release_alpha);
+            advanced = wgpu_env_advance(&env_state, &env, before, attack_inc, decay_mul, sustain_level, release_alpha);
             remaining -= before;
             pending = -1;
             if (env_state != ENV_OFF) {
@@ -4277,7 +4355,7 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
         }
     }
     if (remaining > 0 && env_state != ENV_OFF)
-        advanced += wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_dec, release_alpha);
+        advanced += wgpu_env_advance(&env_state, &env, remaining, attack_inc, decay_mul, sustain_level, release_alpha);
 #ifdef VOR
     if (vor_fading && advanced > 0) {
         float scale = vor_target + (v->vor_gain_scale - vor_target) * powf(release_alpha, (float)advanced);
@@ -4294,6 +4372,7 @@ static int wgpu_try_offload(voice *v, int vid, int frames, int channels, int che
     }
     /* Without a loop the GPU stops the voice where the sample runs out (HANDOFF sec. 75). */
     if (!loop_active && pos >= (float)sample_end) env_state = ENV_OFF;
+    voice_consume_hold(v, v->env_state, frames);
     v->pending_note_off_samples = pending;
     v->startup_samples = 0;
     v->position = pos;
@@ -4370,7 +4449,7 @@ typedef struct voice_park {
     float last_baseL, last_baseR;
     float gainL, gainR, pitch_mult;
     float c_b0, c_b1, c_b2, c_a1, c_a2;
-    float attack_inc, decay_dec, sustain_level, release_alpha;
+    float attack_inc, decay_mul, sustain_level, release_alpha;
     int no_interp, release_allow_no_interp, release_allow_decimate, decimate_mask_block;
     int loop_active, loop_start, loop_end, playback_end;
     int porta_active, startup_samples;
@@ -4405,7 +4484,7 @@ static int voice_run_scalar(voice_park *p, float *mix, int frames) {
     int ended = 0;
     for (int f = p->f; f < frames; ++f) {
         if (!advance_voice_sample_state(v, p->sustain_down, &pending, &env_state, &env,
-                                        p->attack_inc, p->decay_dec, p->sustain_level,
+                                        p->attack_inc, p->decay_mul, p->sustain_level,
                                         p->release_alpha)) {
             ended = 1;
             break;
@@ -4537,10 +4616,10 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
         voice_park *p = lane[k];
         pos[k] = p->pos; pitch[k] = p->pitch_mult; env[k] = p->env;
         state[k] = p->env_state;
-        envm[k] = p->env_state == ENV_RELEASE ? p->release_alpha : 1.0f;
-        enva[k] = p->env_state == ENV_ATTACK ? p->attack_inc
-                : (p->env_state == ENV_DECAY ? -p->decay_dec : 0.0f);
-        sus[k] = p->sustain_level; dec[k] = p->decay_dec;
+        envm[k] = p->env_state == ENV_RELEASE ? p->release_alpha
+                : (p->env_state == ENV_DECAY ? p->decay_mul : 1.0f);
+        enva[k] = p->env_state == ENV_ATTACK ? p->attack_inc : 0.0f;
+        sus[k] = p->sustain_level; dec[k] = p->decay_mul;
         gl[k] = p->gainL; gr[k] = p->gainR;
         b0[k] = p->c_b0; b1[k] = p->c_b1; b2[k] = p->c_b2; a1[k] = p->c_a1; a2[k] = p->c_a2;
         z1l[k] = p->v->z1_l; z2l[k] = p->v->z2_l; z1r[k] = p->v->z1_r; z2r[k] = p->v->z2_r;
@@ -4690,10 +4769,11 @@ static int voice_quad_render(voice_park **lane, int nl, float *mix, int frames) 
         if (vq_any(att | dcy)) {
             env = vq_sel(att, one, env);
             state = (att & st_dec) | (~att & state);
-            enva = vq_sel(att, -dec, enva);
+            enva = vq_sel(att, zero, enva);
+            envm = vq_sel(att, dec, envm);
             env = vq_sel(dcy, sus, env);
             state = (dcy & st_sus) | (~dcy & state);
-            enva = vq_sel(dcy, zero, enva);
+            envm = vq_sel(dcy, one, envm);
         }
         vq_i4 leave = act & ~dead & decim & (state == st_rel) & (env < decim_start);
         const vq_i4 at_end = act & ~dead & ~leave & (pos >= endpos);
@@ -4988,6 +5068,15 @@ if (admit_budget_us > 0) {
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 for (int layer_index = 0; layer_index < layer_count; ++layer_index) {
+                                                                                                                                                                                                                                                                const sfz_region *kill_region = layer_regions[layer_index];
+                                                                                                                                                                                                                                                                int kill_seen = 0;
+                                                                                                                                                                                                                                                                if (!kill_region || kill_region->off_by <= 0 || kill_region->trigger != 0) continue;
+                                                                                                                                                                                                                                                                for (int prior = 0; prior < layer_index; ++prior) {
+                                                                                                                                                                                                                                                                if (layer_regions[prior] && layer_regions[prior]->off_by == kill_region->off_by) kill_seen = 1;
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                if (!kill_seen) channel_kill_group(e.ch, kill_region->off_by);
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                for (int layer_index = 0; layer_index < layer_count; ++layer_index) {
                                                                                                                                                                                                                                                                 sfz_region *region = layer_regions[layer_index];
                                                                                                                                                                                                                                                                 const int effective_key = (region->key_override >= 0) ? region->key_override : e.key;
                                                                                                                                                                                                                                                                 const int effective_vel = (region->vel_override >= 0) ? region->vel_override : e.value;
@@ -5111,9 +5200,6 @@ if (ss_profile && vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
                                                                                                                                                                                                                                                                 const float note_cutoff = (region_flags & SFZ_REGION_RUNTIME_VEL_CUTOFF)
                                                                                                                                                                                                                                                                 ? sfz_velocity_cutoff(region->cutoff_hz, vel_norm, region->fil_veltrack)
                                                                                                                                                                                                                                                                 : region->cutoff_hz;
-                                                                                                                                                                                                                                                                if (region->off_by > 0) {
-                                                                                                                                                                                                                                                                channel_kill_group(e.ch, region->off_by);
-                                                                                                                                                                                                                                                                }
                                                                                                                                                                                                                                                                 v->region = region;
                                                                                                                                                                                                                                                                 v->key = e.key;
                                                                                                                                                                                                                                                                 v->position = (float)region->offset;
@@ -5151,13 +5237,13 @@ v->group_id = region->group;
                                                                                                                                                                                                                                                                 ? ((note_attack > 0.0f) ? clampf(g_dt / note_attack, 0.000001f, 1.0f) : 1.0f)
                                                                                                                                                                                                                                                                 : region->cached_attack_inc)
                                                                                                                                                                                                                                                                 : -1.0f;
-                                                                                                                                                                                                                                                                v->env_decay_dec = (note_decay >= 0.0f && note_sustain >= 0.0f)
+                                                                                                                                                                                                                                                                v->env_decay_mul = (note_decay >= 0.0f && note_sustain >= 0.0f)
                                                                                                                                                                                                                                                                 ? (((region_flags & (SFZ_REGION_RUNTIME_VEL_DECAY | SFZ_REGION_RUNTIME_KEY_DECAY | SFZ_REGION_RUNTIME_VEL_SUSTAIN)) != 0u)
-                                                                                                                                                                                                                                                                ? ((1.0f - note_sustain) *
-                                                                                                                                                                                                                                                                ((note_decay > 0.0f) ? clampf(g_dt / note_decay, 0.000001f, 1.0f) : 1.0f))
-                                                                                                                                                                                                                                                                : region->cached_decay_dec)
+                                                                                                                                                                                                                                                                ? decay_seconds_to_mul(note_decay, note_sustain)
+                                                                                                                                                                                                                                                                : region->cached_decay_mul)
                                                                                                                                                                                                                                                                 : -1.0f;
-                                                                                                                                                                                                                                                                v->env_sustain_level = note_sustain;
+                                                                                                                                                                                                                                                                v->env_sustain_level = note_sustain > DECAY_FLOOR_LEVEL ? note_sustain : DECAY_FLOOR_LEVEL;
+                                                                                                                                                                                                                                                                v->env_hold_samples = region->ampeg_hold > 0.0f ? (int)(region->ampeg_hold * (float)g_audio.sample_rate + 0.5f) : 0;
                                                                                                                                                                                                                                                                 {
 const float release_scale = g_channel_render[e.ch].release_time_scale;
 if (note_release >= 0.0f) {
@@ -5316,6 +5402,7 @@ QueryPerformanceCounter(&ss_cc_begin);
                                                                                                                                                                                                                                                                 // High-frequency continuous controllers
 case 0:
 cs->bank_msb = val;
+worker_apply_selector(wd, e.ch, SELECTOR_BANK_MSB, val);
 break;
                                                                                                                                                                                                                                                                 case 1:  cs->mod_wheel = val; break;
                                                                                                                                                                                                                                                                 case 2:  cs->breath = val; break;
@@ -5335,6 +5422,7 @@ break;
                                                                                                                                                                                                                                                                 break;
 case 32:
 cs->bank_lsb = val;
+worker_apply_selector(wd, e.ch, SELECTOR_BANK_LSB, val);
 break;
 
                                                                                                                                                                                                                                                                 // Switches
@@ -5487,13 +5575,18 @@ channel_state *cs = &g_channels[e.ch];
 cs->program = e.value & 0x7F; // single-writer
 cs->applied_bank_msb = cs->bank_msb;
 cs->applied_bank_lsb = cs->bank_lsb;
+worker_apply_selector(wd, e.ch, SELECTOR_PROGRAM, e.value);
 InterlockedIncrement(&g_channel_selector_version[e.ch]);
 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_DRUM_PART) {
                                                                                                                                                                                                                                                                 g_channels[e.ch].drum_part = e.value & 0x7F; // single-writer
+                                                                                                                                                                                                                                                                worker_apply_selector(wd, e.ch, SELECTOR_DRUM_PART, e.value);
                                                                                                                                                                                                                                                                 InterlockedIncrement(&g_channel_selector_version[e.ch]);
                                                                                                                                                                                                                                                                 InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                else if (e.type == EVT_SELECTOR_COPY) {
+                                                                                                                                                                                                                                                                worker_apply_selector(wd, e.ch, e.key, e.value);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_SCALE_TUNE) {
                                                                                                                                                                                                                                                                 int note = e.key % 12;
@@ -6503,7 +6596,8 @@ continue;
                                                                                                                                                                                                                                                                  }
 
                                                                                                                                                                                                                                                                  const float attack_inc = v->env_attack_inc >= 0.0f ? v->env_attack_inc : ch_render->attack_inc;
-                                                                                                                                                                                                                                                                 const float decay_dec = v->env_decay_dec >= 0.0f ? v->env_decay_dec : g_decay_dec;
+                                                                                                                                                                                                                                                                 const float decay_mul = voice_block_decay_mul(v, env_state, v->env_decay_mul >= 0.0f ? v->env_decay_mul : g_decay_mul);
+                                                                                                                                                                                                                                                                 voice_consume_hold(v, env_state, frames);
                                                                                                                                                                                                                                                                  const float sustain_level = v->env_sustain_level;
                                                                                                                                                                                                                                                                  const float release_alpha = v->kill_now ? g_kill_release_alpha :
                                                                                                                                                                                                                                                                  (v->env_release_seconds >= 0.0f
@@ -6713,7 +6807,7 @@ continue;
                                                                                                                                                                                                                                                                     pk->last_baseL = last_baseL; pk->last_baseR = last_baseR;
                                                                                                                                                                                                                                                                     pk->gainL = gainL; pk->gainR = gainR; pk->pitch_mult = pitch_mult;
                                                                                                                                                                                                                                                                     pk->c_b0 = c_b0; pk->c_b1 = c_b1; pk->c_b2 = c_b2; pk->c_a1 = c_a1; pk->c_a2 = c_a2;
-                                                                                                                                                                                                                                                                    pk->attack_inc = attack_inc; pk->decay_dec = decay_dec;
+                                                                                                                                                                                                                                                                    pk->attack_inc = attack_inc; pk->decay_mul = decay_mul;
                                                                                                                                                                                                                                                                     pk->sustain_level = sustain_level; pk->release_alpha = release_alpha;
                                                                                                                                                                                                                                                                     pk->no_interp = no_interp; pk->release_allow_no_interp = release_allow_no_interp;
                                                                                                                                                                                                                                                                     pk->release_allow_decimate = release_allow_decimate; pk->decimate_mask_block = decimate_mask_block;
@@ -6734,7 +6828,7 @@ continue;
                                                                                                                                                                                                                                                                 &env_state,
                                                                                                                                                                                                                                                                 &env,
                                                                                                                                                                                                                                                                 attack_inc,
-                                                                                                                                                                                                                                                                decay_dec,
+                                                                                                                                                                                                                                                                decay_mul,
                                                                                                                                                                                                                                                                 sustain_level,
                                                                                                                                                                                                                                                                 release_alpha)) {
                                                                                                                                                                                                                                                                 goto voice_done_ws;
@@ -6800,7 +6894,7 @@ int use_no_interp = no_interp ||
                                                                                                                                                                                                                                                                 &env_state,
                                                                                                                                                                                                                                                                 &env,
                                                                                                                                                                                                                                                                 attack_inc,
-                                                                                                                                                                                                                                                                decay_dec,
+                                                                                                                                                                                                                                                                decay_mul,
                                                                                                                                                                                                                                                                 sustain_level,
                                                                                                                                                                                                                                                                 release_alpha)) {
                                                                                                                                                                                                                                                                 goto voice_done_ws;
@@ -7117,6 +7211,7 @@ note_map_by_channel = (max_voices <= 4096) ? 2 : 0;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
+                                                                                                                                                                                                                                                                g_selector_copies = (note_map_by_channel == 0 && g_worker_count > 1);
                                                                                                                                                                                                                                                                 g_event_worker_count = (note_map_by_channel == 2) ? 1 : (g_worker_count > 0 ? g_worker_count : 1);
   for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
                                                                                                                                                                                                                                                                 /* "single" (SVMS, HANDOFF sec. 62): worker 0 processes every event; all workers
@@ -7161,12 +7256,12 @@ note_map_by_channel = (max_voices <= 4096) ? 2 : 0;
                                                                                                                                                                                                                                                                     MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT,
                                                                                                                                                                                                                                                                     sizeof(note_single_region_cache_entry));
                                                                                                                                                                                                                                                                 for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
-                                                                                                                                                                                                                                                                g_workers[w].selector_cache_version[ch] = -1;
                                                                                                                                                                                                                                                                 g_workers[w].selector_program[ch] = 0;
-                                                                                                                                                                                                                                                                g_workers[w].selector_bank_combined[ch] = 0;
                                                                                                                                                                                                                                                                 g_workers[w].selector_bank_msb[ch] = 0;
                                                                                                                                                                                                                                                                 g_workers[w].selector_bank_lsb[ch] = 0;
-                                                                                                                                                                                                                                                                g_workers[w].selector_is_drum[ch] = 0;
+                                                                                                                                                                                                                                                                g_workers[w].selector_applied_msb[ch] = 0;
+                                                                                                                                                                                                                                                                g_workers[w].selector_applied_lsb[ch] = 0;
+                                                                                                                                                                                                                                                                g_workers[w].selector_drum_part[ch] = 0;
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 // REMOVED: Broken steal bucket initialization
@@ -7250,7 +7345,7 @@ static int queue_gpu_render_voices(LONG cycle_id, int frames, int channels) {
         if (!loop_active &&
             v->position + pitch_mult * (float)frames >= (float)(sample_end - 1)) continue;
         const float attack_inc = v->env_attack_inc >= 0.0f ? v->env_attack_inc : ch_render->attack_inc;
-        const float decay_dec = v->env_decay_dec >= 0.0f ? v->env_decay_dec : g_decay_dec;
+        const float decay_mul = v->env_decay_mul >= 0.0f ? v->env_decay_mul : g_decay_mul;
         const float release_alpha = v->kill_now ? g_kill_release_alpha :
             (v->env_release_seconds >= 0.0f
                 ? region_release_seconds_to_alpha(clampf(v->env_release_seconds * ch_render->release_time_scale, 0.0f, 3.2f))
@@ -7296,7 +7391,7 @@ static int queue_gpu_render_voices(LONG cycle_id, int frames, int channels) {
         req->kill_now = v->kill_now;
         req->use_no_interp = no_interp;
         req->attack_inc = attack_inc;
-        req->decay_dec = decay_dec;
+        req->decay_mul = decay_mul;
         req->sustain_level = v->env_sustain_level;
         req->release_alpha = release_alpha;
         req->filter_enabled = filter_enabled;
@@ -7402,7 +7497,7 @@ static int queue_gpu_render_voices(LONG cycle_id, int frames, int channels) {
                                                                                                                                                                                                                                                                 // Update time constants
                                                                                                                                                                                                                                                                 g_dt = 1.0f / (float)g_audio.sample_rate;
                                                                                                                                                                                                                                                                 g_attack_inc = g_dt / DEFAULT_ATTACK_TIME;
-                                                                                                                                                                                                                                                                g_decay_dec  = (1.0f - DEFAULT_SUSTAIN_LEVEL) * (g_dt / DEFAULT_DECAY_TIME);
+                                                                                                                                                                                                                                                                g_decay_mul  = decay_seconds_to_mul(DEFAULT_DECAY_TIME, DEFAULT_SUSTAIN_LEVEL);
                                                                                                                                                                                                                                                                 g_release_alpha = expf(-g_dt / DEFAULT_RELEASE_TIME);
                                                                                                                                                                                                                                                                 g_kill_release_alpha = expf(-g_dt / STEAL_RELEASE_RAMP_SEC);
                                                                                                                                                                                                                                                                 g_limiter_attack_coeff = expf(-1.0f / ((LIMITER_ATTACK_MS * 0.001f) * (float)g_audio.sample_rate));
@@ -7913,7 +8008,7 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
                                                                                                                                                                                                                                                                 int *env_state,
                                                                                                                                                                                                                                                                 float *env,
                                                                                                                                                                                                                                                                 float attack_inc,
-                                                                                                                                                                                                                                                                float decay_dec,
+                                                                                                                                                                                                                                                                float decay_mul,
                                                                                                                                                                                                                                                                 float sustain_level,
                                                                                                                                                                                                                                                                 float release_alpha) {
                                                                                                                                                                                                                                                                 if (*pending_note_off_samples > 0) {
@@ -7943,7 +8038,7 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 break;
                                                                                                                                                                                                                                                                 case ENV_DECAY:
-                                                                                                                                                                                                                                                                *env -= decay_dec;
+                                                                                                                                                                                                                                                                *env *= decay_mul;
                                                                                                                                                                                                                                                                 if (*env <= sustain_level) {
                                                                                                                                                                                                                                                                 *env = sustain_level;
                                                                                                                                                                                                                                                                 *env_state = ENV_SUSTAIN;
@@ -8205,7 +8300,7 @@ if (g_render_producers_ready) ResetEvent(g_render_producers_ready);
                                                                                                                                                                                                                                                                 gpu_mix_begin(num_frames,
                                                                                                                                                                                                                                                                 channels,
                                                                                                                                                                                                                                                                 g_attack_inc,
-                                                                                                                                                                                                                                                                g_decay_dec,
+                                                                                                                                                                                                                                                                g_decay_mul,
                                                                                                                                                                                                                                                                 DEFAULT_SUSTAIN_LEVEL,
                                                                                                                                                                                                                                                                 g_release_alpha,
                                                                                                                                                                                                                                                                 g_kill_release_alpha,

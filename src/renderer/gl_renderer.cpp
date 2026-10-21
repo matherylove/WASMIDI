@@ -33,11 +33,12 @@ EM_JS(void, wasmidi_roll_debug_count, (int catchUp), {
     else
         globalThis.__wasmidiRollHeld = (globalThis.__wasmidiRollHeld | 0) + 1;
 });
-EM_JS(void, wasmidi_roll_debug_drawn, (double instances, double raw, double resident), {
+EM_JS(void, wasmidi_roll_debug_drawn, (double instances, double raw, double resident, double held), {
     const root = globalThis;
     root.__wasmidiRollDrawnMax = Math.max(root.__wasmidiRollDrawnMax || 0, instances);
     root.__wasmidiRollRawMax = Math.max(root.__wasmidiRollRawMax || 0, raw);
     root.__wasmidiRollResident = resident;
+    root.__wasmidiRollLongNotes = held;
     root.__wasmidiAppMemory = HEAP8.length;
 });
 // Cull tile work on the page thread, read by ?visualdebug=1: kind 0 is a slice of a
@@ -55,7 +56,7 @@ static int wasmidi_tile_slice_disabled() { return 0; }
 static int wasmidi_tiles_disabled() { return 0; }
 static int wasmidi_roll_draw_disabled() { return 0; }
 static void wasmidi_roll_debug_count(int) {}
-static void wasmidi_roll_debug_drawn(double, double, double) {}
+static void wasmidi_roll_debug_drawn(double, double, double, double) {}
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -348,6 +349,10 @@ GLuint linkProgram(const char* vertexSource,
 constexpr std::size_t InitialRingCapacity =
     std::size_t(1) << 18;
 
+// Ring notes the horizon may keep ahead, and the ring's largest size (HANDOFF sec. 104).
+constexpr std::size_t kSharpResidentBudget = (std::size_t(1) << 23) * 11u / 20u;
+constexpr std::size_t kSharpRingMax = std::size_t(1) << 26;
+
 
 } // namespace
 
@@ -392,6 +397,7 @@ layout(location=2) in uint aPackedData;
 uniform vec3 uMetrics;
 uniform vec2 uRollSize;
 uniform int uViewStart;
+uniform float uViewFrac;
 uniform int uViewEnd;
 uniform int uCurrentTick;
 uniform int uPerTrack;
@@ -422,8 +428,8 @@ void main() {
     uint isEnd = uint(gl_VertexID) & 1u;
     uint isTop = uint(gl_VertexID >> 1) & 1u;
 
-    float startX = float(int(aStartTick) - uViewStart) * uMetrics.x - 1.0;
-    float endX = float(endTick - uViewStart) * uMetrics.x - 1.0;
+    float startX = (float(int(aStartTick) - uViewStart) - uViewFrac) * uMetrics.x - 1.0;
+    float endX = (float(endTick - uViewStart) - uViewFrac) * uMetrics.x - 1.0;
     float x = bool(isEnd) ? endX : startX;
 
     uint noteIndex = (aPackedData >> 16u) & 0xffu;
@@ -484,6 +490,90 @@ void main() {
             color += (1.0 - color) * 0.13;
     }
     fragColor = vec4(color, vBase.a);
+}
+)GLSL";
+
+    // A tile drawn from its raster (HANDOFF sec. 102): each pixel looks up the one
+    // note on top there and shades it exactly as noteVertex/noteFragment would.
+    static const char* tileFragment = R"GLSL(#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+uniform usampler2D uCells;
+uniform usampler2D uTable;
+uniform sampler2D uPalette;
+uniform vec2 uRollSize;
+uniform int uPortrait;
+uniform int uTileShift;
+uniform int uTileStart;
+uniform int uViewEnd;
+uniform int uCurrentTick;
+uniform float uPixelsPerTick;
+uniform int uBandWidth;
+uniform int uTableWidth;
+
+out vec4 fragColor;
+
+float keyEdge(float k) {
+    float L = uRollSize.y;
+    float O = max(1.0, floor(L * 12.0 / 128.0));
+    float off = floor((L - 10.0 * O - floor(8.0 * O / 12.0)) * 0.5);
+    float oct = floor(k / 12.0);
+    return off + oct * O + floor((k - oct * 12.0) * O / 12.0);
+}
+
+void main() {
+    ivec2 frag = ivec2(gl_FragCoord.xy);
+    int timeCol = uPortrait == 1 ? int(uRollSize.x) - 1 - frag.y : frag.x;
+    int keyRow = uPortrait == 1 ? frag.x : frag.y;
+
+    float L = uRollSize.y;
+    int O = int(max(1.0, floor(L * 12.0 / 128.0)));
+    int rel = keyRow - int(floor((L - 10.0 * float(O) - floor(8.0 * float(O) / 12.0)) * 0.5));
+    if (rel < 0) discard;
+    int oct = rel / O;
+    int key = oct * 12 + (12 * (rel - oct * O + 1) + O - 1) / O - 1;
+    if (key > 127) discard;
+
+    int col = timeCol + uTileShift;
+    uint cell = texelFetch(uCells, ivec2(col % uBandWidth, key + 128 * (col / uBandWidth)), 0).r;
+    if (cell == 0u) discard;
+    int slot = int(cell) - 1;
+    uvec3 note = texelFetch(uTable, ivec2(slot % uTableWidth, slot / uTableWidth), 0).rgb;
+    int startTick = int(note.x);
+    int endTick = note.y > 0u ? int(note.y) : uViewEnd;
+
+    vec3 base = texelFetch(uPalette, ivec2(int((note.z >> 16u) & 0x0fu), 0), 0).rgb;
+    if (uCurrentTick >= startTick && uCurrentTick <= endTick)
+        base = min(base * 2.0 + vec3(0.1), vec3(1.0));
+
+    float centre = float(col) + 0.5;
+    float widthPx = float(endTick - startTick) * uPixelsPerTick;
+    float rowLow = keyEdge(float(key));
+    float rowPx = keyEdge(float(key) + 1.0) - rowLow;
+    float py = float(keyRow) + 0.5 - rowLow;
+    vec4 dist = vec4(
+        widthPx >= 3.0
+            ? vec2(centre - float(startTick - uTileStart) * uPixelsPerTick,
+                   float(endTick - uTileStart) * uPixelsPerTick - centre)
+            : vec2(2.0),
+        rowPx >= 3.0 ? vec2(py, rowPx - py) : vec2(2.0));
+
+    vec3 color;
+    if (any(lessThan(dist, vec4(1.0)))) {
+        color = base * 0.3;
+    } else {
+        float t = 1.0 - py / rowPx;
+        vec3 light = base + (1.0 - base) * 0.45;
+        vec3 dark = base * 0.55;
+        color = t < 0.45
+            ? mix(light, base, t * (1.0 / 0.45))
+            : mix(base, dark, (t - 0.45) * (1.0 / 0.55));
+        if (((frag.x ^ frag.y) & 1) == 1)
+            color += (1.0 - color) * 0.13;
+    }
+    fragColor = vec4(color, 1.0);
 }
 )GLSL";
 
@@ -567,6 +657,8 @@ void main()
             backgroundVertex,
             playheadFragment);
 
+    tileProgram_ = linkProgram(backgroundVertex, tileFragment);
+
     // The horizontal note program is the only mandatory pipeline.
     // Background effects are optional accelerations and must never make
     // the piano roll disappear if a browser/driver rejects one of their shaders.
@@ -582,6 +674,8 @@ void main()
         glGetUniformLocation(
             noteProgram_,
             "uViewEnd");
+
+    viewFracUniform_ = glGetUniformLocation(noteProgram_, "uViewFrac");
 
     currentTickUniform_ =
         glGetUniformLocation(
@@ -640,6 +734,21 @@ void main()
             glGetUniformLocation(
                 backgroundProgram_,
                 "uPortrait");
+    }
+
+    if (tileProgram_) {
+        tileCellsUniform_ = glGetUniformLocation(tileProgram_, "uCells");
+        tileTableUniform_ = glGetUniformLocation(tileProgram_, "uTable");
+        tilePaletteUniform_ = glGetUniformLocation(tileProgram_, "uPalette");
+        tileRollSizeUniform_ = glGetUniformLocation(tileProgram_, "uRollSize");
+        tilePortraitUniform_ = glGetUniformLocation(tileProgram_, "uPortrait");
+        tileShiftUniform_ = glGetUniformLocation(tileProgram_, "uTileShift");
+        tileStartUniform_ = glGetUniformLocation(tileProgram_, "uTileStart");
+        tileViewEndUniform_ = glGetUniformLocation(tileProgram_, "uViewEnd");
+        tileCurrentTickUniform_ = glGetUniformLocation(tileProgram_, "uCurrentTick");
+        tilePixelsPerTickUniform_ = glGetUniformLocation(tileProgram_, "uPixelsPerTick");
+        tileBandWidthUniform_ = glGetUniformLocation(tileProgram_, "uBandWidth");
+        tileTableWidthUniform_ = glGetUniformLocation(tileProgram_, "uTableWidth");
     }
 
     if (playheadProgram_) {
@@ -751,14 +860,6 @@ bool GLRenderer::initialize()
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    glGenVertexArrays(1, &cullVao_);
-    glBindVertexArray(cullVao_);
-    for (GLuint attribute = 0; attribute < 3; ++attribute) {
-        glEnableVertexAttribArray(attribute);
-        glVertexAttribDivisor(attribute, 1);
-    }
-    glBindVertexArray(0);
-
     glGenVertexArrays(1, &denseVao_);
     glGenBuffers(1, &denseVbo_);
     glBindVertexArray(denseVao_);
@@ -792,6 +893,10 @@ bool GLRenderer::initialize()
 
     glGenTextures(1, &sharpPaletteTexture_);
     regenerateSharpPalette();
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize_);
+    maxTextureSize_ = std::max(maxTextureSize_, 2048);
+    glGenBuffers(1, &heldVbo_);
+    heldVboCapacity_ = 0;
 
     // SharpMIDI-raylib starts with a 2^23-note persistent ring. Reserving the
     // same capacity avoids CPU-vector + VBO realloc/copy stalls exactly when a
@@ -808,7 +913,8 @@ void GLRenderer::destroy()
     const GLuint buffers[] = {
         noteVbo_,
         carryVbo_,
-        denseVbo_
+        denseVbo_,
+        heldVbo_
     };
 
     for (GLuint buffer : buffers) {
@@ -831,7 +937,8 @@ void GLRenderer::destroy()
     const GLuint programs[] = {
         noteProgram_,
         backgroundProgram_,
-        playheadProgram_
+        playheadProgram_,
+        tileProgram_
     };
 
     for (GLuint program : programs) {
@@ -846,20 +953,20 @@ void GLRenderer::destroy()
     noteVbo_ = 0;
     carryVbo_ = 0;
     denseVbo_ = 0;
+    heldVbo_ = 0;
+    heldVboCapacity_ = 0;
+    clearHeldNotes();
 
     noteVao_ = 0;
     carryVao_ = 0;
     denseVao_ = 0;
     releaseCullTiles();
-    if (cullVao_) {
-        glDeleteVertexArrays(1, &cullVao_);
-        cullVao_ = 0;
-    }
     backgroundVao_ = 0;
 
     noteProgram_ = 0;
     backgroundProgram_ = 0;
     playheadProgram_ = 0;
+    tileProgram_ = 0;
 
     ring_.clear();
     carryNotes_.clear();
@@ -1691,6 +1798,9 @@ void GLRenderer::allocateRing(std::size_t capacity)
 
 void GLRenderer::ensureRingCapacity(std::size_t required)
 {
+    // A bigger ring (and the copy while it grows) does not fit in the 4 GiB heap;
+    // the oldest notes are dropped instead (HANDOFF sec. 104).
+    required = std::min(required, kSharpRingMax);
     if (required <= ringCapacity_)
         return;
 
@@ -2007,7 +2117,8 @@ void GLRenderer::syncVisualCache(
 }
 
 void GLRenderer::setInstanceBase(
-    std::size_t physicalIndex)
+    std::size_t physicalIndex,
+    GLuint buffer)
 {
     const std::size_t base =
         physicalIndex *
@@ -2015,7 +2126,7 @@ void GLRenderer::setInstanceBase(
 
     glBindBuffer(
         GL_ARRAY_BUFFER,
-        noteVbo_);
+        buffer ? buffer : noteVbo_);
 
     glVertexAttribIPointer(
         0, 1,
@@ -2052,6 +2163,7 @@ void GLRenderer::resetSharpRenderer(bool requestRemote)
 {
     sharpHead_ = 1;
     sharpTail_ = 1;
+    clearHeldNotes();
     ++sharpRingEpoch_;
     sharpLastSweepEnd_ = -1;
     sharpLastWindowTicks_ = 0;
@@ -2109,10 +2221,9 @@ void GLRenderer::calculateSharpView(
         return;
     }
 
-    currentTick = static_cast<uint32_t>(std::clamp<double>(
-        std::floor(document_->secondsToTick(currentTime_)),
-        0.0,
-        double(document_->maxTick)));
+    const double exactTick = std::clamp<double>(
+        document_->secondsToTick(currentTime_), 0.0, double(document_->maxTick));
+    currentTick = static_cast<uint32_t>(std::floor(exactTick));
 
     // SharpMIDI's WindowTicks is a stable renderer parameter.  The previous
     // port recomputed it at every tempo change, which made an otherwise
@@ -2138,8 +2249,16 @@ void GLRenderer::calculateSharpView(
     const uint32_t half = std::max<uint32_t>(1u, windowTicks >> 1u);
     // Portrait falls like Synthesia: the playhead sits on the keyboard and the
     // whole window is ahead of it (HANDOFF sec. 97).
-    viewStart = portrait_ ? currentTick : (currentTick > half ? currentTick - half : 0u);
-    viewEnd = std::min<uint32_t>(document_->maxTick, portrait_ ? currentTick + windowTicks : currentTick + half);
+    // Whole-pixel scroll (HANDOFF sec. 102): tile k starts at pixel k * timePx, so
+    // every tile column is a screen column.
+    const int64_t timeLength = std::max(1, timePx());
+    const double leftTick = portrait_ ? exactTick : std::max(0.0, exactTick - double(half));
+    sharpScrollPx_ = std::llround(leftTick * double(timeLength) / double(windowTicks));
+    const int64_t leftScaled = sharpScrollPx_ * int64_t(windowTicks);
+    viewStart = static_cast<uint32_t>(std::min<int64_t>(leftScaled / timeLength, document_->maxTick));
+    sharpViewFrac_ = float(double(leftScaled - int64_t(viewStart) * timeLength) / double(timeLength));
+    viewEnd = static_cast<uint32_t>(std::min<uint64_t>(document_->maxTick,
+        uint64_t(viewStart) + windowTicks + (sharpViewFrac_ > 0.0f ? 1u : 0u)));
     if (viewEnd <= viewStart)
         viewEnd = std::min<uint32_t>(document_->maxTick, viewStart + 1u);
 
@@ -2152,8 +2271,7 @@ void GLRenderer::calculateSharpView(
         : 0.0;
     const double estimatedPerScreen =
         std::max(1.0, notesPerTick * double(windowTicks));
-    const double residentBudget =
-        double(std::max<std::size_t>(ringCapacity_, std::size_t(1) << 23)) * 0.55;
+    const double residentBudget = double(kSharpResidentBudget);
     // Keep a healthy multi-screen reserve, but do not let speculative
     // preprocessing consume the same CPU/Worker budget needed by audio and
     // live-state updates.  Pass 13.8 raised this to 12..96 screens and then
@@ -2174,6 +2292,8 @@ void GLRenderer::appendSharpNote(
 {
     const std::size_t active = std::size_t(sharpHead_ - sharpTail_);
     ensureRingCapacity(active + 2u);
+    if (active + 1u > ringCapacity_)
+        sharpTail_ = sharpHead_ + 1u - static_cast<uint32_t>(ringCapacity_);
 
     const uint32_t id = sharpHead_++;
     ring_[std::size_t(id) & ringMask_] = {
@@ -2190,8 +2310,17 @@ void GLRenderer::closeSharpNote(
     uint32_t endTick,
     std::vector<uint32_t>* closeIds)
 {
-    if (noteId < sharpTail_ || noteId >= sharpHead_ || ringCapacity_ == 0)
+    if (noteId >= sharpHead_ || ringCapacity_ == 0)
         return;
+    if (noteId < sharpTail_) {
+        const auto it = std::lower_bound(heldIds_.begin(), heldIds_.end(), noteId);
+        if (it != heldIds_.end() && *it == noteId) {
+            const std::size_t index = std::size_t(it - heldIds_.begin());
+            held_[index].endTick = endTick;
+            heldUploaded_ = std::min(heldUploaded_, index);
+        }
+        return;
+    }
 
     ring_[std::size_t(noteId) & ringMask_].endTick = endTick;
     if (closeIds)
@@ -2375,7 +2504,7 @@ void GLRenderer::uploadSharpCloseIds(std::vector<uint32_t>& closeIds)
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
-void GLRenderer::advanceSharpTail(uint32_t viewStart)
+void GLRenderer::advanceSharpTail(uint32_t viewStart, uint32_t windowTicks)
 {
     if (ringCapacity_ == 0)
         return;
@@ -2386,14 +2515,45 @@ void GLRenderer::advanceSharpTail(uint32_t viewStart)
     if (sharpTail_ < safeTail)
         sharpTail_ = safeTail;
 
+    // A note still on screen a window after it began kept every later note in the
+    // ring until it ended (HANDOFF sec. 104); it moves to held_ instead.
+    const uint32_t holdBefore = viewStart > windowTicks ? viewStart - windowTicks : 0u;
     while (sharpTail_ < sharpHead_) {
         const VisualNote& note = ring_[std::size_t(sharpTail_) & ringMask_];
-        const bool open = note.endTick == 0;
-        if (!open && note.endTick < viewStart)
-            ++sharpTail_;
-        else
-            break;
+        if (note.endTick == 0 || note.endTick >= viewStart) {
+            if (note.startTick >= holdBefore)
+                break;
+            held_.push_back(note);
+            heldIds_.push_back(sharpTail_);
+        }
+        ++sharpTail_;
     }
+
+    if (!held_.empty() && (viewStart < heldPrunedAt_ || viewStart - heldPrunedAt_ >= windowTicks)) {
+        heldPrunedAt_ = viewStart;
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < held_.size(); ++i) {
+            if (held_[i].endTick != 0 && held_[i].endTick < viewStart)
+                continue;
+            if (kept != i) {
+                held_[kept] = held_[i];
+                heldIds_[kept] = heldIds_[i];
+                heldUploaded_ = std::min(heldUploaded_, kept);
+            }
+            ++kept;
+        }
+        held_.resize(kept);
+        heldIds_.resize(kept);
+        heldUploaded_ = std::min(heldUploaded_, kept);
+    }
+}
+
+void GLRenderer::clearHeldNotes()
+{
+    held_.clear();
+    heldIds_.clear();
+    heldUploaded_ = 0;
+    heldPrunedAt_ = 0;
 }
 
 void GLRenderer::requestRemoteSharpSweep(
@@ -2426,6 +2586,7 @@ void GLRenderer::receiveSharpRenderReset(uint32_t generation)
     sharpRemoteWaitingReset_ = false;
     sharpHead_ = 1u;
     sharpTail_ = 1u;
+    clearHeldNotes();
     ++sharpRingEpoch_;
     sharpRemotePreparedHead_ = 1u;
     sharpRemotePendingBase_ = 1u;
@@ -2538,6 +2699,10 @@ void GLRenderer::flushRemoteSharpBatches(
                     ? std::size_t(required - sharpTail_) + 1u
                     : 2u;
                 ensureRingCapacity(resident);
+                if (std::size_t(required - sharpTail_) > ringCapacity_) {
+                    sharpTail_ = required - static_cast<uint32_t>(ringCapacity_);
+                    sharpHead_ = std::max(sharpHead_, sharpTail_);
+                }
                 // WebGL2 cannot expose SharpMIDI's persistently mapped VBO,
                 // but the CPU ring can still receive each Worker delta as at
                 // most two contiguous memcpy operations instead of one C++
@@ -2689,6 +2854,30 @@ uint32_t GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
         drawEnd = lo;
     }
 
+    // Held notes began before every note in the ring: they go underneath.
+    uint32_t heldCount = 0;
+    if (notesReady && !held_.empty() && heldVbo_ != 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, heldVbo_);
+        if (held_.size() > heldVboCapacity_) {
+            heldVboCapacity_ = std::max<std::size_t>(held_.size() * 2u, 4096u);
+            glBufferData(GL_ARRAY_BUFFER,
+                static_cast<GLsizeiptr>(heldVboCapacity_ * sizeof(VisualNote)), nullptr, GL_DYNAMIC_DRAW);
+            heldUploaded_ = 0;
+        }
+        if (heldUploaded_ < held_.size()) {
+            glBufferSubData(GL_ARRAY_BUFFER,
+                static_cast<GLintptr>(heldUploaded_ * sizeof(VisualNote)),
+                static_cast<GLsizeiptr>((held_.size() - heldUploaded_) * sizeof(VisualNote)),
+                held_.data() + heldUploaded_);
+            heldUploaded_ = held_.size();
+        }
+        heldCount = static_cast<uint32_t>(held_.size());
+        glBindVertexArray(noteVao_);
+        setInstanceBase(0, heldVbo_);
+        drawNoteInstances(static_cast<GLsizei>(heldCount));
+        setInstanceBase(0);
+    }
+
     const uint32_t count = drawEnd - sharpTail_;
     if (count != 0 && ringCapacity_ != 0) {
         const std::size_t start = std::size_t(sharpTail_) & ringMask_;
@@ -2706,7 +2895,7 @@ uint32_t GLRenderer::drawSharpRingRange(uint32_t viewEnd, bool notesReady)
             drawNoteInstances(static_cast<GLsizei>(second));
         }
     }
-    return count;
+    return count + heldCount;
 }
 
 void GLRenderer::drawSharpRing(
@@ -2733,6 +2922,7 @@ void GLRenderer::drawSharpRing(
     glUniform2f(rollSizeUniform_, float(timePx()), float(keyPx()));
     glUniform1i(notePortraitUniform_, portrait_ ? 1 : 0);
     glUniform1i(viewStartUniform_, static_cast<GLint>(viewStart));
+    glUniform1f(viewFracUniform_, sharpViewFrac_);
     glUniform1i(viewEndUniform_, static_cast<GLint>(viewEnd));
     glUniform1i(currentTickUniform_, static_cast<GLint>(currentTick));
     glUniform1i(perTrackUniform_, sharpModePerTrack_ ? 1 : 0);
@@ -2753,10 +2943,10 @@ void GLRenderer::drawSharpRing(
 
     bool drewTiles = false;
     double drawn = 0.0, raw = 0.0;
-    if (!cullTiles_.empty() && windowTicks != 0 && timePx() > 0) {
+    if (!cullTiles_.empty() && tileProgram_ && windowTicks != 0 && timePx() > 0) {
         const uint32_t firstTile = viewStart / windowTicks;
         const uint32_t lastTile = viewEnd / windowTicks;
-        // A tile is drawn from its own buffer once it holds every note of its visible part.
+        // A tile is drawn from its raster once it holds every note of its visible part.
         const auto usable = [&](const CullTile* tile) {
             return tile && tile->coverage >= std::min<uint64_t>(
                 viewEnd, (uint64_t(tile->index) + 1u) * windowTicks);
@@ -2766,41 +2956,61 @@ void GLRenderer::drawSharpRing(
             if (usable(findCullTile(k))) anyUsable = true;
         if (anyUsable) {
             const int timeLength = timePx();
-            const double pixelsPerTick = double(timeLength) / double(windowTicks);
+            const int bandWidth = std::min(timeLength, maxTextureSize_);
+            glUseProgram(tileProgram_);
+            glUniform2f(tileRollSizeUniform_, float(timeLength), float(keyPx()));
+            glUniform1i(tilePortraitUniform_, portrait_ ? 1 : 0);
+            glUniform1i(tileViewEndUniform_, static_cast<GLint>(viewEnd));
+            glUniform1i(tileCurrentTickUniform_, static_cast<GLint>(currentTick));
+            glUniform1f(tilePixelsPerTickUniform_, float(double(timeLength) / double(windowTicks)));
+            glUniform1i(tileBandWidthUniform_, bandWidth);
+            glUniform1i(tileTableWidthUniform_, std::min(4096, maxTextureSize_));
+            glUniform1i(tilePaletteUniform_, 0);
+            glUniform1i(tileCellsUniform_, 1);
+            glUniform1i(tileTableUniform_, 2);
+            glBindVertexArray(backgroundVao_);
             glEnable(GL_SCISSOR_TEST);
             for (uint32_t k = firstTile; k <= lastTile; ++k) {
-                const double tileStart = double(uint64_t(k) * windowTicks);
-                // A pixel column belongs to the tile its centre falls in.
-                const int px0 = std::clamp(static_cast<int>(std::ceil(
-                    (tileStart - double(viewStart)) * pixelsPerTick - 0.5)), 0, timeLength);
-                const int px1 = std::clamp(static_cast<int>(std::ceil(
-                    (tileStart + double(windowTicks) - double(viewStart)) * pixelsPerTick - 0.5)), 0, timeLength);
+                // Tile k covers pixels [k, k + 1) * timeLength from tick 0.
+                const int64_t tilePx = int64_t(k) * timeLength - sharpScrollPx_;
+                const int px0 = static_cast<int>(std::clamp<int64_t>(tilePx, 0, timeLength));
+                const int px1 = static_cast<int>(std::clamp<int64_t>(tilePx + timeLength, 0, timeLength));
                 if (px1 <= px0) continue;
                 scissorRoll(px0, 0, px1 - px0, keyPx());
                 const CullTile* tile = findCullTile(k);
                 if (usable(tile)) {
                     if (tile->count == 0) continue;
-                    glBindVertexArray(cullVao_);
-                    glBindBuffer(GL_ARRAY_BUFFER, tile->vbo);
-                    glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
-                        reinterpret_cast<void*>(offsetof(VisualNote, startTick)));
-                    glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
-                        reinterpret_cast<void*>(offsetof(VisualNote, endTick)));
-                    glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
-                        reinterpret_cast<void*>(offsetof(VisualNote, packedData)));
-                    drawNoteInstances(static_cast<GLsizei>(tile->count));
+                    glUseProgram(tileProgram_);
+                    glBindVertexArray(backgroundVao_);
+                    glUniform1i(tileShiftUniform_, static_cast<GLint>(-tilePx));
+                    glUniform1i(tileStartUniform_, static_cast<GLint>(uint64_t(k) * windowTicks));
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, tile->cells);
+                    glActiveTexture(GL_TEXTURE2);
+                    glBindTexture(GL_TEXTURE_2D, tile->table);
+                    glActiveTexture(GL_TEXTURE0);
+                    static const bool skip = wasmidi_roll_draw_disabled() != 0;
+                    if (!skip)
+                        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
                     drawn += double(tile->count);
                 } else {
+                    glUseProgram(noteProgram_);
                     raw += double(drawSharpRingRange(viewEnd, notesReady));
                 }
             }
             glDisable(GL_SCISSOR_TEST);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glActiveTexture(GL_TEXTURE0);
+            glUseProgram(noteProgram_);
             drewTiles = true;
         }
     }
     if (!drewTiles)
         raw += double(drawSharpRingRange(viewEnd, notesReady));
-    wasmidi_roll_debug_drawn(drawn + raw, raw, double(sharpHead_ - sharpTail_));
+    wasmidi_roll_debug_drawn(drawn + raw, raw, double(sharpHead_ - sharpTail_), double(held_.size()));
 
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -2965,6 +3175,17 @@ bool GLRenderer::renderRoll()
     sharpRemoteUrgentThrough_ = static_cast<uint32_t>(std::min<uint64_t>(
         urgent64, document_->maxTick));
 
+    // The horizon comes from the song's average density; in a part many times denser
+    // it asked for tens of millions of notes (HANDOFF sec. 104). With the ring past the
+    // budget it stays where it was asked, never short of the urgent screens.
+    if (document_->remoteIndexed &&
+        std::size_t(std::max(sharpHead_, sharpRemotePreparedHead_) - sharpTail_) >= kSharpResidentBudget) {
+        const uint32_t asked = sharpRemoteRebuilding_ ? sharpRemoteBuildTarget_ : sharpRemoteRequestedEnd_;
+        const uint32_t floorTick = std::max<uint32_t>(sharpRemoteUrgentThrough_,
+            sharpLastSweepEnd_ > 0 ? static_cast<uint32_t>(sharpLastSweepEnd_) : 0u);
+        sweepEnd = std::min(sweepEnd, std::max(asked, floorTick));
+    }
+
     // Drain completed background work after both the visible and future
     // endpoints are known. Do this *before* issuing another extension request
     // so already-generated frames are installed first instead of allowing a
@@ -3061,6 +3282,7 @@ bool GLRenderer::renderRoll()
             // keeps animating while complete ticks from the replacement arrive.
             sharpHead_ = 1u;
             sharpTail_ = 1u;
+            clearHeldNotes();
             ++sharpRingEpoch_;
             sharpRemotePreparedHead_ = 1u;
             sharpRemotePendingBase_ = 1u;
@@ -3111,11 +3333,10 @@ bool GLRenderer::renderRoll()
         }
     }
 
-    // Never age/cull the old ring against a seek destination while a remote
-    // replacement is still being built. That was the direct cause of notes
-    // disappearing before their EndTick and of the all-black seek state.
-    if (!document_->remoteIndexed || !sharpRemoteRebuilding_)
-        advanceSharpTail(viewStart);
+    // A rebuild drops the old ring when it starts, so the tail advances during one
+    // too: a rebuild whose target kept moving ahead never finished, and the ring grew
+    // until the heap ran out (HANDOFF sec. 104).
+    advanceSharpTail(viewStart, windowTicks);
 
     // Never expose a half-generated visible window. This is the contingency
     // path only; the primary strategy is the multi-screen prefetch above.
@@ -3174,17 +3395,21 @@ GLRenderer::CullTile* GLRenderer::findCullTileMutable(uint32_t index)
 
 void GLRenderer::releaseCullTiles()
 {
-    for (CullTile& tile : cullTiles_)
-        if (tile.vbo) glDeleteBuffers(1, &tile.vbo);
+    for (CullTile& tile : cullTiles_) {
+        if (tile.cells) glDeleteTextures(1, &tile.cells);
+        if (tile.table) glDeleteTextures(1, &tile.table);
+    }
     cullTiles_.clear();
     cullJob_.active = false;
+    longIds_.clear();
+    longScanId_ = sharpTail_;
 }
 
 void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady)
 {
     static const bool tilesDisabled = wasmidi_tiles_disabled() != 0;
-    if (tilesDisabled || !document_ || !document_->remoteIndexed || windowTicks == 0 || timePx() <= 0 ||
-        ringCapacity_ == 0) {
+    if (tilesDisabled || !tileProgram_ || !document_ || !document_->remoteIndexed || windowTicks == 0 ||
+        timePx() <= 0 || ringCapacity_ == 0) {
         releaseCullTiles();
         return;
     }
@@ -3223,7 +3448,8 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
     const uint32_t lastTile = viewEnd / windowTicks;
     for (std::size_t i = 0; i < cullTiles_.size();) {
         if (cullTiles_[i].index < firstTile || cullTiles_[i].index >= firstTile + 64u) {
-            if (cullTiles_[i].vbo) glDeleteBuffers(1, &cullTiles_[i].vbo);
+            if (cullTiles_[i].cells) glDeleteTextures(1, &cullTiles_[i].cells);
+            if (cullTiles_[i].table) glDeleteTextures(1, &cullTiles_[i].table);
             cullTiles_[i] = cullTiles_.back();
             cullTiles_.pop_back();
         } else {
@@ -3245,7 +3471,7 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
             if (sharpRemoteSafeThrough_ < needed) continue;
             if (cullJob_.active && cullJob_.index == k && cullJob_.coverage >= needed) {
                 const auto started = std::chrono::steady_clock::now();
-                stepCullJob(1.0e9);
+                stepCullJob(cullJob_, 1.0e9);
                 wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - started).count(), 2);
                 continue;
@@ -3253,7 +3479,10 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
             if (cullJob_.active && cullJob_.index == k)
                 cullJob_.active = false;
             const auto started = std::chrono::steady_clock::now();
-            buildCullTile(k, windowTicks);
+            startCullJob(cullSyncJob_, k, windowTicks,
+                static_cast<uint32_t>(std::min<uint64_t>(tileEnd, sharpRemoteSafeThrough_)),
+                firstTile * windowTicks);
+            stepCullJob(cullSyncJob_, 1.0e9);
             wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count(), 2);
         }
@@ -3273,7 +3502,7 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
             // complete, and redone once enough new notes arrived for it.
             if (target < tileEnd && k > lastTile + 1u) break;
             if (target < tileEnd && tile && target - tile->coverage < windowTicks / 16u) break;
-            startCullJob(k, windowTicks, static_cast<uint32_t>(target));
+            startCullJob(cullJob_, k, windowTicks, static_cast<uint32_t>(target), firstTile * windowTicks);
             break;
         }
     }
@@ -3282,13 +3511,13 @@ void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t 
         static const bool sliceDisabled = wasmidi_tile_slice_disabled() != 0;
         const bool visible = cullJob_.index <= lastTile;
         const double budget = framePeriodMs_ * (visible ? 0.36 : 0.18);
-        const bool finished = stepCullJob(sliceDisabled ? 1.0e9 : budget);
+        const bool finished = stepCullJob(cullJob_, sliceDisabled ? 1.0e9 : budget);
         wasmidi_roll_debug_tile(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count(), finished ? 1 : 0);
     }
 }
 
-void GLRenderer::uploadCullTile(uint32_t index, uint32_t coverage, const CompositorNote* notes, std::size_t count)
+void GLRenderer::uploadCullTile(uint32_t index, uint32_t coverage, const RasterTile& raster)
 {
     CullTile* existing = findCullTileMutable(index);
     if (!existing) {
@@ -3298,118 +3527,163 @@ void GLRenderer::uploadCullTile(uint32_t index, uint32_t coverage, const Composi
     }
     CullTile& tile = *existing;
     tile.coverage = coverage;
-    tile.count = static_cast<uint32_t>(count);
-    if (count == 0) return;
-    if (!tile.vbo) glGenBuffers(1, &tile.vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, tile.vbo);
-    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(count * sizeof(CompositorNote)),
-        notes, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    tile.count = static_cast<uint32_t>(raster.table.size());
+    if (tile.count == 0 || raster.width <= 0) return;
+
+    // Columns past the texture size limit wrap into further bands of 128 rows.
+    const int width = raster.width;
+    const int bandWidth = std::min(width, maxTextureSize_);
+    const int bands = (width + bandWidth - 1) / bandWidth;
+    glActiveTexture(GL_TEXTURE1);
+    if (!tile.cells) glGenTextures(1, &tile.cells);
+    glBindTexture(GL_TEXTURE_2D, tile.cells);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    if (bands == 1) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, width, 128, 0,
+            GL_RED_INTEGER, GL_UNSIGNED_INT, raster.cells.data());
+    } else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, bandWidth, 128 * bands, 0,
+            GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
+        for (int band = 0; band < bands; ++band) {
+            glPixelStorei(GL_UNPACK_SKIP_PIXELS, band * bandWidth);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 128 * band,
+                std::min(bandWidth, width - band * bandWidth), 128,
+                GL_RED_INTEGER, GL_UNSIGNED_INT, raster.cells.data());
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    const int tableWidth = std::min(4096, maxTextureSize_);
+    const int count = static_cast<int>(tile.count);
+    const int fullRows = count / tableWidth;
+    const int rest = count - fullRows * tableWidth;
+    if (!tile.table) glGenTextures(1, &tile.table);
+    glBindTexture(GL_TEXTURE_2D, tile.table);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32UI, tableWidth, fullRows + (rest ? 1 : 0), 0,
+        GL_RGB_INTEGER, GL_UNSIGNED_INT, nullptr);
+    if (fullRows)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tableWidth, fullRows,
+            GL_RGB_INTEGER, GL_UNSIGNED_INT, raster.table.data());
+    if (rest)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, fullRows, rest, 1,
+            GL_RGB_INTEGER, GL_UNSIGNED_INT, raster.table.data() + std::size_t(fullRows) * tableWidth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
 }
 
-void GLRenderer::buildCullTile(uint32_t index, uint32_t windowTicks)
+void GLRenderer::scanLongNotes(uint32_t throughId, uint32_t windowTicks)
 {
-    constexpr std::size_t kCullMinNotes = 50000;
+    // A note that starts a window or more before a tile and still reaches it is longer
+    // than a window, or open.
+    longScanId_ = std::max(longScanId_, sharpTail_);
+    for (; longScanId_ < throughId; ++longScanId_) {
+        const VisualNote& note = ring_[std::size_t(longScanId_) & ringMask_];
+        if (note.endTick == 0 || note.endTick - note.startTick > windowTicks)
+            longIds_.push_back(longScanId_);
+    }
+}
+
+void GLRenderer::startCullJob(CullJob& job, uint32_t index, uint32_t windowTicks, uint32_t coverage,
+                              uint32_t keepFrom)
+{
     const uint32_t tileStart = index * windowTicks;
     const uint32_t tileEnd = tileStart + windowTicks;
     // Every note that starts, or closes, before the coverage tick is in the ring.
-    const uint32_t coverage = std::min<uint32_t>(tileEnd, sharpRemoteSafeThrough_);
-
-    cullInput_.clear();
-    const uint64_t collectEnd = coverage == tileEnd ? uint64_t(tileEnd) : uint64_t(coverage) + 1u;
+    const uint32_t collectEnd = coverage == tileEnd ? tileEnd : coverage + 1u;
     const uint32_t head = std::max(sharpHead_, sharpRemotePreparedHead_);
-    for (uint32_t id = sharpTail_; id < head; ++id) {
+    const auto firstStartingAt = [&](uint32_t lo, uint32_t tick) {
+        uint32_t hi = head;
+        while (lo < hi) {
+            const uint32_t mid = lo + ((hi - lo) >> 1u);
+            if (ring_[std::size_t(mid) & ringMask_].startTick < tick)
+                lo = mid + 1u;
+            else
+                hi = mid;
+        }
+        return lo;
+    };
+    const uint32_t rangeBegin = firstStartingAt(sharpTail_, tileStart > windowTicks ? tileStart - windowTicks : 0u);
+    const uint32_t rangeEnd = firstStartingAt(rangeBegin, collectEnd);
+
+    // Before rangeBegin only the long notes can reach the tile, held ones first (they
+    // began earlier); drop the ones that ended before every tile still kept.
+    scanLongNotes(rangeBegin, windowTicks);
+    job.longNotes.clear();
+    for (const VisualNote& note : held_)
+        if (note.endTick == 0 || note.endTick > tileStart)
+            job.longNotes.push_back({ note.startTick, note.endTick, note.packedData });
+    std::size_t kept = 0;
+    for (const uint32_t id : longIds_) {
+        if (id < sharpTail_) continue;
         const VisualNote& note = ring_[std::size_t(id) & ringMask_];
-        if (note.startTick >= collectEnd) break;
-        if (note.endTick != 0 && note.endTick <= tileStart) continue;
-        cullInput_.push_back({ note.startTick, note.endTick, note.packedData });
+        if (note.endTick != 0 && note.endTick <= keepFrom) continue;
+        longIds_[kept++] = id;
+        if (id < rangeBegin && (note.endTick == 0 || note.endTick > tileStart))
+            job.longNotes.push_back({ note.startTick, note.endTick, note.packedData });
     }
-    if (cullInput_.size() < kCullMinNotes) {
-        uploadCullTile(index, coverage, cullInput_.data(), cullInput_.size());
-        return;
-    }
+    longIds_.resize(kept);
 
-    CompositorSettings settings;
-    settings.startTick = tileStart;
-    settings.spanTicks = windowTicks;
-    settings.rasterWidth = timePx();
-    settings.firstKey = 0;
-    settings.keyCount = 128;
-    settings.viewEndTick = coverage;
-    CullViewport(cullInput_.data(), cullInput_.size(), settings, cullScratch_, cullResult_);
-    uploadCullTile(index, coverage, cullResult_.notes.data(), cullResult_.notes.size());
+    job.active = true;
+    job.index = index;
+    job.coverage = coverage;
+    job.windowTicks = windowTicks;
+    job.rangeBegin = rangeBegin;
+    job.nextId = rangeEnd;
+    job.longNext = job.longNotes.size();
+    job.settings.startTick = tileStart;
+    job.settings.spanTicks = windowTicks;
+    job.settings.rasterWidth = timePx();
+    job.settings.firstKey = 0;
+    job.settings.keyCount = 128;
+    job.settings.viewEndTick = coverage;
+    RasterBegin(job.settings, job.scratch, job.raster);
 }
 
-void GLRenderer::startCullJob(uint32_t index, uint32_t windowTicks, uint32_t coverage)
+bool GLRenderer::stepCullJob(CullJob& job, double budgetMs)
 {
-    cullJob_.active = true;
-    cullJob_.collecting = true;
-    cullJob_.index = index;
-    cullJob_.coverage = coverage;
-    cullJob_.windowTicks = windowTicks;
-    cullJob_.nextId = sharpTail_;
-    cullJob_.input.clear();
-}
-
-bool GLRenderer::stepCullJob(double budgetMs)
-{
-    constexpr std::size_t kCullMinNotes = 50000;
-    constexpr uint32_t kCollectSlice = 16384;
-    constexpr std::size_t kCullSlice = 4096;
-    CullJob& job = cullJob_;
+    constexpr uint32_t kSlice = 4096;
     const auto started = std::chrono::steady_clock::now();
     const auto spent = [&started]() {
         return std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count();
     };
-    const uint32_t tileStart = job.index * job.windowTicks;
-    const uint32_t tileEnd = tileStart + job.windowTicks;
+    static_assert(sizeof(VisualNote) == sizeof(CompositorNote), "raster reads ring notes in place");
 
-    if (job.collecting) {
-        // The notes before the coverage tick no longer change, but the tail may pass
-        // the ones that ended left of the screen (their slots can be reused).
-        const uint64_t collectEnd = job.coverage == tileEnd ? uint64_t(tileEnd) : uint64_t(job.coverage) + 1u;
-        for (;;) {
-            const uint32_t head = std::max(sharpHead_, sharpRemotePreparedHead_);
-            uint32_t id = std::max(job.nextId, sharpTail_);
-            const uint32_t sliceEnd = head - id > kCollectSlice ? id + kCollectSlice : head;
-            bool reached = sliceEnd == head;
-            for (; id < sliceEnd; ++id) {
-                const VisualNote& note = ring_[std::size_t(id) & ringMask_];
-                if (note.startTick >= collectEnd) { reached = true; break; }
-                if (note.endTick != 0 && note.endTick <= tileStart) continue;
-                job.input.push_back({ note.startTick, note.endTick, note.packedData });
-            }
-            job.nextId = id;
-            if (reached) break;
-            if (spent() >= budgetMs) return false;
+    // Front to back: the ring range from its end, then the long notes before it. A
+    // note the tail passed ended left of the screen and its slot may be reused.
+    for (;;) {
+        const uint32_t floorId = std::max(job.rangeBegin, sharpTail_);
+        if (job.nextId <= floorId) {
+            job.nextId = job.rangeBegin;
+            break;
         }
-        job.collecting = false;
-        if (job.input.size() < kCullMinNotes) {
-            job.active = false;
-            const CullTile* tile = findCullTile(job.index);
-            if (!tile || tile->coverage < job.coverage)
-                uploadCullTile(job.index, job.coverage, job.input.data(), job.input.size());
-            return true;
-        }
-        CompositorSettings settings;
-        settings.startTick = tileStart;
-        settings.spanTicks = job.windowTicks;
-        settings.rasterWidth = timePx();
-        settings.firstKey = 0;
-        settings.keyCount = 128;
-        settings.viewEndTick = job.coverage;
-        CullBegin(job.input.data(), job.input.size(), settings, job.scratch, job.progress);
+        const uint32_t lo = job.nextId - floorId > kSlice ? job.nextId - kSlice : floorId;
+        const std::size_t physical = std::size_t(lo) & ringMask_;
+        const std::size_t count = job.nextId - lo;
+        const std::size_t first = std::min(count, ringCapacity_ - physical);
+        if (count > first)
+            RasterAddReversed(ring_.data(), count - first, job.settings, job.scratch, job.raster);
+        RasterAddReversed(ring_.data() + physical, first, job.settings, job.scratch, job.raster);
+        job.nextId = lo;
         if (spent() >= budgetMs) return false;
     }
+    while (job.longNext != 0) {
+        const std::size_t count = std::min<std::size_t>(kSlice, job.longNext);
+        job.longNext -= count;
+        RasterAddReversed(job.longNotes.data() + job.longNext, count, job.settings, job.scratch, job.raster);
+        if (job.longNext != 0 && spent() >= budgetMs) return false;
+    }
 
-    while (!CullStep(job.scratch, job.progress, kCullSlice))
-        if (spent() >= budgetMs) return false;
-    CullFinish(job.progress, job.result);
     job.active = false;
     const CullTile* tile = findCullTile(job.index);
     if (!tile || tile->coverage < job.coverage)
-        uploadCullTile(job.index, job.coverage, job.result.notes.data(), job.result.notes.size());
+        uploadCullTile(job.index, job.coverage, job.raster);
     return true;
 }
 

@@ -6601,7 +6601,370 @@ horizontal; y el teclado horizontal se seguía viendo dañado.
 - Un celular real. Escritorio con DPR distinto de 1 (las filas ahora pueden no llenar todo el alto: hasta
   ~11 px de margen).
 
-## 101. Revisión 104 — teclado sin franjas blancas, gráfico del ancho del note speed, registro de lag
+## 101. Revisión 104 — instrumentos General MIDI y batería en WasmiSynth
+
+### Pedido
+
+Dekx: WasmiSynth "nunca detecta bien las soundfonts General MIDI": en MIDIs de solo piano suenan
+instrumentos que no tienen nada que ver, con varios instrumentos se equivoca y la batería suena mal.
+Soundfont de prueba que mandó: Arachno SoundFont 1.0 (155 MB).
+
+### Causa
+
+La elección de preset en sí estaba bien: con FluidR3_GM y TimGM6mb, `sfz_find_region_for_program` da el
+preset correcto para los 128 programas del banco 0 y para la batería (banco 128). Los fallos eran tres:
+
+1. **Enlaces estéreo rotos de la SF2** (`sf2_parser.c`). Cada muestra LEFT/RIGHT se juntaba con la que
+   nombra su `sample_link` sin comprobar que esa apunte de vuelta. Arachno tiene 180 de 1397 muestras con
+   enlaces que no son pares (por ejemplo "Grand Piano 39", LEFT, enlazada a "Trombone C41", mono): el
+   piano salía con el trombón en el canal derecho. Además una muestra podía quedar en la tabla de varias
+   formas y `sfz_region_attach_sample_owned` liberaba un WAV que seguía en uso (ASan: heap-use-after-free;
+   en host se cae al cargar Arachno, en wasm no se cae pero esa memoria la reusan otras muestras). Las
+   mitades RIGHT cuyo enlace apuntaba a una LEFT ajena además se descartaban (notas que faltan).
+2. **Carrera entre program change y notas con reparto Hash** (`voice.c`, Auto usa Hash arriba de 4096
+   voces). El program change va a la cola del worker del canal y las notas a la del worker de su tecla;
+   las dos colas se consumen a la vez en el mismo ciclo, así que una nota en el mismo tramo que el program
+   change (lo normal al empezar la canción: PC y primera nota en el tick 0) leía el programa anterior
+   (piano). La frontera exacta para selectores de `ssw_render_queued_into` solo cubría "nota antes del selector", no "selector antes de
+   la nota", y con los dos en el mismo cuadro no hay frontera posible. Host, MIDI de 5 instrumentos, 4
+   workers, Hash, 12288 voces, 30 corridas: 46 notas con el programa equivocado.
+3. **Banco MSB 1 sonaba como batería** con SF2. Para un canal melódico el banco combinado era
+   `MSB·128 + LSB`, y con MSB 1 eso da 128, que en una SF2 es el banco de batería: el programa 0 sonaba con
+   el kit Standard. MSB 8 (variaciones GS) también perdía contra el banco 0 por coincidir el LSB.
+
+### Cambios
+
+- `sf2_parser.c`: `sf2_stereo_partner` solo acepta un par si las dos cabeceras se apuntan entre sí con
+  lados opuestos; cualquier otro enlace se toca como mono con el pan de la zona. Se usa al armar el WAV,
+  al descartar la mitad derecha y para el pan.
+- `voice.c`: cada worker guarda su propio estado de selector por canal (banco pendiente, banco aplicado,
+  programa, parte de batería) y las notas se resuelven con ese estado. Con Hash, `enqueue_event` manda
+  una copia `EVT_SELECTOR_COPY` del banco/programa/parte de batería a la cola del mismo canal de cada
+  otro worker, en el mismo orden que las notas; el worker dueño del canal sigue siendo el único que
+  escribe `g_channels`. Las copias seguidas del mismo tipo se pisan en la cola. En Single y Channel las
+  notas ya iban a la cola del canal: no hay copias.
+- `voice.c` (`selector_effective_banks`): con SF2, el banco melódico es el MSB, o el LSB si el MSB es 0
+  (como XG). La batería no cambia.
+
+### Medición / verificación
+
+- Arachno carga sin errores de ASan (4420 regiones); FluidR3 y TimGM6mb dan las mismas regiones que
+  antes (16912 y 2063). Selección por programa: 0 errores en las tres.
+- Motor real en host (`midibench` con traza por nota), Hash, 4 workers, 12288 voces, 30 corridas: notas
+  con programa equivocado 46 → 0. `pipeline_bench` (feed del parser) con un MIDI de Arachno ("Paul
+  Albrecht - Homeward"): Hash y Single dan los mismos programas y bancos por nota.
+- MIDI con banco MSB 1 + programa 0 en Arachno: antes banco 128 (kit de batería), ahora Grand Piano.
+- Pruebas de host del CI: sintaxis, `ssw_schedule_harness`, `worker_freelist_borrow_check`,
+  `worker_cycle_smoke`.
+
+### No verificado
+
+- En el navegador con Arachno y los MIDIs de Dekx.
+- Quedan diferencias de sonido de la SF2 que no cambian el instrumento: los generadores de la zona de
+  preset se combinan con reglas de instrumento (rangos que se cruzan con la zona global en vez de
+  reemplazarla, valores que se reemplazan en vez de sumarse), solo se toca una región por nota en SF2
+  (las capas de SFZ sí suenan todas) y no hay moduladores.
+
+## 102. Revisión 105 — capas, generadores y envolvente de SF2 como BASSMIDI
+
+### Pedido
+
+Después de la rev. 104, Dekx: "el problema persiste, los instrumentos no son correctos en ningún MIDI que
+use GM. y el piano y los drums están mal ecualizados, probablemente todos los instrumentos". Referencia:
+BASSMIDI (FluidSynth es muy lento para él).
+
+### Cómo se midió
+
+BASSMIDI 2.4 de un4seen (biblioteca de Linux, `BASS_MIDI_StreamCreateFile` + `BASS_MIDI_DECAYEND`, 48 kHz;
+`BASS_MIDI_NOFX` para comparar sin reverb ni chorus, que WasmiSynth no tiene) contra `midibench` con
+`DET=1`. MIDI de prueba: 18 tramos de 2 s (nota de 1 s, velocidad 100) con piano, piano eléctrico, órgano,
+guitarra, bajo, violín, cuerdas, trompeta, saxo, flauta, lead, pad, bombo, redoblante, hi-hat, crash, ride
+y tom. Por tramo: nivel RMS, balance L/R, energía por octavas (relativa al total) y correlación de los
+espectros. SoundFonts: Arachno 1.0, FluidR3_GM, MatheryLSD.
+
+### Causa
+
+1. **SF2 tocaba una sola zona por nota.** `sfz_find_region_for_program` elegía la mejor región y las demás
+   capas no sonaban, y la búsqueda de capas descartaba las que usaban la misma muestra. Arachno arma casi
+   todos sus presets con dos instrumentos que usan la misma muestra con pan -500/+500 (estéreo falso) o con
+   capas de distinta velocidad: sonaba la mitad del instrumento, en un solo lado o sin la capa principal.
+2. **Generadores leídos con reglas equivocadas.** Las zonas de preset se mezclaban con la de instrumento
+   cruzando rangos y multiplicando tiempos; la especificación (SF2 2.04 §9.4) dice: en el instrumento la zona
+   local reemplaza a la global, que reemplaza al valor por defecto; en el preset igual, y el valor del preset
+   se **suma** al del instrumento (los rangos se cruzan). Además:
+   - `initialAttenuation` sin el factor 0,4 que usan el hardware EMU, FluidSynth y BASSMIDI (la trompeta de
+     Arachno, 117 cB, sonaba 7 dB más baja).
+   - `sampleModes` 1 y 3 iban los dos a "sustain"; Q como `0,707 + cB·0,01`; filtro siempre encendido y con
+     corte mínimo 1500 cents aunque no se hubiera pedido.
+   - Decay: en SF2 el tiempo es el de caer 100 dB; el motor lo usaba como el tiempo hasta el sustain.
+   - Hold ignorado (piano de Arachno: 2,3 s; órgano: 5,7 s).
+   - Corrección de afinación de la muestra con el signo cambiado.
+3. **Pan lineal.** El pan de región era un balance (centro 1/1, extremo 1/0); los reproductores de SF2 usan
+   potencia constante (centro 0,707, extremo 1). Las capas de Arachno con pan ±500 (bombo, redoblante,
+   toms) quedaban 3 dB más bajas que un instrumento centrado.
+4. **Clases exclusivas entre capas de la misma nota.** Las tres capas del hi-hat de Arachno tienen
+   `exclusiveClass` 1: cada capa nueva apagaba a las anteriores de la misma nota (el hi-hat sonaba con una
+   capa, -9 dB).
+5. **Decaimiento lineal en amplitud.** SF2 decae lineal en dB (exponencial en amplitud). Con una rampa
+   lineal el crash (decay de 6,2 s) seguía casi entero 1,5 s después: +5 dB contra BASSMIDI.
+
+### Cambios
+
+- `voice.c`: SF2 toca todas las regiones que coinciden (`sfz_collect_exact_regions_for_program`) sin
+  descartar las que comparten muestra.
+- `sf2_parser.c`: cada zona guarda sus generadores crudos y cuáles tiene (`gen[]`, `has[]`);
+  `sf2_gen_value` aplica las reglas de la especificación y `sf2_region_from_zones` convierte: atenuación ×0,4,
+  tiempos en timecents (attack, hold, decay, release), sustain en cB, decay hasta el sustain =
+  decay × sustain/100 dB, filtro solo con corte < 13500 cents y Q = 10^((cB/10 − 3,01)/20), loop 1 =
+  continuo y 3 = hasta soltar, `keynum`/`velocity` fijos, offsets finos y gruesos, afinación de la muestra
+  con el signo correcto. Pan de región de potencia constante con el centro en ganancia 1 (los instrumentos
+  centrados no cambian de nivel). Sin envolvente de modulación en el motor, el corte del filtro es el
+  valor al que llega esa envolvente en el sustain (`modEnvToFilterFc` × (1 − `sustainModEnv`)).
+- `voice.c`: el decay es exponencial (multiplicador por muestra `decay_mul`, como el release) hasta el
+  sustain o hasta -100 dB si el sustain es 0; el campo `decay_dec` pasó a `decay_mul` en el voice, la
+  región, las peticiones a la GPU, el shader WGSL y `midibench`. En el modo GPU el sustain por voz no llegaba
+  (se usaba siempre 0,8): ahora va el de la voz.
+- `voice.c`: etapa hold (`ampeg_hold` en SF2 y SFZ) por bloque: mientras dura, el multiplicador del decay
+  es 1 (error de a lo sumo un bloque al terminar). Se descuenta donde se escribe el estado de la voz (CPU o
+  GPU), una vez por bloque.
+- `voice.c`: al empezar una nota se apagan una vez los grupos (`off_by`) de todas sus capas, antes de
+  crearlas; antes cada capa apagaba a las anteriores de la misma nota.
+
+### Medición
+
+Nivel por tramo, BASSMIDI sin efectos → WasmiSynth (dB). Antes = rev. 104; después = esta revisión.
+
+| Arachno | BASSMIDI | antes | después |
+|---|---|---|---|
+| piano | -35,9 | -39,9 | -36,8 |
+| órgano | -26,8 | -33,4 | -27,8 |
+| violín | -24,6 | -32,2 | -25,3 |
+| cuerdas | -28,5 | -32,8 | -29,0 |
+| trompeta | -29,8 | -37,7 | -30,7 |
+| lead | -26,9 | -40,8 | -28,5 |
+| bombo | -30,5 | -42,3 | -31,5 |
+| redoblante | -30,9 | -40,5 | -31,7 |
+| hi-hat | -42,3 | -51,6 | -45,4 |
+| crash | -36,3 | -31,3 | -35,9 |
+| tom | -24,9 | -29,9 | -25,7 |
+
+Todos quedan ~1 dB debajo de BASSMIDI salvo el hi-hat (-3 dB); el balance L/R coincide y las bandas por
+octava quedan a ±1 dB en casi todos los tramos. FluidR3_GM: todos los niveles a ~1 dB de BASSMIDI (antes de
+esta revisión no se midió). Lo que sigue distinto es el brillo de los sonidos que mueven el filtro con la
+envolvente de modulación (bajo de Arachno: -8 a -10 dB en 3-6 kHz; pad de FluidR3: -10 a -19 dB en
+3-12 kHz) y los graves de la trompeta de Arachno (+5 dB en 63-187 Hz).
+Con `GPUEMU=1` (emulación del shader) el WAV queda a ≤ 0,2 dB del de CPU en todos los tramos.
+Costo con MatheryLSD (una capa por nota), MIDI sintético de 3000 notas/s en 16 canales, 1024 voces, 1 worker:
+0,29× tiempo real antes y después.
+
+### Verificación
+
+- Pruebas de host del CI (`run_ci_step.py "Host tests (engine logic, no Emscripten)"`): todas pasan.
+- `node --check` de `web/*.js`.
+- Compilación local con Emscripten 3.1.56 / Qt 6.8.3 (`tools/local_build.sh`, mismos pasos del CI) y WASMIDI
+  Audio en Chromium con Arachno y el MIDI de prueba: carga en 4,8 s (4420 regiones), 2-7 voces por nota con
+  capas, 0 underruns.
+
+### No verificado
+
+- El sonido en las PCs de Dekx y el modo GPU en una GPU real.
+- Envolvente de modulación, LFOs y moduladores de SF2 (vibrato, filtro que se abre y se cierra): siguen sin
+  implementarse. Reverb y chorus tampoco (BASSMIDI los aplica por defecto con los envíos de la SF2).
+- Con SFZ el decay ahora también es exponencial (como sfizz); no se comparó con otra implementación.
+
+## 103. Revisión 106 — el roll dibuja solo lo que se ve
+
+### Pedido
+
+Dekx, con una captura de The Nuker 3 a 2:05 en Brave (note speed 0,10 s, 6144 voces, roll 11 cuadros/s y
+teclado 12): "no tengo tiempo para hacer debug, tienes que hacer algo que basicamente ignore la polyphony en el
+visualizador, algo que basicamente no se moleste en dibujar overlaps ni en dibujar notas que no se van a ver, por
+ejemplo si hay una nota que dura dos ticks, y arriba hay una nota de un tick, el medio tick de la nota que queda
+abajo, solo se dibuja la mitad que si se puede ver".
+
+### Causa
+
+Los tiles culleados (§38, §73, §81, §84) quitaban solo las notas que no aportan ningún píxel; cada nota que
+quedaba se dibujaba entera, con la de arriba encima. Una nota larga tapada casi toda se pintaba completa, y en
+las zonas densas cada tile mandaba decenas o cientos de miles de instancias, la mayoría pintando píxeles que
+otra nota tapaba después. El trabajo de la GPU crecía con la polifonía, no con el tamaño del roll.
+
+Además, armar un tile recorría el ring desde la cola, y una sola nota larga sostiene la cola
+(`advanceSharpTail` para en la primera nota abierta o que termina después del borde izquierdo). Con note speed
+0,1 s hay 5 tiles por segundo de canción y cada uno recorría todas las notas residentes desde esa nota.
+
+### Cambios
+
+- Tile de solo lo visible (`RasterTile`, `RasterBegin`/`RasterAddReversed` en `note_raster_compositor`): de
+  adelante hacia atrás (orden inverso del ring, la misma regla de capas de siempre), cada celda (columna de píxel
+  × tecla) se queda con la primera nota que cubre el centro del píxel. En enteros exactos: la columna c está
+  cubierta si 2·(inicio − inicio del tile)·ancho ≤ (2c + 1)·ventana < 2·(fin − inicio del tile)·ancho, la regla
+  de centros de la GPU. La tabla del tile guarda solo las notas que ganaron al menos una celda. El ejemplo del
+  pedido queda así: de la nota de dos ticks se ven solo los píxeles de su primer tick.
+- Cada tile se sube como dos texturas: celdas `R32UI` (ancho del roll × 128 teclas, índice en la tabla + 1, 0
+  vacía; si el ancho pasa `GL_MAX_TEXTURE_SIZE`, sigue en bandas de 128 filas) y la tabla `RGB32UI` (inicio,
+  fin, datos). Se dibuja con un solo cuadrilátero recortado al tile (`tileFragment`): cada píxel busca su tecla
+  (inversa exacta de `keyEdge`), su celda y su nota, y la pinta como `noteVertex`/`noteFragment` (degradado por
+  fila, borde de 1 px solo si el lado mide ≥ 3 px, damero de 2 px, brillo mientras suena, nota abierta hasta
+  `viewEnd`). Cada píxel del roll se escribe una vez por cuadro, haya las notas que haya.
+- Scroll en píxeles enteros: `calculateSharpView` redondea el borde izquierdo a un píxel (`sharpScrollPx_`). El
+  tile k empieza en el píxel k × ancho desde el tick 0, así que sus columnas caen en columnas de la pantalla.
+  `uViewFrac` lleva la fracción de tick al dibujo crudo (`?tiles=0` o tiles que todavía no cubren), que queda
+  con el mismo corrimiento. La posición sale del tick exacto, no del entero: con PPQ bajo y note speed chico el
+  roll ya no avanza a saltos de un tick. Al empezar la canción `viewEnd` es el borde derecho de la pantalla
+  (antes, en la primera media ventana, el tick del cursor + media ventana).
+- Todos los tiles usan la trama (antes, con menos de 50 000 notas se subían las notas crudas).
+- Notas largas (`longIds_`, `scanLongNotes`): una nota que empieza una ventana o más antes de un tile y llega a él
+  dura más de una ventana o está abierta. Un cursor pasa una vez por cada nota del ring y anota esas. Un tile toma
+  las anotadas que lo alcanzan más el tramo del ring desde una ventana antes de su inicio (búsqueda binaria), sin
+  recorrer desde la cola. El tramo del ring se compone en su lugar, sin copiarlo; las notas largas se copian al
+  empezar el tile. La lista se poda de notas que terminaron antes del primer tile guardado.
+- Un tile visible que falta se arma al momento en un trabajo aparte (`cullSyncJob_`), sin tirar el tile que se
+  arma de a pedazos.
+- `browser_bench.py app --resize=S:WxH` cambia el tamaño de la página (diseño del celular con 420x860).
+- El contador "drawn max" de `[WASMIDI app]` cuenta ahora las notas que se ven en al menos un píxel.
+
+### Medición
+
+- Sobredibujo en tiles sintéticos de 1920 px × 128 teclas (los generadores de `note_raster_compositor_check`):
+  columnas de píxel que pintaban las notas que sobrevivían al cull, contra celdas que se pintan ahora.
+
+  | caso | antes | ahora | veces |
+  |---|---|---|---|
+  | denso, 100 k notas de ≤ 60 ticks | 1,30 M | 154 k | 8,5× |
+  | 1 M notas de ≤ 20 ticks | 2,25 M | 246 k | 9,2× |
+  | 50 k notas de ≤ 3000 ticks | 26,5 M | 245 k | 108× |
+  | 300 k notas de ≤ 1200 ticks | 60,5 M | 246 k | 246× |
+
+  Cada píxel del roll se pinta ahora una vez por cuadro.
+- Componer un tile en host (-O2, de a 4096 notas): 1 M notas 10-12 ms, 300-400 k notas 4-7 ms.
+- Chromium del contenedor (4 hilos, SwiftShader), WASMIDI con The Nuker 3 desde 1:58, note speed 0,10 s, 1024
+  voces, 30 s: 5 tiles por segundo, 2-11 ms de armado por segundo (máximo 4 ms por pedazo), ningún tile visible
+  armado al momento, nada dibujado crudo, 0 cuadros retenidos, 0 saltos, 0 underruns. Las notas residentes en el
+  ring subieron de 0,55 M a 2,5 M en esos 30 s (una nota larga sostiene la cola) y el armado no creció con ellas.
+  Los cuadros por segundo del contenedor no sirven (SwiftShader, §79).
+
+### Verificación
+
+- `tools/note_raster_compositor_check.cpp`, sección 5 (corre en el CI): siete casos (el ejemplo del pedido, 10 k a
+  1 M notas, tile desplazado de 1500 px, tile parcial con notas abiertas, 0,37 y 40 px por tick), agregados de a
+  4096 desde el final como en el renderer, comparados celda por celda con una referencia en enteros exactos (todas
+  las notas en orden, la de después encima): 0 diferencias.
+- La inversa de `keyEdge` del shader da la misma tecla que `keyEdge` para todas las alturas de 1 a 6000 px.
+- Pruebas de host del CI y compilación local con Emscripten 3.1.56 / Qt 6.8.3 (`tools/local_build.sh`).
+- Chromium, un mismo cuadro pausado dibujado con la trama y crudo:
+  - many30.mid horizontal (`?tiles=0` en otra corrida; los dos cuadros se repiten idénticos entre corridas):
+    56 914 píxeles de nota en ambos, iguales salvo 373 con ±1 en el degradado. 682 píxeles distintos, todos en
+    bordes corridos una columna. Con las notas del ring volcadas, esos bordes caen a menos de 1/32 px del centro de
+    un píxel (por ejemplo en 46,504 px: el dibujo crudo pinta la columna 46 y la trama no): SwiftShader redondea
+    los vértices a 1/16 px y la trama usa la cuenta exacta.
+  - many30.mid en el diseño del celular (420×860, `--resize`): 4755 píxeles de nota iguales y 194 en bordes en
+    empate (con 0,625 px por tick muchos bordes caen justo en un centro, y en vertical la GPU desempata del otro
+    lado).
+  - The Nuker 3 a 2:38 con note speed 0,1, trama y crudo alternando en la misma corrida (cambio temporal, no
+    quedó en el código): 1143 píxeles distintos de 660 000, todos bordes corridos una columna. Ninguna zona con
+    notas faltantes, que es lo que se vería si la lista de notas largas perdiera alguna.
+
+### No verificado
+
+- Los cuadros por segundo con GPU real en las PCs de Dekx, que es lo que pidió: el contenedor no tiene GPU.
+- Memoria de GPU: cada tile guarda ancho × 128 × 4 B de celdas (0,46 MB a 892 px, 2 MB a 3840 px) más su tabla,
+  hasta unos 33 tiles por delante del cursor.
+- Un navegador con `GL_MAX_TEXTURE_SIZE` menor que el largo del roll (las bandas no se probaron).
+- Donde el roll todavía dibuja crudo (sin tile que cubra la pantalla tras un salto, o `?tiles=0`) sigue el
+  sobredibujo de antes.
+
+## 104. Revisión 107 — el roll ya no agota la memoria en las zonas densas
+
+### Pedido
+
+Dekx probó la rev. 106 con The Nuker 3 (Brave, note speed 0,10 s, 6144 voces): "el programa hizo aplication exit
+durante la prueba en una parte exigente", con una captura de la consola: `renderer ring grows` de 8 388 608 a
+16 777 216, 33 554 432, 67 108 864, 134 217 728 y 268 435 456 notas, y después `Aborted()` dentro de
+`wasmidi.wasm`.
+
+### Causa
+
+El ring del roll (§34) guarda las notas desde la más vieja que todavía se ve (la cola) hasta lo preparado por
+delante (la cabeza). Cuando se llena se duplica: con 134 M notas (1,5 GiB) pasar a 268 M pide 3 GiB más mientras
+copia, y el heap de la app es de 4 GiB. `Aborted()` es esa reserva fallida. Creció sin tope por tres razones:
+
+- **La cola no avanzaba durante una reconstrucción.** `renderRoll` no llamaba a `advanceSharpTail` mientras
+  `sharpRemoteRebuilding_` estaba encendido (un comentario de cuando el ring viejo se conservaba durante la
+  reconstrucción). Hoy el ring se vacía al empezar una reconstrucción, pero esta termina solo cuando un lote completo
+  llega a `sharpRemoteBuildTarget_`, y mientras tanto ese objetivo se corre una ventana cada vez que el cursor avanza
+  una ventana. En una zona densa el Worker va justo por delante del cursor sin alcanzar el objetivo: la reconstrucción
+  que empezó con un salto del roll (§80) no terminaba y la cola se quedaba en la primera nota. En el Chromium del
+  contenedor (corrida 1 abajo) las notas del ring subieron sin bajar de 0,19 M a 5,1 M en 68 s, hasta el salto
+  siguiente; en una PC que no necesita saltos el ring crece hasta el final del tema. Es probable (no verificado) que el
+  cierre del 7435HS de la rev. 85 (§81) fuera lo mismo.
+- **Una nota larga sostenía la cola.** `advanceSharpTail` para en la primera nota abierta o que termina después del
+  borde izquierdo: una nota de 10 s en una zona de 20 M notas/s deja 200 M notas en el ring.
+- **El adelanto salía de la densidad promedio del tema** (`calculateSharpView`): en una zona diez veces más densa que
+  el promedio pedía diez veces más notas, y el presupuesto era 0,55 × la capacidad actual del ring, así que cada vez
+  que el ring crecía pedía más.
+
+### Cambios
+
+- La cola avanza siempre, también durante una reconstrucción (el ring ya se vació al empezarla).
+- Notas sostenidas aparte (`held_`, `heldIds_`): una nota que sigue en pantalla una ventana después de empezar sale del
+  ring por la cola a una lista propia en orden de id, y la cola sigue. La lista se poda cada vez que el borde izquierdo
+  avanza una ventana. El cierre de una nota que ya salió del ring la busca ahí (`closeSharpNote`, búsqueda binaria).
+  Las notas sostenidas empezaron antes que todas las del ring, así que van debajo: el dibujo crudo las dibuja primero
+  desde su propio VBO (`heldVbo_`; se sube solo lo que cambió y solo cuando hay que dibujar crudo) y los tiles las
+  agregan detrás de las notas largas del ring. La regla de capas no cambia.
+- Adelanto con presupuesto fijo de 0,55 × 2^23 notas (`kSharpResidentBudget`), que ya no crece con el ring; y con el
+  ring pasado de ese presupuesto el horizonte no se pide más lejos de lo ya pedido, salvo las dos pantallas urgentes.
+- Tope del ring en 2^26 notas (`kSharpRingMax`, 768 MiB; 1,1 GiB mientras crece desde 2^25): si una pantalla
+  necesitara más, se pierden las notas más viejas en vez de cerrar la app.
+- `[WASMIDI app]` (`?visualdebug=1`) muestra `resident N, long M`: notas en el ring y notas sostenidas.
+- `browser_bench.py`: la ayuda decía `--url URL` y el script solo lee `--url=URL`.
+
+### Medición
+
+Chromium del contenedor (4 hilos, SwiftShader), WASMIDI con The Nuker 3, note speed 0,10 s, 6144 voces, desde el
+principio, 218 s de reproducción (`browser_bench.py app ... --setting=noteSpeed=0.1 --voices=6144`):
+
+| | rev. 106 | rev. 107 |
+|---|---|---|
+| notas en el ring, máximo | 5,15 M | 0,58 M |
+| mayor subida sin bajar | +4,97 M en 68 s | +0,48 M en 6 s |
+| notas sostenidas, máximo | (en el ring) | 1383 |
+| saltos del roll | 21 | 16 |
+| cuadros retenidos | 481 | 386 |
+| memoria de la app | 147 MiB | 151 MiB |
+
+El ring no creció en ninguna de las dos (2^23 alcanza para 5 M); en la rev. 106 la subida paró solo porque otro salto
+vació el ring. El final de la corrida de la rev. 106 coincidió con una compilación en el contenedor: los saltos y
+cuadros retenidos no son comparables, la forma de la curva sí.
+
+MIDI sintético con notas de 8 s, una nota que no se cierra y notas cortas encima (`longnotes.mid`, 3 pistas), note
+speed 0,1: con la rev. 106 el ring guardaba 5120 notas (la nota larga de la cola sostenía todo); con la rev. 107, 1825
+en el ring y 17 sostenidas, mismas notas dibujadas (164 como máximo).
+
+The Nuker 3 desde un salto a ~400 s (la segunda zona densa, 420-450 s), mismas opciones, 110 s: máximo 0,53 M notas
+en el ring y 1145 sostenidas, 41 saltos del roll (el contenedor no alcanza esa zona), memoria de la app 161 MiB, sin
+`ring grows`.
+
+### Verificación
+
+- Chequeo temporal cuadro a cuadro (no quedó en el código): una copia de cada nota de la generación con sus cierres,
+  comparada después de `advanceSharpTail` con el ring y la lista de sostenidas (toda nota visible tiene que estar en
+  uno de los dos, con el mismo inicio, fin y datos). `longnotes.mid` con note speed 0,1 y 1 y un salto adelante y
+  otro atrás, y many30.mid con 0,1: 3080 cuadros, 0 diferencias.
+- Capturas de `longnotes.mid` con tiles, con `?tiles=0` y con la rev. 106: las notas de 8 s cruzan la pantalla entera
+  en las tres, debajo de las cortas que empiezan después.
+- Compilación local con Emscripten 3.1.56 / Qt 6.8.3; CI del PR.
+
+### No verificado
+
+- The Nuker 3 entero en las PCs de Dekx, con GPU real.
+- El tope de 2^26 notas no se alcanzó en ninguna prueba (haría falta una pantalla con más de 67 M notas).
+- Con muchas notas sostenidas y el roll dibujando crudo, cada cuadro sube la parte de la lista que cambió.
+- Sin cambio: un salto o una reconstrucción que empieza dentro de una nota larga no la muestra, porque el cursor del
+  Worker arranca sin notas activas (`resetRenderCursor`).
+
+## 105. Revisión 108 — teclado sin franjas blancas, gráfico del ancho del note speed, registro de lag
 
 ### Pedido
 

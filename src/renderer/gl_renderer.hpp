@@ -73,7 +73,7 @@ private:
     void rebuildCarryCache(uint32_t viewStart, std::size_t desiredBegin);
     void advanceCarryCache(uint32_t viewStart, std::size_t oldBegin, std::size_t desiredBegin);
     void uploadCarryCache();
-    void setInstanceBase(std::size_t physicalIndex);
+    void setInstanceBase(std::size_t physicalIndex, GLuint buffer = 0);
 
     // SharpMIDI-raylib GLNoteRenderer port. Screen-page generation is not used
     // by this path; notes are opened/closed directly in a persistent ring.
@@ -87,7 +87,8 @@ private:
                          uint8_t noteIndex);
     void closeSharpNote(uint32_t noteId, uint32_t endTick,
                         std::vector<uint32_t>* closeIds = nullptr);
-    void advanceSharpTail(uint32_t viewStart);
+    void advanceSharpTail(uint32_t viewStart, uint32_t windowTicks);
+    void clearHeldNotes();
     void uploadSharpRange(uint32_t beginId, uint32_t endId);
     void uploadSharpCloseIds(std::vector<uint32_t>& closeIds);
     void requestRemoteSharpSweep(uint32_t startTick, uint32_t endTick,
@@ -100,48 +101,77 @@ private:
                        bool notesReady = true);
     uint32_t drawSharpRingRange(uint32_t viewEnd, bool notesReady);
 
-    // BPFA-style culled tile cache (HANDOFF sec. 38).
+    // BPFA-style tile cache (HANDOFF sec. 38); since sec. 102 each tile is a raster of
+    // the note on top per pixel, drawn as one quad.
     struct CullTile {
         uint32_t index = 0;
-        GLuint vbo = 0;
         uint32_t count = 0;
         uint32_t coverage = 0;
+        GLuint cells = 0;
+        GLuint table = 0;
     };
     void updateCullTiles(uint32_t viewStart, uint32_t viewEnd, uint32_t windowTicks, bool notesReady);
-    void buildCullTile(uint32_t index, uint32_t windowTicks);
     // One tile built a slice per frame (HANDOFF sec. 84).
     struct CullJob {
         bool active = false;
-        bool collecting = false;
         uint32_t index = 0;
         uint32_t coverage = 0;
         uint32_t windowTicks = 0;
+        // Still to add, front to back: ring ids [rangeBegin, nextId), then the first
+        // longNext of longNotes (copied when the job starts).
+        uint32_t rangeBegin = 0;
         uint32_t nextId = 0;
-        std::vector<CompositorNote> input;
+        std::size_t longNext = 0;
+        std::vector<CompositorNote> longNotes;
+        CompositorSettings settings;
         CompositorScratch scratch;
-        CompositorProgress progress;
-        CompositorResult result;
+        RasterTile raster;
     };
-    void startCullJob(uint32_t index, uint32_t windowTicks, uint32_t coverage);
-    bool stepCullJob(double budgetMs);
+    void startCullJob(CullJob& job, uint32_t index, uint32_t windowTicks, uint32_t coverage,
+                      uint32_t keepFrom);
+    bool stepCullJob(CullJob& job, double budgetMs);
     // Shortest gap between frames in the last second (the display period), sizes the
     // per-frame slice (HANDOFF sec. 95).
     double framePeriodMs_ = 1000.0 / 60.0;
     double framePeriodCandidateMs_ = 1.0e9;
     std::chrono::steady_clock::time_point framePeriodLast_{};
     std::chrono::steady_clock::time_point framePeriodWindow_{};
-    void uploadCullTile(uint32_t index, uint32_t coverage, const CompositorNote* notes, std::size_t count);
+    void uploadCullTile(uint32_t index, uint32_t coverage, const RasterTile& raster);
+    // Notes that may reach past the next tile (open, or longer than a window), in id
+    // order, so a tile does not scan the ring from a tail pinned by them (sec. 102).
+    void scanLongNotes(uint32_t throughId, uint32_t windowTicks);
+    std::vector<uint32_t> longIds_;
+    uint32_t longScanId_ = 1;
+    uint64_t longEpoch_ = ~0ull;
     CullJob cullJob_;
+    // A visible tile built at once, without dropping the job in progress.
+    CullJob cullSyncJob_;
     CullTile* findCullTileMutable(uint32_t index);
     void releaseCullTiles();
     const CullTile* findCullTile(uint32_t index) const;
     std::vector<CullTile> cullTiles_;
     uint64_t cullSignature_ = 0;
     uint64_t sharpRingEpoch_ = 0;
-    GLuint cullVao_ = 0;
-    std::vector<CompositorNote> cullInput_;
-    CompositorScratch cullScratch_;
-    CompositorResult cullResult_;
+    GLuint tileProgram_ = 0;
+    GLint tileCellsUniform_ = -1;
+    GLint tileTableUniform_ = -1;
+    GLint tilePaletteUniform_ = -1;
+    GLint tileRollSizeUniform_ = -1;
+    GLint tilePortraitUniform_ = -1;
+    GLint tileShiftUniform_ = -1;
+    GLint tileStartUniform_ = -1;
+    GLint tileViewEndUniform_ = -1;
+    GLint tileCurrentTickUniform_ = -1;
+    GLint tilePixelsPerTickUniform_ = -1;
+    GLint tileBandWidthUniform_ = -1;
+    GLint tileTableWidthUniform_ = -1;
+    int maxTextureSize_ = 2048;
+    // Screen column 0 in pixels from tick 0: the roll scrolls by whole pixels so a
+    // tile's cells land on screen pixels (sec. 102). viewStart plus this fraction of
+    // a tick is the exact left edge.
+    int64_t sharpScrollPx_ = 0;
+    float sharpViewFrac_ = 0.0f;
+    GLint viewFracUniform_ = -1;
 
     struct VisualPage {
         uint32_t spanTicks = 0;
@@ -267,6 +297,15 @@ private:
     // is id & ringMask_. uint16 overlap counts intentionally match ushort.
     uint32_t sharpHead_ = 1;
     uint32_t sharpTail_ = 1;
+    // Notes still on screen a window after they began, moved out of the ring so they
+    // do not pin its tail (HANDOFF sec. 104). Ascending id order, all below the tail.
+    std::vector<VisualNote> held_;
+    std::vector<uint32_t> heldIds_;
+    GLuint heldVbo_ = 0;
+    std::size_t heldVboCapacity_ = 0;
+    // Leading entries of held_ already in heldVbo_ as they are now.
+    std::size_t heldUploaded_ = 0;
+    uint32_t heldPrunedAt_ = 0;
     int64_t sharpLastSweepEnd_ = -1;
     uint32_t sharpLastWindowTicks_ = 0;
     uint32_t sharpStableWindowTicks_ = 0;

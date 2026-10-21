@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§101). Este archivo resume el estado al cierre de la rev. 104 y dice
+`HANDOFF.md` (§1-§105). Este archivo resume el estado al cierre de la rev. 108 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 104)
+## Estado actual (rev. 108)
 
 Rendimiento medido por el usuario:
 
@@ -304,7 +304,29 @@ Rendimiento medido por el usuario:
 - Rev. 103 (HANDOFF §100): el panel de pestañas del celular va debajo del teclado (vertical) o a la derecha
   del roll (acostado), no encima de las notas. Filas de teclas en píxeles enteros con octavas iguales
   (`keyEdge`, roll, fondo y teclado); FBO del teclado a resolución del dispositivo. Ícono de Colors y reloj.
-- Rev. 104 (HANDOFF §101): la franja blanca junto a cada tecla negra toma el color de las teclas blancas de
+- Rev. 104 (HANDOFF §101): instrumentos GM equivocados y batería mala en WasmiSynth. Pares estéreo de la SF2 solo
+  si los dos enlaces se apuntan entre sí (Arachno juntaba el piano con un trombón y liberaba muestras en uso);
+  con Hash cada worker resuelve el programa con su propio estado de selector (copias `EVT_SELECTOR_COPY`), antes
+  la primera nota tras un program change sonaba con el programa anterior; banco melódico de SF2 = MSB (o LSB),
+  MSB 1 ya no cae en el banco 128 de batería.
+- Rev. 105 (HANDOFF §102): comparado con BASSMIDI (biblioteca de Linux, `NOFX`). SF2 toca todas las capas de la
+  nota; generadores según la especificación (local > global > defecto, el preset se suma), atenuación ×0,4, hold,
+  decay en dB hasta sustain, Q y filtro como SF2, loops 1/3, pan de potencia constante; las clases exclusivas no
+  apagan capas de la misma nota. Arachno: niveles a ~1 dB de BASSMIDI (antes hasta -14 dB). Falta envolvente de
+  modulación, LFOs, moduladores, reverb y chorus.
+- Rev. 106 (HANDOFF §103): el usuario pidió que el roll no dibuje superposiciones ni notas que no se ven. Cada tile
+  es ahora una trama con la nota de arriba por píxel (`RasterTile`, regla de capas igual) y se dibuja con un solo
+  cuadrilátero que la pinta con el mismo estilo: cada píxel una vez por cuadro (antes 8-246× más columnas en tiles
+  densos). Scroll en píxeles enteros (`sharpScrollPx_`, `uViewFrac` para lo crudo). Los tiles ya no recorren el ring
+  desde la cola: lista de notas largas (`longIds_`). The Nuker 3 a 2:00 con note speed 0,1 en el contenedor: armado
+  2-11 ms/s con 0,5-2,5 M notas residentes. Sin medir con GPU real.
+- Rev. 107 (HANDOFF §104): "application exit" en una zona densa de The Nuker 3: el ring del roll crecía de 8 M a 268 M
+  notas y la reserva fallaba (heap de 4 GiB). La cola del ring no avanzaba durante una reconstrucción, y una reconstrucción
+  que empezó con un salto del roll no terminaba nunca (su objetivo se corre con el cursor). Ahora la cola avanza siempre,
+  las notas que siguen en pantalla una ventana después de empezar salen del ring a una lista aparte (`held_`, debajo de
+  todo), el adelanto tiene presupuesto fijo (0,55 × 2^23 notas) y el ring tope de 2^26. Chromium, The Nuker 3 desde 0,
+  note speed 0,1, 6144 voces, 218 s: máximo 0,58 M notas en el ring (antes subía sin bajar hasta 5,1 M).
+- Rev. 108 (HANDOFF §105): la franja blanca junto a cada tecla negra toma el color de las teclas blancas de
   al lado. El gráfico NPS/polifonía muestra solo los segundos del note speed. El aviso de lag cuenta su
   duración; "Lag log" (Advanced… → View) guarda totales por fuente, FPS mín/prom/máx y episodios con su
   segundo del MIDI, y "Download" lo baja como texto. Se borra al cambiar el MIDI o la SoundFont.
@@ -321,6 +343,11 @@ Mecanismos activos y cómo desactivarlos:
 | Fuente cruda / zstd en el navegador | `?rawlimit=MiB` (`0` fuerza zstd) |
 | Flujo visual plegado (roll + teclado) | `?visualstream=0`; `?visualdebug=1` mide en consola (Worker del parser y, en WASMIDI, `[WASMIDI app]`) |
 | Tiles culleados del roll | `?tiles=0` en la URL |
+| Tiles de solo lo visible: una celda por píxel con la nota de arriba, un cuadrilátero por tile; scroll en píxeles enteros (rev. 106) | `?tiles=0` (todo crudo, con sobredibujo) |
+| Lista de notas largas para armar tiles sin recorrer el ring desde la cola (rev. 106) | sin interruptor (`longIds_`) |
+| Cola del ring del roll avanza también durante una reconstrucción (rev. 107) | sin interruptor (`advanceSharpTail`) |
+| Notas sostenidas fuera del ring, debajo de todo (rev. 107) | sin interruptor (`held_`; `long N` en `[WASMIDI app]`) |
+| Adelanto del roll con presupuesto fijo y ring con tope de 2^26 notas (rev. 107) | sin interruptor (`kSharpResidentBudget`, `kSharpRingMax`) |
 | Límite de render del synth | `?synthlimit=0` / `ssw_set_render_limit_percent(0)` |
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |
 | Tope de robos por ciclo (25%) | `ssw_set_steal_cap_percent(0)` |
@@ -369,7 +396,9 @@ Mecanismos activos y cómo desactivarlos:
    rev. 82). Rev. 79: modo GPU con todas las voces y suma por cuadro.
    Rev. 80: Auto = Hash arriba de 4096 voces (fase de eventos repartida).
    Rev. 93: modos look-ahead y canción entera (como BPFA).
-   Falta: los dos modos de la rev. 93 en las PCs (canción entera de The Nuker 3 con 32 GB);
+   Falta: cuadros del roll de solo lo visible (rev. 106) con GPU real; The Nuker 3 entero sin cierre (rev. 107) en las
+   PCs; los dos modos de la rev. 93 en las PCs
+   (canción entera de The Nuker 3 con 32 GB);
    el tiempo de carga (el usuario: sharkmidi abre mucho más rápido); The Nuker 3 en WASMIDI con 12288 voces (`helpers N% busy` de
    `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
    log de consola del cierre de WasmiSynth en pausa;
@@ -380,8 +409,8 @@ Mecanismos activos y cómo desactivarlos:
 2. **Verificar en el navegador lo de la rev. 70-73**: que el WGSL compile y WebGPU
    ande, cuánto rinde el modo GPU con 1 y 12 workers, WASMIDI Audio con audio real
    (ventanas, letras, gráficos, visualizador) y el arreglo de la SF2 que no recargaba.
-3. Anteriores: que el hilo coordinador también tome tiles de render; GUI cosmética; mapeo GM de
-   instrumentos/drums; precisión de CC.
+3. Anteriores: que el hilo coordinador también tome tiles de render; GUI cosmética; precisión de CC;
+   envolvente de modulación, LFOs, moduladores, reverb y chorus de SF2 (HANDOFF §102).
 
 ## Errores a no repetir (detalle en HANDOFF §7)
 

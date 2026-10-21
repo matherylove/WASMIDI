@@ -20,6 +20,9 @@
 // instanced draw, the same shader, palette, glow and opacity, with only the
 // hidden notes removed.
 //
+// Since HANDOFF sec. 102 the renderer draws its tiles from RasterTile (below), which
+// keeps per pixel only the note on top; the cull stays for the host checks.
+//
 // Free of Qt, GL and engine headers so it can be tested on the host.
 
 #include <cstddef>
@@ -128,5 +131,21 @@ void CullBegin(
 // Visits up to `maxNotes` more notes; true once every note was visited.
 bool CullStep(CompositorScratch& scratch, CompositorProgress& progress, std::size_t maxNotes);
 void CullFinish(CompositorProgress& progress, CompositorResult& out);
+
+// Visible-only tile (HANDOFF sec. 102): every cell keeps the one note the GPU would
+// show at that pixel centre, so a tile is drawn as one quad, each pixel once. Unlike
+// the cull above it assumes the tile is drawn on whole pixels.
+struct RasterTile {
+    int width = 0;
+    // keyCount rows of `width` cells: index into `table` plus one, 0 where empty.
+    std::vector<std::uint32_t> cells;
+    std::vector<CompositorNote> table;
+    std::uint64_t rejectedByFullRow = 0;
+};
+void RasterBegin(const CompositorSettings& settings, CompositorScratch& scratch, RasterTile& out);
+// Adds `count` 12-byte notes laid out like CompositorNote, from the last one to the
+// first: front to back for an array in ring order.
+void RasterAddReversed(const void* notes, std::size_t count, const CompositorSettings& settings,
+    CompositorScratch& scratch, RasterTile& out);
 
 }  // namespace wasmidi

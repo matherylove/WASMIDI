@@ -43,7 +43,7 @@
       ' latency avg ' + avg.toFixed(1) + ' max ' + max.toFixed(1) + ' ms, roll lead ' + Math.round(st.safe - st.tick) +
       ' ticks (' + st.deltas + ' deltas), roll held ' + ((globalThis.__wasmidiRollHeld | 0) - st.held) +
       ' catch-ups ' + (globalThis.__wasmidiRollCatchUps | 0) + ', drawn max ' + (globalThis.__wasmidiRollDrawnMax || 0) +
-      ' notes (raw ' + (globalThis.__wasmidiRollRawMax || 0) + ', resident ' + (globalThis.__wasmidiRollResident || 0) + '), tiles ' +
+      ' notes (raw ' + (globalThis.__wasmidiRollRawMax || 0) + ', resident ' + (globalThis.__wasmidiRollResident || 0) + ', long ' + (globalThis.__wasmidiRollLongNotes || 0) + '), tiles ' +
       (globalThis.__wasmidiRollTiles | 0) + ' (visible ' + (globalThis.__wasmidiRollTilesVisible | 0) + ', ' +
       (globalThis.__wasmidiRollTileMs || 0).toFixed(0) + ' ms, max ' + (globalThis.__wasmidiRollTileMax || 0).toFixed(0) + ' ms), synth voices ' + (s ? s.activeVoices : '-') + ' load ' +
       (s && s.renderLoadPercent != null ? Number(s.renderLoadPercent).toFixed(0) : '-') + '% ring ' +
