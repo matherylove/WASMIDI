@@ -74,7 +74,7 @@ static int ssw_affects_sounding_voices(uint32_t message) {
     const uint32_t command = message & 0xf0u;
 
     if (command == 0xe0u)
-        return 1;                       /* pitch bend */
+        return voice_wgpu_enabled();    /* pitch bend: CPU voices follow it in-segment */
     if (command != 0xb0u)
         return 0;
 
