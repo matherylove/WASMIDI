@@ -1531,8 +1531,8 @@ EM_JS(void, wasmidi_browser_import_color_config, (), {
     input.click();
 });
 
-EM_JS(void, wasmidi_browser_download_text, (const char* name, const char* data, int size), {
-    const blob = new Blob([HEAPU8.slice(data, data + size)], { type: 'application/xml' });
+EM_JS(void, wasmidi_browser_download_text, (const char* name, const char* data, int size, const char* type), {
+    const blob = new Blob([HEAPU8.slice(data, data + size)], { type: UTF8ToString(type) });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = UTF8ToString(name);
@@ -1632,6 +1632,7 @@ MainWindow::MainWindow(QObject* parent)
         "perTrackColors", perTrackColors_ ? 1.0 : 0.0) != 0.0;
     adaptColors_ = wasmidi_setting_number(
         "adaptColors", adaptColors_ ? 1.0 : 0.0) != 0.0;
+    lagLog_ = wasmidi_setting_number("lagLog", lagLog_ ? 1.0 : 0.0) != 0.0;
     volume_ = std::clamp<int>(
         static_cast<int>(std::lround(wasmidi_setting_number("volume", volume_))),
         0, 100);
@@ -3595,6 +3596,27 @@ QColor MainWindow::accentColor() const
         : DefaultAccent;
 }
 
+void MainWindow::setLagLog(bool enable)
+{
+    if (lagLog_ == enable)
+        return;
+    lagLog_ = enable;
+    WASMIDI_PERSIST_SETTING("lagLog", lagLog_ ? 1 : 0);
+    emit lagLogChanged();
+}
+
+void MainWindow::downloadText(const QString& name, const QString& text)
+{
+#ifdef __EMSCRIPTEN__
+    const QByteArray bytes = text.toUtf8();
+    wasmidi_browser_download_text(name.toUtf8().constData(), bytes.constData(), bytes.size(),
+                                  "text/plain;charset=utf-8");
+#else
+    Q_UNUSED(name);
+    Q_UNUSED(text);
+#endif
+}
+
 void MainWindow::setAdaptColors(bool enable)
 {
     if (adaptColors_ == enable)
@@ -3641,7 +3663,7 @@ void MainWindow::exportColorConfig()
     xml += QStringLiteral("        </Colors>\n    </Visual>\n</WebAssemblyMIDIPlayer>\n");
 #ifdef __EMSCRIPTEN__
     const QByteArray bytes = xml.toUtf8();
-    wasmidi_browser_download_text("config.xml", bytes.constData(), bytes.size());
+    wasmidi_browser_download_text("config.xml", bytes.constData(), bytes.size(), "application/xml");
 #else
     Q_UNUSED(xml);
 #endif

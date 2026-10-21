@@ -57,7 +57,7 @@ void LiveGraph::setSampling(bool value)
 
 void LiveGraph::setSpan(double value)
 {
-    value = std::clamp(value, 1.0, 120.0);
+    value = std::clamp(value, 0.1, 120.0);
     if (span_ == value)
         return;
     span_ = value;
@@ -176,7 +176,10 @@ QSGNode* LiveGraph::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
     gridNode->markDirty(QSGNode::DirtyGeometry);
 
     float maxNps = 1.0f, maxPoly = 1.0f;
+    const double since = samples_.empty() ? 0.0 : samples_.back().time - span_;
     for (const auto& s : samples_) {
+        if (s.time < since)
+            continue;
         maxNps = std::max(maxNps, s.nps);
         maxPoly = std::max(maxPoly, s.polyphony);
     }

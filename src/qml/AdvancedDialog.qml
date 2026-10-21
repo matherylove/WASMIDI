@@ -7,6 +7,7 @@ DkDialog {
     id: dialog
     required property var mainWindow
     readonly property var mw: mainWindow
+    property var toasts: null
     title: "WasmiSynth — Advanced"
     width: Math.min(parent ? parent.width - 24 : 640, 640)
 
@@ -251,6 +252,21 @@ DkDialog {
                         text: dialog.mw.postBufferAuto ? "AUTO" : dialog.mw.postBuffer.toFixed(1) + " S"
                         onClicked: dialog.cyclePostBuffer()
                     }
+                }
+                RowLayout {
+                    spacing: 7
+                    Label { text: "Lag log" }
+                    Toggle { key: "lagLog"; text: on ? "ON" : "OFF" }
+                    DkButton {
+                        text: "Download"
+                        enabled: !!dialog.toasts && dialog.mw.hasMidi
+                        onClicked: dialog.toasts.downloadLog()
+                    }
+                }
+                Label {
+                    visible: dialog.mw.lagLog && !!dialog.toasts
+                    text: dialog.toasts ? dialog.toasts.log.lagSeconds + " s of lag in " +
+                                          dialog.toasts.log.episodes.length + " episodes" : ""
                 }
             }
 

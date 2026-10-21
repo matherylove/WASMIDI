@@ -6963,3 +6963,46 @@ en el ring y 1145 sostenidas, 41 saltos del roll (el contenedor no alcanza esa z
 - Con muchas notas sostenidas y el roll dibujando crudo, cada cuadro sube la parte de la lista que cambió.
 - Sin cambio: un salto o una reconstrucción que empieza dentro de una nota larga no la muestra, porque el cursor del
   Worker arranca sin notas activas (`resetRenderCursor`).
+
+## 105. Revisión 108 — teclado sin franjas blancas, gráfico del ancho del note speed, registro de lag
+
+### Pedido
+
+Dekx: (1) no le gustan las partes sin color del teclado; (2) el gráfico abarca demasiados datos: debe
+mostrar solo los segundos del note speed del roll, para que suba y baje tan rápido como el roll; (3) el
+aviso de lag debe contar cuántos segundos dura y, con un botón de las opciones, guardar un registro
+descargable mientras el MIDI esté abierto: tiempo total de lag por fuente, FPS mínimo/promedio/máximo,
+nombre del MIDI y el segundo del MIDI donde empezó y terminó cada lag. Se borra al cerrar el programa o al
+cambiar el MIDI o la SoundFont.
+
+### Causa
+
+- La fila de una tecla negra tenía una franja de cara blanca (`KindBlackRow`) que no se pintaba cuando
+  sonaban las teclas blancas de al lado.
+- `LiveGraph` usaba un ancho fijo de 10 s y su escala vertical tomaba el máximo de todas las muestras
+  guardadas.
+
+### Cambios
+
+- `keyboard.cpp`: la franja blanca de una tecla negra se parte en dos mitades que toman el color de la
+  tecla blanca de abajo y de la de arriba; el divisor de 1 px va entre ellas. Sin `KindBlackRow`.
+- `Dock.qml`: el gráfico usa `span` = note speed (mínimo 0,1 s; `setSpan` acepta 0,1-120 s) y la etiqueta
+  muestra los segundos. `live_graph.cpp`: el máximo de la escala es solo el de las muestras visibles.
+- `Toasts.qml`: el aviso dice "Out of frames for N s" y, al recuperarse, "Caught up after N s". Con
+  `lagLog` encendido, cada segundo de reproducción se anota: FPS del roll, el teclado y los gráficos, los
+  segundos de lag por fuente y los episodios (segundos del MIDI de inicio y fin, duración y fuentes). Un
+  salto o una pausa cierra el episodio. Se borra con `documentRevision` y con `soundfontName`.
+- `AdvancedDialog.qml` (grupo View): botón "Lag log" ON/OFF (guardado en localStorage, `lagLog`),
+  "Download" (texto `<midi>-lag-log.txt`) y el resumen "N s of lag in M episodes".
+- `mainwindow.cpp`: propiedad `lagLog`, `downloadText(name, text)`; la descarga del navegador recibe el
+  tipo MIME.
+
+### Verificación
+
+- Compilación wasm local OK. Chromium 1280×900 con `burst.mid`: gráfico de 1 s con note speed 1,00; con el
+  registro encendido, "Download" baja el archivo con totales, FPS y un episodio (0:06.3-0:07.1, KEYBOARD).
+- Teclado durante la ráfaga: las mitades blancas junto a las negras se pintan.
+
+### No verificado
+
+- En las PCs del usuario y en el celular.

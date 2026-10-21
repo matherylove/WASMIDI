@@ -3,7 +3,8 @@ import QtQuick.Layouts
 
 // Notices at the top right: a new polyphony or NPS peak once it has passed, and
 // a lag warning naming the parts that run out of frames or fall behind. Checked
-// once per second while playing.
+// once per second while playing; with mw.lagLog on, every lag second goes to a
+// log that lasts until the MIDI or the SoundFont changes.
 Column {
     id: toasts
     required property var mainWindow
@@ -22,6 +23,13 @@ Column {
     property real lagMutedUntil: 0
     property var lagRows: []
     property string lagNames: ""
+    property int lagStreak: 0
+    property int lastStreak: 0
+    property real lastSongTime: 0
+
+    readonly property var sources: ["ROLL", "KEYBOARD", "GRAPHS", "WASMISYNTH"]
+    property var log: emptyLog()
+    property var episode: null
 
     property bool polyMuted: false
     property bool npsMuted: false
@@ -34,6 +42,108 @@ Column {
         lastTime = 0
         displayRate = 0
         badSeconds = goodSeconds = 0
+        lagStreak = 0
+        clearLog()
+    }
+    property string soundfont: mw.soundfontName
+    onSoundfontChanged: clearLog()
+
+    function emptyLog() {
+        var totals = {}, fps = {}
+        for (var i = 0; i < sources.length; ++i) {
+            totals[sources[i]] = 0
+            fps[sources[i]] = { min: -1, sum: 0, max: 0, count: 0 }
+        }
+        return { started: new Date(), seconds: 0, lagSeconds: 0, totals: totals, fps: fps, episodes: [] }
+    }
+
+    function clearLog() {
+        log = emptyLog()
+        episode = null
+    }
+
+    function closeEpisode() {
+        episode = null
+    }
+
+    function record(rows, fps, songFrom, songTo) {
+        log.seconds += 1
+        for (var name in fps) {
+            var f = log.fps[name]
+            if (fps[name] < 0)
+                continue
+            f.min = f.min < 0 ? fps[name] : Math.min(f.min, fps[name])
+            f.max = Math.max(f.max, fps[name])
+            f.sum += fps[name]
+            ++f.count
+        }
+        var bad = rows.filter(function (r) { return r.bad })
+        if (!bad.length) {
+            closeEpisode()
+            return
+        }
+        log.lagSeconds += 1
+        if (!episode) {
+            episode = { start: songFrom, end: songTo, seconds: 0, sources: {} }
+            log.episodes.push(episode)
+        }
+        episode.end = songTo
+        episode.seconds += 1
+        for (var i = 0; i < bad.length; ++i) {
+            log.totals[bad[i].name] += 1
+            episode.sources[bad[i].name] = (episode.sources[bad[i].name] || 0) + 1
+        }
+    }
+
+    function pad(text, width, right) {
+        text = String(text)
+        while (text.length < width)
+            text = right ? " " + text : text + " "
+        return text
+    }
+
+    function logText() {
+        var lines = []
+        lines.push("WASMIDI lag log")
+        lines.push("MIDI: " + (mw.fileName || "(none)"))
+        lines.push("SoundFont: " + (mw.soundfontName || "(none)"))
+        lines.push("From: " + log.started.toLocaleString(Qt.locale(), "yyyy-MM-dd HH:mm:ss"))
+        lines.push("To: " + new Date().toLocaleString(Qt.locale(), "yyyy-MM-dd HH:mm:ss"))
+        lines.push("Seconds played: " + log.seconds)
+        lines.push("Seconds with lag: " + log.lagSeconds)
+        lines.push("")
+        lines.push("Total lag per source (seconds)")
+        for (var i = 0; i < sources.length; ++i)
+            lines.push("  " + pad(sources[i], 12) + pad(log.totals[sources[i]], 6, true))
+        lines.push("")
+        lines.push("FPS           " + pad("min", 6, true) + pad("avg", 8, true) + pad("max", 6, true))
+        for (i = 0; i < 3; ++i) {
+            var f = log.fps[sources[i]]
+            lines.push("  " + pad(sources[i], 12) + (f.count
+                ? pad(f.min, 6, true) + pad((f.sum / f.count).toFixed(1), 8, true) + pad(f.max, 6, true)
+                : "  no samples"))
+        }
+        lines.push("")
+        lines.push("Lag episodes (MIDI time)")
+        if (!log.episodes.length)
+            lines.push("  none")
+        else
+            lines.push("  " + pad("#", 5) + pad("start", 10) + pad("end", 10) + pad("length", 8) + "sources (seconds)")
+        for (i = 0; i < log.episodes.length; ++i) {
+            var e = log.episodes[i]
+            var parts = []
+            for (var j = 0; j < sources.length; ++j)
+                if (e.sources[sources[j]])
+                    parts.push(sources[j] + " " + e.sources[sources[j]])
+            lines.push("  " + pad(i + 1, 5) + pad(clock(e.start), 10) + pad(clock(e.end), 10) +
+                       pad(e.seconds + " s", 8) + parts.join(", ") + (e === episode ? " (ongoing)" : ""))
+        }
+        return lines.join("\n") + "\n"
+    }
+
+    function downloadLog() {
+        var base = (mw.fileName || "wasmidi").replace(/\.[^.]*$/, "")
+        mw.downloadText(base + "-lag-log.txt", logText())
     }
 
     FrameAnimation {
@@ -102,10 +212,24 @@ Column {
         row("WASMISYNTH", underruns > 0 || mw.synthRenderLoad > 100,
             underruns > 0 ? underruns + " UNDERRUNS" : Math.round(mw.synthRenderLoad) + "% LOAD")
 
+        var songTime = mw.currentTime
+        // A seek in between ends the episode: its MIDI times would not be contiguous.
+        if (songTime < lastSongTime || songTime > lastSongTime + 3)
+            closeEpisode()
+        if (mw.lagLog) {
+            record(rows, { ROLL: roll.fps, KEYBOARD: keys.frames, GRAPHS: graphFrames }, lastSongTime, songTime)
+            logChanged()
+        }
+        lastSongTime = songTime
+
         if (names.length) {
             ++badSeconds
+            ++lagStreak
             goodSeconds = 0
         } else {
+            if (lagStreak > 0)
+                lastStreak = lagStreak
+            lagStreak = 0
             ++goodSeconds
             badSeconds = 0
         }
@@ -128,6 +252,8 @@ Column {
         onRunningChanged: {
             toasts.windowFrames = toasts.timeUpdates = 0
             toasts.badSeconds = toasts.goodSeconds = 0
+            toasts.closeEpisode()
+            toasts.lastSongTime = toasts.mw.currentTime
             toasts.lastUnderruns = toasts.mw.synthUnderruns
             toasts.dock.takeGraphFrames()
             toasts.mw.takeKeyboardSample()
@@ -237,8 +363,9 @@ Column {
             Layout.fillWidth: true
             Layout.bottomMargin: 5
             text: toasts.lagNames.length
-                ? "Out of frames: <b><font color='" + Dk.pink + "'>" + toasts.lagNames + "</font></b>"
-                : "Caught up."
+                ? "Out of frames for <b>" + toasts.lagStreak + " s</b>: <b><font color='" + Dk.pink + "'>" +
+                  toasts.lagNames + "</font></b>"
+                : "Caught up after " + toasts.lastStreak + " s."
             textFormat: Text.RichText
             color: Dk.text
             font.family: Dk.ui
