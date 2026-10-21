@@ -464,6 +464,9 @@ let sharpRenderSafeThrough = 0;
 let sharpRenderRunning = false;
 let sharpRenderReady = false;
 let sharpRenderPerTrack = false;
+// The fold of colors per track (HANDOFF sec. 108): the roll's window in ticks and width in pixels.
+let sharpRenderFoldWindow = 0;
+let sharpRenderFoldPixels = 0;
 let sharpRenderCompletedTarget = 0;
 let sharpRenderStarved = false;
 
@@ -657,10 +660,45 @@ function sweepYield() {
     });
 }
 
-// Roll summaries (HANDOFF sec. 108) for the sweep in channel colors; ?rollsummary=0 reads every word.
-// Colors per track do not use them, so neither this Worker nor the helpers compute them then.
-function rollSummaryOn() {
-    return pageOverride("rollsummary") !== 0 && !sharpRenderPerTrack;
+// Roll summaries: 1 in channel colors (HANDOFF sec. 108), 2 in colors per track for the roll's fold
+// (sec. 113), 0 with no fold or ?rollsummary=0 (the sweep reads every word).
+function rollSummaryMode() {
+    if (pageOverride("rollsummary") === 0) return 0;
+    if (!sharpRenderPerTrack) return 1;
+    return sharpRenderFoldWindow && sharpRenderFoldPixels ? 2 : 0;
+}
+
+// The held pieces whose summary is for other colors or another fold go to the helpers again, one at
+// a time and ahead of the visual spans, from the sweep on (HANDOFF sec. 113).
+function rollPump(Module) {
+    const pool = feedPool;
+    if (!pool || !pool.ready || pool.rollBusy || typeof Module._wmp_roll_request_js !== "function") return;
+    if (!rollSummaryMode() || !Module._wmp_roll_request_js()) return;
+    const request = copyWasmBytes(Module, Module._wmp_feed_buffer_ptr_js(),
+        sizeToNumber(Module._wmp_feed_buffer_size_js(), "roll request size"));
+    pool.lastId = (pool.lastId || 0) + 1;
+    pool.rollBusy = { id: pool.lastId, kind: "roll", request, result: null };
+    pool.rollPending.push(pool.rollBusy);
+}
+
+function rollOnResult(entry, m) {
+    const pool = feedPool;
+    if (pool && pool.rollBusy === entry) pool.rollBusy = null;
+    getModule().then(Module => {
+        if (m.result && m.result.byteLength) {
+            const result = new Uint8Array(m.result);
+            const ptr = pointerToNumber(Module._wmp_feed_buffer_js(result.length), "roll buffer");
+            if (ptr) {
+                Module.HEAPU8.set(result, ptr);
+                if (!Module._wmp_roll_attach_js(result.length))
+                    console.warn("[WASMIDI visual] roll summary not attached:", parserErrorText(Module, "?"));
+            }
+        } else if (m.message) {
+            console.warn("[WASMIDI visual] roll summary failed:", m.message);
+        }
+        rollPump(Module);
+        feedDispatch();
+    }).catch(error => console.warn("[WASMIDI visual] roll summary:", error));
 }
 
 async function drainSharpRenderer() {
@@ -809,13 +847,14 @@ async function requestSharpRenderer(message) {
         sharpRenderCompletedTarget = startTick > 0 ? (startTick - 1) >>> 0 : 0;
         sharpRenderSafeThrough = sharpRenderCompletedTarget;
         sharpRenderReady = true;
-        if (typeof Module._wmp_roll_summary_js === "function")
-            Module._wmp_roll_summary_js(rollSummaryOn() ? 1 : 0);
         // ?rollfold=0: colors per track send every note, also those that cover no pixel (HANDOFF sec. 108).
-        if (typeof Module._wmp_render_fold_js === "function") {
-            const fold = pageOverride("rollfold") !== 0;
-            Module._wmp_render_fold_js(fold ? Number(message.foldWindow) >>> 0 : 0, fold ? Number(message.foldPixels) >>> 0 : 0);
-        }
+        const fold = pageOverride("rollfold") !== 0;
+        sharpRenderFoldWindow = fold ? Number(message.foldWindow) >>> 0 : 0;
+        sharpRenderFoldPixels = fold ? Number(message.foldPixels) >>> 0 : 0;
+        if (typeof Module._wmp_roll_summary_js === "function")
+            Module._wmp_roll_summary_js(rollSummaryMode());
+        if (typeof Module._wmp_render_fold_js === "function")
+            Module._wmp_render_fold_js(sharpRenderFoldWindow, sharpRenderFoldPixels);
         Module._wmp_reset_render_cursor_js(startTick, perTrack ? 1 : 0);
         // A start inside the held stream keeps it and the spans in flight (HANDOFF sec. 89).
         const kept = typeof Module._wmp_visual_kept_js === "function" && Module._wmp_visual_kept_js() === 1;
@@ -1464,6 +1503,10 @@ function visualRestart(Module) {
     if (feedPool) {
         feedPool.visualPending = [];
         feedPool.pending = feedPool.pending.filter(e => e.kind !== "joint" || e.feed.sequence === feedSequence);
+        if (feedPool.rollPending.length) {
+            feedPool.rollPending = [];
+            feedPool.rollBusy = null;
+        }
     }
     visualPlanned = sizeToNumber(Module._wmp_visual_head_js(), "visual head");
     visualSpanWords = VISUAL_SPAN_WORDS;
@@ -1496,6 +1539,7 @@ function visualPump(Module) {
     }
     if (appended) liveFeedPump(Module);
     visualStats.appendMs += performance.now() - appendStart;
+    rollPump(Module);
     jointPlan(Module);
     // Past the roll's target, while the synth feed runs, one helper stays free for it.
     const queueLimit = visualQueueLimit(pool);
@@ -1877,7 +1921,7 @@ async function feedStartPool() {
     }
     const url = new URL("midi-parser-helper.js?v=" + encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
         WASMIDI_MIDI_PARSER_BASE_URL).href;
-    const pool = { ready: false, failed: false, helpers: [], pending: [], visualPending: [] };
+    const pool = { ready: false, failed: false, helpers: [], pending: [], visualPending: [], rollPending: [], rollBusy: null };
     feedPool = pool;
     const inits = [];
     for (let h = 0; h < helpers; ++h) {
@@ -1888,7 +1932,8 @@ async function feedStartPool() {
             worker.onmessage = event => {
                 const m = event.data || {};
                 if (m.type === "feed-ready") resolve();
-                else if (m.type === "feed-result" || m.type === "visual-result" || m.type === "joint-result")
+                else if (m.type === "feed-result" || m.type === "visual-result" || m.type === "joint-result" ||
+                         m.type === "roll-result")
                     feedOnResult(helper, m);
                 else if (m.type === "feed-error") {
                     reject(new Error(m.message || "Synth feed helper failed"));
@@ -1941,12 +1986,14 @@ function feedDispatch() {
     if (!pool || !pool.ready) return;
     for (const helper of pool.helpers) {
         if (helper.busy) continue;
-        const entry = pool.pending.shift() || pool.visualPending.shift();
+        const entry = pool.pending.shift() || pool.rollPending.shift() || pool.visualPending.shift();
         if (!entry) return;
         helper.busy = entry;
         helper.since = performance.now();
-        helper.worker.postMessage({ type: entry.kind === "visual" ? "visual-decode" : entry.kind === "joint" ? "joint-decode" : "feed-decode",
-            id: entry.id, request: entry.request.buffer, rollSummary: rollSummaryOn() }, [entry.request.buffer]);
+        const type = entry.kind === "visual" ? "visual-decode" : entry.kind === "joint" ? "joint-decode" :
+            entry.kind === "roll" ? "roll-summarize" : "feed-decode";
+        helper.worker.postMessage({ type, id: entry.id, request: entry.request.buffer, rollMode: rollSummaryMode(),
+            foldWindow: sharpRenderFoldWindow, foldPixels: sharpRenderFoldPixels }, [entry.request.buffer]);
         entry.request = null;
     }
 }
@@ -1963,6 +2010,8 @@ function feedOnResult(helper, m) {
         visualOnResult(entry.visual, { result: m.visual });
     } else if (entry && entry.id === m.id && entry.kind === "visual") {
         visualOnResult(entry, m);
+    } else if (entry && entry.id === m.id && entry.kind === "roll") {
+        rollOnResult(entry, m);
     } else if (entry && entry.id === m.id && entry.sequence === feedSequence) {
         entry.result = new Uint8Array(m.result);
         getModule().then(Module => feedPump(Module));
@@ -2238,7 +2287,7 @@ async function handleMessage(event) {
         jointOn = pageOverride("jointdecode") === 1 || (!visualAhead && pageOverride("jointdecode") !== 0);
         Module._wmp_visual_config_js(visualStreamOn ? 1 : 0, 1);
         if (typeof Module._wmp_roll_summary_js === "function")
-            Module._wmp_roll_summary_js(rollSummaryOn() ? 1 : 0);
+            Module._wmp_roll_summary_js(rollSummaryMode());
         const ok = await parallelParse(Module, file, total, total > rawLimit) ||
             Module._wmp_parse_file_js(total);
         if (!ok) {

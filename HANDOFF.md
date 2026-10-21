@@ -7414,3 +7414,112 @@ pruebas de host del CI pasan.
   bajada de ganancia por copia de las pilas VOR/eco (la voz se suelta con el note-off de su última
   copia), modo mono, orden de voces por región.
 - La suma no es la del CPU bit a bit (orden de suma y filtro en float32).
+
+## 113. Revisión 116 — el resumen del roll también en colores por pista
+
+### Pedido
+
+Después de la rev. 111 (§108) Dekx contestó qué modo de colores usa: "Los colores por pista son lo que usan la mayoría". En
+ese modo el barrido del roll seguía leyendo cada palabra del flujo visual (300-700 ms por segundo de canción en
+Chromium desde 425 s de The Nuker 3), así que la polifonía alta todavía podía dejar al roll sin cuadros.
+
+### Causa
+
+El resumen de la rev. 111 sirve para colores por canal: el dueño de una tecla es su canal y la tecla solo cambia de
+nota cuando su contador llega a cero. En colores por pista el dueño es (pista & 15, canal): un note-on de otra pista
+cierra la nota y abre otra, y un note-off de otra pista se ignora. Así salen ~20 M notas por segundo en 436-440 s, el
+98% de menos de un píxel; el plegado por píxel de la rev. 111 descarta esas en el barrido, pero el barrido tiene que
+leer cada palabra para saber cuáles son.
+
+### Cambios
+
+1. **Resumen por pista con el plegado (helpers y decodificación local).** El roll ya manda su ventana W y su ancho L
+   con cada reset; ahora el Worker del parser los pasa a los helpers con cada tramo (`rollMode` 2, `foldWindow`,
+   `foldPixels`) y la imagen de los helpers lleva los colores por pista (flag 1 del campo reservado de
+   `exportFeedImage`). Por cada tramo de 4 M palabras, el codificador recorre cada (canal, tecla) como `renderRun`
+   desde "sin nota" y guarda solo las notas que el plegado muestra (las que siguen abiertas en el primer centro de
+   columna después de su comienzo) más la que queda abierta al final del tramo, todas en orden de palabra, con su
+   color y velocidad. Para la nota que una tecla ya tiene al empezar el tramo guarda lo necesario para su primer
+   cierre (`RollTrackSlot`): el primer note-on (f1) y su dueño, el primer note-on de otro dueño (f2), los note-off
+   antes de f1 con su dueño, y las caídas de la suma de copias del dueño de f1 hasta f2.
+2. **Barrido en colores por pista sin leer palabras.** Al llegar al comienzo de un tramo, una tecla con c0 copias del
+   dueño o0 cierra esa nota en el primer note-off de o0 antes de f1 que lleve la cuenta a c0, en f1 si es de otro
+   dueño, en la primera caída a -c0 del dueño de f1 o en f2. Desde ese cierre la tecla está en el mismo estado que el
+   recorrido desde "sin nota", así que el barrido aplica las notas guardadas desde esa palabra (cierres de la nota
+   anterior incluidos) con `renderOpen`/`renderClose`/`renderFoldFlush`: mismos ids, mismo orden de comienzo y la
+   misma regla de capas. Si la nota no se cierra, solo cambia su cuenta. Se lee palabra por palabra si c0 más el
+   máximo pasa de 65535, si el dueño guardado no es de ese canal o si el resumen no es del plegado actual.
+3. **Resumen calculado de nuevo.** El resumen depende del plegado: lo prellenado antes del primer reset (en colores
+   por canal) y lo guardado al cambiar note speed o ancho tiene otro. Los pedazos de 1 M palabras o más desde la
+   posición del barrido van a los helpers de a uno, antes que los tramos visuales nuevos (`roll-summarize`,
+   `wmp_roll_request_js` / `wmp_roll_decode_js` / `wmp_roll_attach_js`): el helper vuelve a sacar las palabras de
+   los bytes del pedazo (`visualDecodeBytes`), las codifica con el plegado pedido, comprueba que los bytes salgan
+   iguales y devuelve solo el resumen. Un resultado de un plegado viejo o de un pedazo ya recortado se descarta.
+4. Las notas del resumen ocupan ~7,7 bytes cada una (palabra << 2 | apertura << 1 | cambió el tick, tecla y
+   color/velocidad en un varint). Un tramo por pista guarda su resumen con hasta 1 byte por palabra (por canal sigue
+   siendo medio byte).
+5. `wmp_roll_summary_js(modo)`: 0 apagado, 1 colores por canal, 2 colores por pista con el plegado. `?rollsummary=0`
+   apaga los dos.
+6. `tools/feeder_check/roll_track_check.cpp` (en `check.sh`): MIDI denso generado (48 pistas, 3 canales, 12 teclas),
+   barrido con resumen directo y con resumen recalculado contra el barrido que lee cada palabra, con dos plegados.
+   `midi_parser_bootstrap_smoke.cjs` compara también el modo 2 (local y helper) con la fusión.
+
+### Medición
+
+Host, The Nuker 3, un segundo de canción desde cero (sin nota), pedazos de 8 M palabras, 60 cuadros, L = 1600,
+W = 133632 (note speed 1):
+
+| s | palabras | notas del roll | resumen | barrido crudo | con resumen |
+|---|---|---|---|---|---|
+| 425 | 16,1 M | 1,04 M | 0,50 B/palabra | 0,163 s | 0,033 s |
+| 436 | 42,3 M | 1,48 M | 0,29 B/palabra | 0,354 s | 0,043 s |
+| 446 | 60,2 M | 1,51 M | 0,21 B/palabra | 0,481 s | 0,046 s |
+| 448 | 93,5 M | 1,51 M | 0,14 B/palabra | 0,681 s | 0,047 s |
+
+El barrido con resumen depende de las notas que se ven (~1,5 M por segundo con note speed 1 en 1600 px), no de la
+polifonía. Con note speed 0,1 (W = 13364) en 436 s se ven 6,7 M notas por segundo: el resumen pasaría de 1 byte por
+palabra y no se guarda (barrido crudo, como antes).
+
+Costo en los helpers (callgrind, 8,4 M palabras de 436 s, solo codificar): 672 M instrucciones sin resumen, 1045 M con
+el de colores por canal y 1152 M con el de colores por pista.
+
+En Chromium la primera versión empeoró el roll: el barrido del Worker del parser bajó de 500-700 a 30-70 ms por segundo
+y el teclado subió (40/s contra 24-32/s), pero los helpers entregaban menos flujo visual (25-28 contra 30-46 MiB/s) y el
+roll quedaba más atrasado (1417-1466 de ~1455 cuadros, contra 492-1083 sin resumen, tres pasadas de cada uno). Medido en
+wasm (Memory64 y `-fexceptions` como el módulo del parser, node del emsdk, 42 M palabras de 436 s en pedazos de 4 M),
+codificar costaba 6,5 ns por palabra sin resumen, ~15 con el de colores por canal y 40-59 con el de colores por pista
+(en host 9-10). La causa: con `-fexceptions` de Emscripten, una llamada que no queda en línea a una función que puede
+lanzar (la lambda que guarda una nota hace `push_back`) pasa por un `invoke_*` de JavaScript, y se hacía en cada note-on.
+Ahora la lambda va forzada en línea y se llama solo para las notas que el plegado muestra: **~16 ns por palabra**, lo
+mismo que el resumen por canal. Con el plegado de note speed 0,1 en 436 s (todas las notas guardadas, el tramo se
+descarta por tamaño) cuesta 33 ns.
+
+Chromium del contenedor (4 hilos, sin GPU), visual-bench de The Nuker 3 desde 425 s por 25 s, colores por pista,
+`?helpers=3`, codificador final, dos pasadas de cada uno alternadas:
+
+| | barrido (mediana / máx.) | helpers entregan | teclado | roll atrasado | adelanto mínimo |
+|---|---|---|---|---|---|
+| con resumen | 71-73 / 111-122 ms/s | 47,5-48,2 MiB/s (con el resumen) | 33,9-34,7/s | 618-628 de ~1435 | -2,7 / -2,8 s |
+| `?rollsummary=0` | 554-565 / 737-742 ms/s | 39,4-42,0 MiB/s | 27,9-29,3/s | 403-729 de ~1468 | -1,8 / -2,5 s |
+
+El resumen ocupa ~18% de lo que mandan los helpers, así que el flujo visual que entregan es el mismo; el Worker del
+parser pasa de barrer ~0,56 s por segundo a ~0,07 s y el teclado gana. El roll atrasado queda igual en el contenedor:
+desde 425 s lo limita la decodificación de 3 helpers en 4 hilos (como en §108). En las PCs, con más helpers, el barrido
+de 0,5-0,7 s por segundo era lo que quedaba en el Worker del parser.
+
+### Verificación
+
+- Host (`offline_track`, interno): resumen = barrido crudo, aperturas, cierres y cuentas finales idénticos en The Nuker 3
+  425, 436, 446 y 448 s, con (L, W) = (1600, 133632), (1600, 13364) y (900, 133632) recalculado por pedido; en 12
+  configuraciones sintéticas con 1-3000 pistas, 1-128 teclas, copias y note-offs de otras pistas (dos plegados) y una que
+  deja notas sostenidas de tramo a tramo. Se pasó por los seis casos del primer cierre (note-off antes de f1, caída,
+  f1, f2 y las dos formas de no cerrar). Repetido con el codificador final.
+- `roll_track_check`: IDENTICAL con 20000:64 y 2000:64; tres errores puestos a propósito en el barrido dan DIFFER.
+- `tools/feeder_check/check.sh`: todo IDENTICAL. `tools/local_build.sh` (pruebas de host del CI, compilación y
+  `midi_parser_bootstrap_smoke.cjs`): todo OK.
+
+### No verificado
+
+- En las PCs de Dekx con GPU real: The Nuker 3 en 7:14-7:29 con colores por pista.
+- El recálculo en el navegador después de cambiar note speed o el ancho de la ventana (en host sí).
+- Note speed muy bajo en zonas densas: con más de 1 byte de resumen por palabra el tramo se barre leyendo palabras.

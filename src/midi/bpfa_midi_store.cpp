@@ -1579,6 +1579,36 @@ struct PodReader {
 };
 } // namespace
 
+namespace {
+// A roll summary after its mode (HANDOFF sec. 108-109); templates so the private type is deduced.
+template <typename Roll> void putRollSummary(std::vector<uint8_t>& out, const Roll& roll)
+{
+    if (!roll.mode) return;
+    putPod(out, roll.foldWindow);
+    putPod(out, roll.foldPixels);
+    putPod(out, uint64_t(roll.segments.size()));
+    putPod(out, uint64_t(roll.slots.size()));
+    putPod(out, uint64_t(roll.trackSlots.size()));
+    putPod(out, uint64_t(roll.data.size()));
+    putArray(out, roll.segments.data(), roll.segments.size());
+    putArray(out, roll.slots.data(), roll.slots.size());
+    putArray(out, roll.trackSlots.data(), roll.trackSlots.size());
+    putArray(out, roll.data.data(), roll.data.size());
+}
+template <typename Roll> void getRollSummary(PodReader& in, uint32_t mode, Roll& roll)
+{
+    roll.mode = mode;
+    roll.foldWindow = in.get<uint32_t>();
+    roll.foldPixels = in.get<uint32_t>();
+    const uint64_t segments = in.get<uint64_t>(), slots = in.get<uint64_t>(), trackSlots = in.get<uint64_t>(),
+        data = in.get<uint64_t>();
+    in.array(roll.segments, std::size_t(segments));
+    in.array(roll.slots, std::size_t(slots));
+    in.array(roll.trackSlots, std::size_t(trackSlots));
+    in.array(roll.data, std::size_t(data));
+}
+} // namespace
+
 std::size_t BpfaMidiStore::sourceSlabBytes() { return SourceSlabSize; }
 
 bool BpfaMidiStore::exportFeedImage(std::vector<uint8_t>& blob) const
@@ -1591,13 +1621,16 @@ bool BpfaMidiStore::exportFeedImage(std::vector<uint8_t>& blob) const
     putPod(blob, uint64_t(sourceBlockSize_));
     putPod(blob, uint64_t(sourceChunks_.size()));
     putPod(blob, uint32_t(metadata_.maxTick));
-    putPod(blob, uint32_t(0));
+    // Flag 1: the track colors follow, for the roll summaries in colors per track (HANDOFF sec. 113).
+    const bool colors = trackColors_.size() == tracks_.size();
+    putPod(blob, uint32_t(colors ? 1 : 0));
     for (const TrackStorage& t : tracks_) {
         putPod(blob, t.byteBegin);
         putPod(blob, t.byteEnd);
         putPod(blob, t.channelEnd);
     }
     putArray(blob, sourceChunks_.data(), sourceChunks_.size());
+    if (colors) putArray(blob, trackColors_.data(), trackColors_.size());
     return true;
 }
 
@@ -1611,7 +1644,7 @@ bool BpfaMidiStore::importFeedImage(const uint8_t* data, std::size_t size, FeedS
     sourceBlockSize_ = std::size_t(in.get<uint64_t>());
     const uint64_t chunkCount = in.get<uint64_t>();
     metadata_.maxTick = in.get<uint32_t>();
-    in.get<uint32_t>();
+    const uint32_t flags = in.get<uint32_t>();
     if (!in.ok || trackCount == 0 || trackCount > 65535u || sourceBlockSize_ == 0 || chunkCount == 0) {
         error_ = "Invalid feed image";
         return false;
@@ -1623,6 +1656,7 @@ bool BpfaMidiStore::importFeedImage(const uint8_t* data, std::size_t size, FeedS
         t.channelEnd = in.get<uint64_t>();
     }
     in.array(sourceChunks_, std::size_t(chunkCount));
+    if (flags & 1u) in.array(trackColors_, trackCount);
     if (!in.ok) { error_ = "Truncated feed image"; return false; }
     externalFetch_ = fetch;
     externalFetchUser_ = fetchUser;
@@ -1840,6 +1874,15 @@ void BpfaMidiStore::resetRenderCursor(uint32_t startTick, bool perTrackColors)
     renderActiveIds_.fill(0);
     renderFold_ = perTrackColors && foldWindow_ != 0 && foldPixels_ != 0;
     foldVisibleAt_ = 0;
+    // The summaries the sweep reads from here on (HANDOFF sec. 113); others are computed again.
+    const uint32_t keyMode = !rollSummaryEnabled_ ? 0u : !perTrackColors ? 1u : renderFold_ ? 2u : 0u;
+    const uint32_t keyWindow = keyMode == 2 ? foldWindow_ : 0u, keyPixels = keyMode == 2 ? foldPixels_ : 0u;
+    if (keyMode != rollKeyMode_ || keyWindow != rollKeyWindow_ || keyPixels != rollKeyPixels_) {
+        rollKeyMode_ = keyMode;
+        rollKeyWindow_ = keyWindow;
+        rollKeyPixels_ = keyPixels;
+        ++rollKeyGen_;
+    }
     renderPending_.clear();
     renderPendingHead_ = 0;
     renderPendingBase_ = 0;
@@ -1964,7 +2007,8 @@ inline uint32_t getVisualVar(const uint8_t* bytes, uint32_t& at)
 // word, bit 7 set on the last word of the run.
 std::size_t BpfaMidiStore::RollSummary::bytes() const
 {
-    return segments.size() * sizeof(RollSegment) + slots.size() * sizeof(RollSlot) + data.size();
+    return segments.size() * sizeof(RollSegment) + slots.size() * sizeof(RollSlot) +
+        trackSlots.size() * sizeof(RollTrackSlot) + data.size();
 }
 
 namespace {
@@ -1979,10 +2023,35 @@ struct RollWalk {
 };
 // A record (kind 0, value: the level drop) or an open (1, value: velocity) / close (2) of the walk.
 struct RollEntry { uint32_t word, tick, value; uint16_t slot; uint8_t kind; };
+
+// Colors per track: the walk from no note of a key as renderRun does it (12 bytes, read for every
+// word), its open note, and what the first close of a note held from before the segment needs
+// (phase 0 before the first note-on, 1 before the first one by another owner).
+struct TrackWalk {
+    uint32_t count = 0, openVisible = 0;
+    uint8_t owner = 0, phase = 0, touched = 0, firstOwner = 0;
+};
+struct TrackOpen { uint32_t word = 0, tick = 0, payload = 0; };
+struct TrackFirst {
+    int32_t sum = 0, low = 0, high = 0;
+    uint32_t f1Word = 0, f1Tick = 0, f2Word = 0, f2Tick = 0;
+};
+// A note of the walk: key = local word * 2 + 1 for its open (payload: color << 7 | velocity), * 2 for its close.
+struct TrackItem { uint32_t key, tick; uint16_t slot, payload; };
+
+// The first tick past the first column centre at or after `tick` (the raster's column() rule): a note
+// starting at `tick` is seen if it is still open there.
+inline uint32_t foldVisibleAt(uint64_t tick, uint64_t w, uint64_t l)
+{
+    const int64_t num = int64_t(tick * 2u * l) - int64_t(w);
+    const uint64_t column = num <= 0 ? 0 : (uint64_t(num) + 2u * w - 1u) / (2u * w);
+    return uint32_t(std::min<uint64_t>(0xffffffffu, (2u * column + 1u) * w / (2u * l) + 1u));
+}
 } // namespace
 
 void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t startTick,
-                                 std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks, RollSummary* roll)
+                                 std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks, RollSummary* roll,
+                                 const RollFold* fold)
 {
     marks.clear();
     // Written through a pointer: the vector is resized ahead in large steps and cut at the end.
@@ -2007,6 +2076,15 @@ void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks
     std::size_t segBegin = 0;
     uint32_t segFirstTick = count ? events[0].tick : startTick;
     bool segOk = true;
+    // Colors per track (HANDOFF sec. 113): the walk of each key with owners, the notes it keeps
+    // (those the fold shows, and the one open at the end) and the off counts before f1 per owner.
+    const bool trackFold = roll && fold && fold->window && fold->pixels;
+    std::vector<TrackWalk> twalk;
+    std::vector<TrackOpen> topen;
+    std::vector<TrackFirst> tfirst;
+    std::vector<uint32_t> preOff;
+    std::vector<TrackItem> titems, tsorted;
+    uint32_t visTick = ~0u, visAt = 0;
     if (roll) {
         *roll = RollSummary{};
         walk.resize(128u * 16u);
@@ -2014,6 +2092,15 @@ void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks
         atItem.resize(128u * 16u);
         records.resize(128u * 16u);
         items.resize(128u * 16u);
+        roll->mode = trackFold ? 2u : 1u;
+        if (trackFold) {
+            roll->foldWindow = fold->window;
+            roll->foldPixels = fold->pixels;
+            twalk.resize(128u * 16u);
+            topen.resize(128u * 16u);
+            tfirst.resize(128u * 16u);
+            preOff.resize(128u * 16u * 16u);
+        }
     }
     const auto closeSegment = [&](std::size_t end, uint32_t endByte, uint32_t endTick, uint32_t endTrack) {
         const std::size_t slotsBefore = roll->slots.size(), dataBefore = roll->data.size();
@@ -2087,9 +2174,119 @@ void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks
         segOk = true;
     };
 
+    // Inlined and called only for the notes the fold shows: with -fexceptions in wasm, a call that may
+    // throw goes through JavaScript (HANDOFF sec. 113).
+    const auto trackClose = [&](uint16_t slot, std::size_t word, uint32_t tick) __attribute__((always_inline)) {
+        const TrackOpen& o = topen[slot];
+        titems.push_back(TrackItem{uint32_t(2u * (o.word - segBegin) + 1u), o.tick, slot, uint16_t(o.payload)});
+        titems.push_back(TrackItem{uint32_t(2u * (word - segBegin)), tick, slot, 0});
+    };
+    const auto closeTrackSegment = [&](std::size_t end, uint32_t endByte, uint32_t endTick, uint32_t endTrack) {
+        const std::size_t slotsBefore = roll->trackSlots.size(), dataBefore = roll->data.size();
+        for (const uint16_t slot : touched) {
+            const TrackOpen& o = topen[slot];
+            if (twalk[slot].count) titems.push_back(TrackItem{uint32_t(2u * (o.word - segBegin) + 1u), o.tick, slot, uint16_t(o.payload)});
+        }
+        if (end > segBegin && segOk && (end - segBegin) < (std::size_t(1) << 25)) {
+            // The records grouped by key; the notes of all keys in word order (two 13-bit radix passes).
+            for (const RollEntry& e : entries) ++records[e.slot];
+            uint32_t offset = 0;
+            for (const uint16_t slot : touched) {
+                atRecord[slot] = offset;
+                offset += records[slot];
+            }
+            sorted.resize(entries.size());
+            for (const RollEntry& e : entries) sorted[atRecord[e.slot]++] = e;
+            tsorted.resize(titems.size());
+            for (int pass = 0; pass < 2; ++pass) {
+                const unsigned shift = pass * 13u;
+                std::vector<TrackItem>& from = pass ? tsorted : titems;
+                std::vector<TrackItem>& to = pass ? titems : tsorted;
+                std::array<uint32_t, 8193> at{};
+                for (const TrackItem& it : from) ++at[((it.key >> shift) & 8191u) + 1u];
+                for (std::size_t b = 1; b < at.size(); ++b) at[b] += at[b - 1];
+                for (const TrackItem& it : from) to[at[(it.key >> shift) & 8191u]++] = it;
+            }
+            roll->data.resize(dataBefore + entries.size() * 15u + titems.size() * 15u);
+            uint8_t* dst = roll->data.data() + dataBefore;
+            const auto put = [&dst](uint32_t value) {
+                while (value >= 0x80u) {
+                    *dst++ = uint8_t(value | 0x80u);
+                    value >>= 7;
+                }
+                *dst++ = uint8_t(value);
+            };
+            const RollEntry* e = sorted.data();
+            for (const uint16_t slot : touched) {
+                const TrackWalk& w = twalk[slot];
+                const TrackFirst& f = tfirst[slot];
+                RollTrackSlot ts{};
+                ts.slot = slot;
+                ts.final = uint16_t(w.count);
+                ts.records = records[slot];
+                ts.finalOwner = w.owner;
+                ts.firstOwner = w.firstOwner;
+                ts.flags = uint8_t((w.phase >= 1 ? 1 : 0) | (w.phase == 2 ? 2 : 0));
+                ts.high = f.high;
+                ts.total = f.sum;
+                ts.f1Word = uint32_t(f.f1Word - segBegin);
+                ts.f1Tick = f.f1Tick;
+                ts.f2Word = uint32_t(f.f2Word - segBegin);
+                ts.f2Tick = f.f2Tick;
+                ts.data = uint32_t(dst - roll->data.data());
+                roll->trackSlots.push_back(ts);
+                uint32_t word = uint32_t(segBegin), t = segFirstTick;
+                for (const RollEntry* last = e + records[slot]; e != last; ++e) {
+                    put(e->word - word);
+                    put(e->tick - t);
+                    put(e->value);
+                    word = e->word;
+                    t = e->tick;
+                }
+            }
+            // Each note: word delta << 2 | open << 1 | tick changed, the tick delta if it changed, then
+            // the key, with color << 7 | velocity above its 11 bits for an open.
+            const uint32_t itemData = uint32_t(dst - roll->data.data());
+            uint32_t key = 0, t = segFirstTick;
+            for (const TrackItem& it : titems) {
+                const uint32_t open = it.key & 1u;
+                put((((it.key >> 1) - (key >> 1)) << 2) | (open << 1) | (it.tick != t ? 1u : 0u));
+                if (it.tick != t) put(it.tick - t);
+                put(open ? uint32_t(it.slot) | (uint32_t(it.payload) << 11) : uint32_t(it.slot));
+                key = it.key;
+                t = it.tick;
+            }
+            roll->data.resize(std::size_t(dst - roll->data.data()));
+            // Up to a byte per word: the notes shown are what the sweep needs anyway, fewer than the words.
+            const std::size_t size = (roll->trackSlots.size() - slotsBefore) * sizeof(RollTrackSlot) +
+                (roll->data.size() - dataBefore) + sizeof(RollSegment);
+            if (size <= end - segBegin) {
+                RollSegment seg{uint32_t(segBegin), uint32_t(end), endByte, endTick, endTrack,
+                                segFirstTick, uint32_t(slotsBefore), uint32_t(touched.size())};
+                seg.itemCount = uint32_t(titems.size());
+                seg.itemData = itemData;
+                roll->segments.push_back(seg);
+            } else {
+                roll->trackSlots.resize(slotsBefore);
+                roll->data.resize(dataBefore);
+            }
+        }
+        for (const uint16_t slot : touched) {
+            twalk[slot] = TrackWalk{};
+            tfirst[slot] = TrackFirst{};
+            std::fill_n(preOff.begin() + std::ptrdiff_t(slot) * 16, 16, 0u);
+            records[slot] = 0;
+        }
+        touched.clear();
+        entries.clear();
+        titems.clear();
+        segBegin = end;
+        segOk = true;
+    };
+
     // The walk's step, channel and velocity are the same for every word of a run.
     int32_t rollDelta = 0;
-    uint32_t rollChannel = 0, rollVelocity = 0;
+    uint32_t rollChannel = 0, rollVelocity = 0, rollOwner = 0, rollPayload = 0;
     bool rollOpen = false;
     for (std::size_t i = 0; i < count; ++i) {
         const uint32_t t = events[i].tick, k = tracks[i], packed = events[i].packed;
@@ -2105,7 +2302,8 @@ void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks
                 marks.push_back(VisualMark{i, uint32_t(used), tick, track});
                 nextMark = i + VisualMarkWords;
                 if (roll && marks.size() % RollSegmentMarks == 0) {
-                    closeSegment(i, uint32_t(used), tick, track);
+                    if (trackFold) closeTrackSegment(i, uint32_t(used), tick, track);
+                    else closeSegment(i, uint32_t(used), tick, track);
                     segFirstTick = t;
                 }
             }
@@ -2134,11 +2332,80 @@ void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks
                 rollDelta = command != 0x90u && command != 0x80u ? 0 : rollOpen ? int32_t(copies + 1u) : -int32_t(copies + 1u);
                 rollChannel = (packed & 0x0fu) << 7;
                 rollVelocity = (packed >> 16) & 0x7fu;
+                if (trackFold) {
+                    rollOwner = k & 0x0fu;
+                    const uint32_t color = k < fold->colorCount ? fold->colors[k][packed & 0x0fu] & 0x0fu : 0u;
+                    rollPayload = (color << 7) | rollVelocity;
+                }
             }
         }
         lastData = used;
         out[used++] = uint8_t((packed >> 8) & 0x7fu);
         if (!rollDelta) continue;
+        if (trackFold) {
+            const uint16_t slot = uint16_t(rollChannel | ((packed >> 8) & 0x7fu));
+            const uint8_t owner = uint8_t(rollOwner);
+            const uint32_t n = uint32_t(rollOpen ? rollDelta : -rollDelta);
+            TrackWalk& w = twalk[slot];
+            if (!w.touched) {
+                w.touched = 1;
+                touched.push_back(slot);
+            }
+            if (w.phase != 2) {
+                TrackFirst& f = tfirst[slot];
+                if (w.phase == 0) {
+                    if (rollOpen) {
+                        w.phase = 1;
+                        w.firstOwner = owner;
+                        f.f1Word = uint32_t(i);
+                        f.f1Tick = t;
+                        f.sum = f.low = -int32_t(preOff[std::size_t(slot) * 16u + owner]);
+                    } else {
+                        preOff[std::size_t(slot) * 16u + owner] += n;
+                        entries.push_back(RollEntry{uint32_t(i), t, (n << 4) | owner, slot, 0});
+                    }
+                }
+                if (w.phase == 1) {
+                    if (owner == w.firstOwner) {
+                        if (rollOpen) {
+                            f.sum += int32_t(n);
+                            f.high = std::max(f.high, f.sum);
+                        } else {
+                            f.sum -= int32_t(n);
+                            if (f.sum < f.low) {
+                                entries.push_back(RollEntry{uint32_t(i), t, (uint32_t(f.low - f.sum) << 4) | owner, slot, 0});
+                                f.low = f.sum;
+                            }
+                        }
+                    } else if (rollOpen) {
+                        w.phase = 2;
+                        f.f2Word = uint32_t(i);
+                        f.f2Tick = t;
+                    }
+                }
+            }
+            if (rollOpen) {
+                if (w.count && w.owner != owner) {
+                    if (t >= w.openVisible) trackClose(slot, i, t);
+                    w.count = 0;
+                }
+                if (!w.count) {
+                    if (t != visTick) {
+                        visTick = t;
+                        visAt = foldVisibleAt(t, fold->window, fold->pixels);
+                    }
+                    w.owner = owner;
+                    w.openVisible = visAt;
+                    topen[slot] = TrackOpen{uint32_t(i), t, rollPayload};
+                }
+                w.count += n;
+                if (w.count > 0xffffu) segOk = false;
+            } else if (w.count && w.owner == owner) {
+                w.count -= std::min(n, w.count);
+                if (!w.count && t >= w.openVisible) trackClose(slot, i, t);
+            }
+            continue;
+        }
         const uint16_t slot = uint16_t(rollChannel | ((packed >> 8) & 0x7fu));
         RollWalk& w = walk[slot];
         if (w.high == 0 && w.low == 0) touched.push_back(slot);
@@ -2159,9 +2426,53 @@ void BpfaMidiStore::visualEncode(const EventWord* events, const uint16_t* tracks
     if (runKey != ~0u) out[lastData] |= 0x80u;
     bytes.resize(used);
     if (roll) {
-        closeSegment(count, uint32_t(used), tick, track);
-        if (roll->segments.empty()) *roll = RollSummary{};
+        if (trackFold) closeTrackSegment(count, uint32_t(used), tick, track);
+        else closeSegment(count, uint32_t(used), tick, track);
+        if (roll->segments.empty()) {
+            RollSummary none;
+            none.mode = roll->mode;
+            none.foldWindow = roll->foldWindow;
+            none.foldPixels = roll->foldPixels;
+            *roll = std::move(none);
+        }
     }
+}
+
+// The words of a piece back from its bytes, as visualEncode got them.
+bool BpfaMidiStore::visualDecodeBytes(const uint8_t* bytes, std::size_t size, uint32_t startTick,
+                                      std::vector<EventWord>& events, std::vector<uint16_t>& tracks)
+{
+    events.clear();
+    tracks.clear();
+    uint32_t at = 0, tick = startTick, track = 0;
+    while (at < size) {
+        uint8_t status = bytes[at];
+        if (status >= 0xf0u) {
+            ++at;
+            if (status == 0xf1u) {
+                tick += getVisualVar(bytes, at);
+                track = getVisualVar(bytes, at);
+            } else {
+                track += getVisualVar(bytes, at);
+            }
+            if (at + 2u > size) return false;
+            status = bytes[at];
+        }
+        if (status < 0x80u || status >= 0xf0u || at + 2u > size) return false;
+        const uint8_t data2 = bytes[at + 1];
+        uint32_t message = status | (uint32_t(data2 & 0x7fu) << 16);
+        at += 2;
+        if (data2 & 0x80u) message |= uint32_t(bytes[at++]) << 24;
+        bool last = false;
+        while (!last) {
+            if (at >= size) return false;
+            const uint8_t key = bytes[at++];
+            last = (key & 0x80u) != 0;
+            events.push_back(EventWord{tick, message | (uint32_t(key & 0x7fu) << 8)});
+            tracks.push_back(uint16_t(track));
+        }
+    }
+    return true;
 }
 
 void BpfaMidiStore::visualAddPiece(VisualPiece&& piece)
@@ -2460,8 +2771,10 @@ bool BpfaMidiStore::decodeVisualLocal(uint32_t endTick)
     piece.startTick = visHead_;
     piece.words = visSpanEvents_.size();
     piece.lastTick = visSpanEvents_.empty() ? visHead_ : visSpanEvents_.back().tick;
+    RollFold fold;
+    const RollFold* folded = encodeFold(fold);
     visualEncode(visSpanEvents_.data(), visSpanTracks_.data(), visSpanEvents_.size(), visHead_, piece.bytes, piece.marks,
-                 rollSummaryEnabled_ ? &piece.roll : nullptr);
+                 rollSummaryEnabled_ && (folded || !rollSummaryPerTrack_) ? &piece.roll : nullptr, folded);
     visualAppend(std::move(piece), endTick, anyLeft);
     visCursorTick_ = visHead_;
     return true;
@@ -2539,12 +2852,8 @@ inline void BpfaMidiStore::renderOpen(std::size_t slot, uint32_t tick, uint32_t 
         return;
     }
     if (foldVisibleAt_ == 0 || tick != foldTick_) {
-        // The first column centre at or after the tick, as the raster's column() rule.
-        const uint64_t w = foldWindow_, l = foldPixels_;
-        const int64_t num = int64_t(uint64_t(tick) * 2u * l) - int64_t(w);
-        const uint64_t column = num <= 0 ? 0 : (uint64_t(num) + 2u * w - 1u) / (2u * w);
         foldTick_ = tick;
-        foldVisibleAt_ = uint32_t(std::min<uint64_t>(0xffffffffu, (2u * column + 1u) * w / (2u * l) + 1u));
+        foldVisibleAt_ = foldVisibleAt(tick, foldWindow_, foldPixels_);
     }
     renderActiveIds_[slot] = 0;
     renderPending_.push_back({tick, packed, foldVisibleAt_, uint32_t(slot)});
@@ -2651,7 +2960,7 @@ bool BpfaMidiStore::buildRenderSweepStream(uint32_t endTick, std::size_t maxWord
         const auto run = [&](uint32_t tick, uint32_t message, uint32_t track, const uint8_t* keys, uint32_t n) {
             renderRun(tick, message, uint16_t(track), keys, n, appends, closes);
         };
-        if (renderPerTrackColors_ || !rollSummaryEnabled_) {
+        if (!rollSummaryEnabled_ || (renderPerTrackColors_ && !renderFold_)) {
             visualScanRuns(c, maxWords, endTick, run);
         } else {
             // Whole segments from their roll summary, the words in between one by one.
@@ -2716,7 +3025,8 @@ bool BpfaMidiStore::rollSummaryStep(VisualCursor& c, uint32_t through, std::size
         [](const RollSegment& seg, uint32_t at) { return seg.beginWord < at; });
     if (it == roll.segments.end() || it->beginWord != local) return false;
     const RollSegment& seg = *it;
-    if (seg.firstTick > through) return false;
+    if (seg.firstTick > through || !rollMatches(roll)) return false;
+    if (renderPerTrackColors_) return rollTrackStep(c, piece, seg, through, budget, appends, closes);
 
     // The slots whose walk is read: no copies held (all of it) or reaching zero (after the cut).
     const RollSlot* slots = roll.slots.data() + seg.slotBegin;
@@ -2792,6 +3102,201 @@ bool BpfaMidiStore::rollSummaryStep(VisualCursor& c, uint32_t through, std::size
     return true;
 }
 
+// Colors per track (HANDOFF sec. 113): a key holding c0 copies of owner o0's note keeps it until o0's
+// note-offs before the first note-on (f1) reach c0, until f1 if another owner plays it, until
+// firstOwner's sum after f1 reaches -c0, or until the first note-on by another owner (f2). From that
+// close on, the key is in the state of the walk from no note, whose shown notes the segment lists.
+bool BpfaMidiStore::rollTrackStep(VisualCursor& c, const VisualPiece& piece, const RollSegment& seg, uint32_t through,
+                                  std::size_t& budget, std::vector<VisualNote>& appends,
+                                  std::vector<RenderClose>& closes)
+{
+    const RollSummary& roll = piece.roll;
+    const RollTrackSlot* slots = roll.trackSlots.data() + seg.slotBegin;
+    const uint8_t* data = roll.data.data();
+    std::size_t reads = seg.itemCount;
+    for (uint32_t j = 0; j < seg.slotCount; ++j) {
+        const RollTrackSlot& s = slots[j];
+        const uint32_t c0 = renderActiveCounts_[s.slot];
+        if (!c0) continue;
+        const uint32_t owner = renderActiveColors_[s.slot];
+        if ((owner & 0x0fu) != (s.slot >> 7u)) return false;
+        if ((s.flags & 1u) && s.firstOwner == (owner >> 4) && int64_t(c0) + s.high > 0xffff) return false;
+        reads += s.records;
+    }
+    if (seg.endTick > through && reads > RollOvershootEntries) return false;
+
+    // The held notes' closes, at 2 * word (before the walk's open at that word).
+    rollOut_.clear();
+    for (uint32_t j = 0; j < seg.slotCount; ++j) {
+        const RollTrackSlot& s = slots[j];
+        const uint32_t c0 = renderActiveCounts_[s.slot];
+        rollCut_[s.slot] = 0;
+        if (!c0) continue;
+        const uint32_t o0 = renderActiveColors_[s.slot] >> 4;
+        const bool played = (s.flags & 1u) != 0, same = played && s.firstOwner == o0;
+        uint32_t at = s.data, word = 0, tick = seg.firstTick, offs = 0, drops = 0;
+        bool closed = false;
+        for (uint32_t r = 0; r < s.records && !closed; ++r) {
+            word += getVisualVar(data, at);
+            tick += getVisualVar(data, at);
+            const uint32_t value = getVisualVar(data, at), n = value >> 4;
+            if (!played || word < s.f1Word) {
+                if ((value & 0x0fu) != o0) continue;
+                offs += n;
+                closed = offs >= c0;
+            } else if (same) {
+                drops += n;
+                closed = uint64_t(offs) + drops >= c0;
+            }
+        }
+        if (!closed && played && (!same || (s.flags & 2u))) {
+            closed = true;
+            word = same ? s.f2Word : s.f1Word;
+            tick = same ? s.f2Tick : s.f1Tick;
+        }
+        if (closed) {
+            rollCut_[s.slot] = 2u * word + 1u;
+            rollOut_.push_back(RollOut{2u * word, tick, s.slot, 0, 2});
+        } else {
+            rollCut_[s.slot] = ~0u;
+            rollKeep_[s.slot] = played ? uint32_t(int64_t(c0) + s.total) : c0 - offs;
+        }
+    }
+    std::sort(rollOut_.begin(), rollOut_.end(), [](const RollOut& a, const RollOut& b) { return a.word < b.word; });
+
+    std::size_t held = 0;
+    const auto closeHeld = [&](uint32_t key) {
+        for (; held < rollOut_.size() && rollOut_[held].word <= key; ++held) {
+            renderFoldFlush(rollOut_[held].tick, appends);
+            renderClose(rollOut_[held].slot, rollOut_[held].tick, closes);
+        }
+    };
+    uint32_t at = seg.itemData, word = 0, tick = seg.firstTick;
+    for (uint32_t k = 0; k < seg.itemCount; ++k) {
+        const uint32_t head = getVisualVar(data, at), open = (head >> 1) & 1u;
+        word += head >> 2;
+        if (head & 1u) tick += getVisualVar(data, at);
+        const uint32_t value = getVisualVar(data, at), slot = value & 0x7ffu, payload = value >> 11;
+        const uint32_t key = 2u * word + open;
+        closeHeld(key);
+        if (key < rollCut_[slot]) continue;
+        renderFoldFlush(tick, appends);
+        if (open)
+            renderOpen(slot, tick, (payload & 0x7fu) | ((slot & 0x7fu) << 8) | ((payload >> 7) << 16), appends);
+        else
+            renderClose(slot, tick, closes);
+    }
+    closeHeld(~0u);
+    for (uint32_t j = 0; j < seg.slotCount; ++j) {
+        const RollTrackSlot& s = slots[j];
+        if (rollCut_[s.slot] == ~0u) {
+            renderActiveCounts_[s.slot] = uint16_t(rollKeep_[s.slot]);
+            continue;
+        }
+        renderActiveCounts_[s.slot] = s.final;
+        if (s.final) renderActiveColors_[s.slot] = uint8_t((s.finalOwner << 4) | (s.slot >> 7));
+    }
+    c.pos = piece.base + seg.endWord;
+    c.byte = seg.endByte;
+    c.tick = seg.endTick;
+    c.track = seg.endTrack;
+    c.inRun = false;
+    budget -= std::min<std::size_t>(budget, seg.slotCount + 2u * reads + 64u);
+    return true;
+}
+
+bool BpfaMidiStore::rollMatches(const RollSummary& roll) const
+{
+    return roll.mode == rollKeyMode_ && (roll.mode != 2 || (roll.foldWindow == rollKeyWindow_ && roll.foldPixels == rollKeyPixels_));
+}
+
+namespace {
+constexpr uint32_t RollRequestMagic = 0x31525257u;  // "WRR1"
+constexpr uint32_t RollResultMagic = 0x31535257u;   // "WRS1"
+// Pieces under this many words are swept word by word rather than summarized again.
+constexpr uint64_t RollRequestMinWords = uint64_t(1) << 20;
+} // namespace
+
+bool BpfaMidiStore::buildRollRequest(std::vector<uint8_t>& request)
+{
+    request.clear();
+    if (!valid_ || !visValid_ || !rollKeyMode_ || visPieces_.empty() || renderPos_ >= visEnd_) return false;
+    for (std::size_t i = renderPos_ < visBase_ ? 0 : visualPieceAt(renderPos_); i < visPieces_.size(); ++i) {
+        VisualPiece& piece = visPieces_[i];
+        if (piece.rollAsked == rollKeyGen_ || piece.words < RollRequestMinWords || rollMatches(piece.roll)) continue;
+        piece.rollAsked = rollKeyGen_;
+        putPod(request, RollRequestMagic);
+        putPod(request, piece.base);
+        putPod(request, piece.words);
+        putPod(request, piece.startTick);
+        putPod(request, rollKeyMode_);
+        putPod(request, rollKeyWindow_);
+        putPod(request, rollKeyPixels_);
+        putPod(request, uint64_t(piece.bytes.size()));
+        putArray(request, piece.bytes.data(), piece.bytes.size());
+        return true;
+    }
+    return false;
+}
+
+bool BpfaMidiStore::decodeRollRequest(const uint8_t* data, std::size_t size, std::vector<uint8_t>& result)
+{
+    result.clear();
+    PodReader in{data, size};
+    if (in.get<uint32_t>() != RollRequestMagic) { error_ = "Invalid roll request"; return false; }
+    const uint64_t base = in.get<uint64_t>(), words = in.get<uint64_t>();
+    const uint32_t startTick = in.get<uint32_t>(), mode = in.get<uint32_t>();
+    RollFold fold;
+    fold.window = in.get<uint32_t>();
+    fold.pixels = in.get<uint32_t>();
+    const uint64_t byteCount = in.get<uint64_t>();
+    const uint8_t* bytes = in.view<uint8_t>(std::size_t(byteCount));
+    if (!in.ok || (mode != 1 && mode != 2)) { error_ = "Invalid roll request"; return false; }
+    if (!visualDecodeBytes(bytes, std::size_t(byteCount), startTick, visSpanEvents_, visSpanTracks_) ||
+        visSpanEvents_.size() != words) {
+        error_ = "Invalid roll request words";
+        return false;
+    }
+    fold.colors = trackColors_.data();
+    fold.colorCount = trackColors_.size();
+    if (mode == 2 && (!fold.window || !fold.pixels || trackColors_.empty())) { error_ = "Invalid roll request fold"; return false; }
+    std::vector<uint8_t> again;
+    std::vector<VisualMark> marks;
+    RollSummary roll;
+    visualEncode(visSpanEvents_.data(), visSpanTracks_.data(), visSpanEvents_.size(), startTick, again, marks, &roll,
+                 mode == 2 ? &fold : nullptr);
+    // The summary's byte positions are those of the bytes encoded again.
+    if (again.size() != byteCount || std::memcmp(again.data(), bytes, again.size()) != 0) {
+        error_ = "Roll request bytes differ";
+        return false;
+    }
+    putPod(result, RollResultMagic);
+    putPod(result, base);
+    putPod(result, words);
+    putPod(result, roll.mode);
+    putRollSummary(result, roll);
+    return true;
+}
+
+bool BpfaMidiStore::attachRollResult(const uint8_t* data, std::size_t size)
+{
+    PodReader in{data, size};
+    if (!valid_ || !visValid_ || in.get<uint32_t>() != RollResultMagic) { error_ = "Invalid roll result"; return false; }
+    const uint64_t base = in.get<uint64_t>(), words = in.get<uint64_t>();
+    const uint32_t mode = in.get<uint32_t>();
+    RollSummary roll;
+    if (mode) getRollSummary(in, mode, roll);
+    if (!in.ok) { error_ = "Truncated roll result"; return false; }
+    // The piece may have been trimmed or the stream restarted since: then the result is dropped.
+    if (visPieces_.empty() || base < visBase_ || base >= visEnd_) return true;
+    VisualPiece& piece = visPieces_[visualPieceAt(base)];
+    if (piece.base != base || piece.words != words || !rollMatches(roll)) return true;
+    visHeldBytes_ -= piece.roll.bytes();
+    piece.roll = std::move(roll);
+    visHeldBytes_ += piece.roll.bytes();
+    return true;
+}
+
 bool BpfaMidiStore::buildVisualRequest(uint32_t startTick, uint32_t endTick, std::vector<uint8_t>& request) const
 {
     request.clear();
@@ -2856,22 +3361,28 @@ void BpfaMidiStore::putVisualResult(std::vector<uint8_t>& result, uint32_t start
     std::vector<uint8_t> bytes;
     std::vector<VisualMark> marks;
     RollSummary roll;
+    RollFold fold;
+    const RollFold* folded = encodeFold(fold);
     visualEncode(visSpanEvents_.data(), visSpanTracks_.data(), visSpanEvents_.size(), startTick, bytes, marks,
-                 rollSummaryEnabled_ ? &roll : nullptr);
+                 rollSummaryEnabled_ && (folded || !rollSummaryPerTrack_) ? &roll : nullptr, folded);
     putPod(result, uint64_t(visSpanEvents_.size()));
     putPod(result, visSpanEvents_.empty() ? startTick : visSpanEvents_.back().tick);
-    putPod(result, uint32_t(roll.empty() ? 0 : 1));
+    putPod(result, roll.mode);
     putPod(result, uint64_t(bytes.size()));
     putPod(result, uint64_t(marks.size()));
     putArray(result, bytes.data(), bytes.size());
     putArray(result, marks.data(), marks.size());
-    if (roll.empty()) return;
-    putPod(result, uint64_t(roll.segments.size()));
-    putPod(result, uint64_t(roll.slots.size()));
-    putPod(result, uint64_t(roll.data.size()));
-    putArray(result, roll.segments.data(), roll.segments.size());
-    putArray(result, roll.slots.data(), roll.slots.size());
-    putArray(result, roll.data.data(), roll.data.size());
+    putRollSummary(result, roll);
+}
+
+const BpfaMidiStore::RollFold* BpfaMidiStore::encodeFold(RollFold& fold) const
+{
+    if (!rollSummaryPerTrack_ || !foldWindow_ || !foldPixels_ || trackColors_.empty()) return nullptr;
+    fold.window = foldWindow_;
+    fold.pixels = foldPixels_;
+    fold.colors = trackColors_.data();
+    fold.colorCount = trackColors_.size();
+    return &fold;
 }
 
 bool BpfaMidiStore::appendVisualResult(const uint8_t* data, std::size_t size)
@@ -2884,15 +3395,12 @@ bool BpfaMidiStore::appendVisualResult(const uint8_t* data, std::size_t size)
     piece.startTick = startTick;
     piece.words = in.get<uint64_t>();
     piece.lastTick = in.get<uint32_t>();
-    const bool hasRoll = (in.get<uint32_t>() & 1u) != 0;
+    const uint32_t rollMode = in.get<uint32_t>();
     const uint64_t byteCount = in.get<uint64_t>(), markCount = in.get<uint64_t>();
     in.array(piece.bytes, std::size_t(byteCount));
     in.array(piece.marks, std::size_t(markCount));
-    if (hasRoll) {
-        const uint64_t segments = in.get<uint64_t>(), slots = in.get<uint64_t>(), data = in.get<uint64_t>();
-        in.array(piece.roll.segments, std::size_t(segments));
-        in.array(piece.roll.slots, std::size_t(slots));
-        in.array(piece.roll.data, std::size_t(data));
+    if (rollMode) {
+        getRollSummary(in, rollMode, piece.roll);
         if (!rollSummaryEnabled_ || liveOnly_) piece.roll = RollSummary{};
     }
     if (!in.ok) { error_ = "Truncated visual result"; return false; }
