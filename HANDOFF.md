@@ -7201,3 +7201,60 @@ así que la limpieza ocurre en la primera corrida en `main` después de este cam
 
 **No verificado.** GitHub recalcula el uso de almacenamiento cada 6-12 h: el aviso de límite puede
 tardar en irse aunque los artifacts ya estén borrados.
+
+## 110. Revisión 113 — CC en su muestra dentro del bloque
+
+**Pedido.** "Haz que el timing del CC y su accuracy sean lo mejor posible, sin afectar la velocidad
+de WasmiSynth".
+
+**Causa.** `ssw_render_queued_into` corta el bloque de 512 cuadros solo en pitch bend, CC64 y CC65
+(redondeado hacia abajo a un cuanto de 64+ cuadros y con un tope de cortes del gobernador). CC7, CC10
+y CC11 nunca cortaban: el motor aplicaba el valor nuevo al principio del segmento. Medido con
+escalones de CC7 contra un render con bloques de 8 cuadros (referencia casi exacta): error medio
+-5,2 ms, peor -15 ms (siempre antes de tiempo); lo mismo para el paneo. Además, dos CC iguales
+seguidos del mismo canal se fusionaban (en el core, `ssw_controller_absorbed_by_next`, y en la cola
+del worker, `enqueue_event`) aunque estuvieran a muchos milisegundos, y un escalón se perdía. Cortar
+más el bloque no sirve: forzar 8 cortes cuesta +35% de CPU en un MIDI denso con CC.
+
+Comparado con BASSMIDI (`NOFX`): curvas de CC7, CC11 y pitch bend iguales. El paneo no: BASSMIDI usa
+la ley de potencia constante de GM2 (L = cos(π/2·(p−1)/126), R = sin; +3 dB en un extremo frente al
+centro) y WasmiSynth un balance lineal, con pan 127 dejando −58 dB en el canal izquierdo.
+
+**Cambios.**
+- `voice.c`: línea de tiempo por canal dentro del bloque. La fase de eventos anota cada cambio de
+  CC7, CC10, CC11 y pitch bend con su desplazamiento en cuadros (`ctl_log_change`, `g_ctl_log`, hasta
+  `SSW_CTL_TIMELINE_MAX` = 32 por canal y bloque; el último estado siempre es el final).
+  `rebuild_channel_render_cache` (último productor, único escritor) la convierte en estados
+  (`ctl_offset`, `ctl_gain_l/r`, `ctl_pitch` en `channel_render_state`). Los cuatro caminos de render
+  que la respetan: el bucle escalar en línea, `voice_run_scalar` y `voice_quad_render` (por carril, la
+  corrida se corta en el próximo cambio) y la entrada a ellos desde `worker_cycle`. Los caminos
+  rápidos (lotes estéreo AVX2/wasm, `vor_fast_ok`) se saltan los canales con línea de tiempo en ese
+  bloque. Sin cambios de CC dentro del bloque `ctl_count` es 0 y todo sigue igual que antes.
+- Paneo de potencia constante como GM2/BASSMIDI (`channel_pan_gains`); pan 64 da 1,0/1,0 exactos, así
+  que un MIDI sin paneo suena byte a byte igual.
+- Core: el pitch bend ya no corta el segmento en modo CPU (la línea de tiempo lo pone en su muestra);
+  en modo GPU sigue cortando porque la GPU usa el estado final del canal.
+- Fusión de CC7/10/11 en el core y de CC y pitch bend en la cola del worker solo si los dos eventos
+  están a menos de `SSW_CTL_MERGE_FRAMES` = 32 cuadros (~0,7 ms).
+
+**Medición** (host, `midibench`, Arachno, `DET=1`).
+- Escalones de CC7 (`step.mid`, 45 escalones): error frente a la referencia de bloques de 8 cuadros
+  -5,16 ms medio / -15,1 ms peor → 0,02 / 0,09 ms. Contra la referencia de la misma revisión, 0,00.
+- Escalones de paneo: -5,16 / -15,1 → 0,00 ms.
+- MIDI denso con rampas de pitch bend y CC11 (`densecc.mid`): parecido con la referencia de bloques
+  de 8 cuadros 3,6 → 16,0 dB de SNR.
+- Paneo frente a BASSMIDI: pan 0/32/96/127 con las mismas diferencias L/R (+3 dB en el extremo, 0 en
+  el canal contrario); queda el desfase global de ~1 dB que ya había (§102).
+- Costo, 1024 voces, 1 worker, 3 corridas alternadas: densecc 0,34/0,34/0,34× → 0,33/0,37/0,33×; dense
+  0,32/0,32/0,35× → 0,31/0,33/0,32×. 4096 voces, 4 workers: 0,43-0,45× → 0,41-0,46×. Dentro del ruido.
+- WAV idéntico byte a byte en `seq.mid`, `dense.mid` y `gm.mid` (sin CC dentro de los bloques o sin
+  paneo). GPUEMU en densecc: 77,7 dB de SNR contra antes (pitch bend sigue cortando en modo GPU).
+
+**Verificación.** Pruebas de host del CI (`run_ci_step.py "Host tests…"`), `emcc -msimd128` del motor
+y del core, compilación local del sitio.
+
+**No verificado.** Escucha en las PCs del usuario. Si un CC cae después de un corte redondeado hacia
+abajo (por un pedal en el mismo cuanto) queda en la última muestra del segmento, hasta un cuanto antes
+(antes: al inicio del segmento). Más de 32 cambios por canal en un bloque: los que sobran se aplican
+juntos con el último. La GPU sigue aplicando volumen, expresión y paneo al inicio del segmento.
+Envolvente de modulación, LFOs, moduladores, reverb y chorus siguen pendientes.

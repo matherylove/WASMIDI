@@ -817,6 +817,10 @@ static void dispatch_sysex_data_at_qpc(const unsigned char* data, int length,
 #define SSW_COLLAPSE_CONTROLLER_BURSTS 1
 #endif
 
+#ifndef SSW_CTL_MERGE_FRAMES
+#define SSW_CTL_MERGE_FRAMES 32
+#endif
+
 static int ssw_cc_is_collapsible(uint32_t cc) {
     switch (cc & 0x7fu) {
         case 6: case 38: case 98: case 99: case 100: case 101:
@@ -873,9 +877,16 @@ static int ssw_controller_absorbed_by_next(
     const uint32_t other_command = other & 0xf0u;
     /* next_channel_index already skipped notes and other channels.  Therefore
      * this is exactly the event the old forward scan would have returned. */
-    return (other & 0x0fu) == channel &&
-           other_command == 0xb0u &&
-           ((other >> 8) & 0x7fu) == ((message >> 8) & 0x7fu);
+    if ((other & 0x0fu) != channel ||
+        other_command != 0xb0u ||
+        ((other >> 8) & 0x7fu) != ((message >> 8) & 0x7fu))
+        return 0;
+    switch ((message >> 8) & 0x7fu) {
+        case 7: case 10: case 11:
+            return next->sample_frame - events[index].sample_frame < SSW_CTL_MERGE_FRAMES;
+        default:
+            return 1;
+    }
 }
 
 static void dispatch_short_at_qpc(uint32_t msg, int64_t timestamp_qpc) {
@@ -1416,7 +1427,7 @@ static int ssw_affects_sounding_voices(uint32_t message) {
     const uint32_t command = message & 0xf0u;
 
     if (command == 0xe0u)
-        return 1;                       /* pitch bend */
+        return voice_wgpu_enabled();    /* pitch bend: CPU voices follow it in-segment */
     if (command != 0xb0u)
         return 0;
 
