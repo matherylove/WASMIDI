@@ -73,7 +73,7 @@ private:
     void rebuildCarryCache(uint32_t viewStart, std::size_t desiredBegin);
     void advanceCarryCache(uint32_t viewStart, std::size_t oldBegin, std::size_t desiredBegin);
     void uploadCarryCache();
-    void setInstanceBase(std::size_t physicalIndex);
+    void setInstanceBase(std::size_t physicalIndex, GLuint buffer = 0);
 
     // SharpMIDI-raylib GLNoteRenderer port. Screen-page generation is not used
     // by this path; notes are opened/closed directly in a persistent ring.
@@ -87,7 +87,8 @@ private:
                          uint8_t noteIndex);
     void closeSharpNote(uint32_t noteId, uint32_t endTick,
                         std::vector<uint32_t>* closeIds = nullptr);
-    void advanceSharpTail(uint32_t viewStart);
+    void advanceSharpTail(uint32_t viewStart, uint32_t windowTicks);
+    void clearHeldNotes();
     void uploadSharpRange(uint32_t beginId, uint32_t endId);
     void uploadSharpCloseIds(std::vector<uint32_t>& closeIds);
     void requestRemoteSharpSweep(uint32_t startTick, uint32_t endTick,
@@ -296,6 +297,15 @@ private:
     // is id & ringMask_. uint16 overlap counts intentionally match ushort.
     uint32_t sharpHead_ = 1;
     uint32_t sharpTail_ = 1;
+    // Notes still on screen a window after they began, moved out of the ring so they
+    // do not pin its tail (HANDOFF sec. 104). Ascending id order, all below the tail.
+    std::vector<VisualNote> held_;
+    std::vector<uint32_t> heldIds_;
+    GLuint heldVbo_ = 0;
+    std::size_t heldVboCapacity_ = 0;
+    // Leading entries of held_ already in heldVbo_ as they are now.
+    std::size_t heldUploaded_ = 0;
+    uint32_t heldPrunedAt_ = 0;
     int64_t sharpLastSweepEnd_ = -1;
     uint32_t sharpLastWindowTicks_ = 0;
     uint32_t sharpStableWindowTicks_ = 0;

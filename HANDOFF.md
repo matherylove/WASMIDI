@@ -6873,3 +6873,93 @@ Además, armar un tile recorría el ring desde la cola, y una sola nota larga so
 - Un navegador con `GL_MAX_TEXTURE_SIZE` menor que el largo del roll (las bandas no se probaron).
 - Donde el roll todavía dibuja crudo (sin tile que cubra la pantalla tras un salto, o `?tiles=0`) sigue el
   sobredibujo de antes.
+
+## 104. Revisión 107 — el roll ya no agota la memoria en las zonas densas
+
+### Pedido
+
+Dekx probó la rev. 106 con The Nuker 3 (Brave, note speed 0,10 s, 6144 voces): "el programa hizo aplication exit
+durante la prueba en una parte exigente", con una captura de la consola: `renderer ring grows` de 8 388 608 a
+16 777 216, 33 554 432, 67 108 864, 134 217 728 y 268 435 456 notas, y después `Aborted()` dentro de
+`wasmidi.wasm`.
+
+### Causa
+
+El ring del roll (§34) guarda las notas desde la más vieja que todavía se ve (la cola) hasta lo preparado por
+delante (la cabeza). Cuando se llena se duplica: con 134 M notas (1,5 GiB) pasar a 268 M pide 3 GiB más mientras
+copia, y el heap de la app es de 4 GiB. `Aborted()` es esa reserva fallida. Creció sin tope por tres razones:
+
+- **La cola no avanzaba durante una reconstrucción.** `renderRoll` no llamaba a `advanceSharpTail` mientras
+  `sharpRemoteRebuilding_` estaba encendido (un comentario de cuando el ring viejo se conservaba durante la
+  reconstrucción). Hoy el ring se vacía al empezar una reconstrucción, pero esta termina solo cuando un lote completo
+  llega a `sharpRemoteBuildTarget_`, y mientras tanto ese objetivo se corre una ventana cada vez que el cursor avanza
+  una ventana. En una zona densa el Worker va justo por delante del cursor sin alcanzar el objetivo: la reconstrucción
+  que empezó con un salto del roll (§80) no terminaba y la cola se quedaba en la primera nota. En el Chromium del
+  contenedor (corrida 1 abajo) las notas del ring subieron sin bajar de 0,19 M a 5,1 M en 68 s, hasta el salto
+  siguiente; en una PC que no necesita saltos el ring crece hasta el final del tema. Es probable (no verificado) que el
+  cierre del 7435HS de la rev. 85 (§81) fuera lo mismo.
+- **Una nota larga sostenía la cola.** `advanceSharpTail` para en la primera nota abierta o que termina después del
+  borde izquierdo: una nota de 10 s en una zona de 20 M notas/s deja 200 M notas en el ring.
+- **El adelanto salía de la densidad promedio del tema** (`calculateSharpView`): en una zona diez veces más densa que
+  el promedio pedía diez veces más notas, y el presupuesto era 0,55 × la capacidad actual del ring, así que cada vez
+  que el ring crecía pedía más.
+
+### Cambios
+
+- La cola avanza siempre, también durante una reconstrucción (el ring ya se vació al empezarla).
+- Notas sostenidas aparte (`held_`, `heldIds_`): una nota que sigue en pantalla una ventana después de empezar sale del
+  ring por la cola a una lista propia en orden de id, y la cola sigue. La lista se poda cada vez que el borde izquierdo
+  avanza una ventana. El cierre de una nota que ya salió del ring la busca ahí (`closeSharpNote`, búsqueda binaria).
+  Las notas sostenidas empezaron antes que todas las del ring, así que van debajo: el dibujo crudo las dibuja primero
+  desde su propio VBO (`heldVbo_`; se sube solo lo que cambió y solo cuando hay que dibujar crudo) y los tiles las
+  agregan detrás de las notas largas del ring. La regla de capas no cambia.
+- Adelanto con presupuesto fijo de 0,55 × 2^23 notas (`kSharpResidentBudget`), que ya no crece con el ring; y con el
+  ring pasado de ese presupuesto el horizonte no se pide más lejos de lo ya pedido, salvo las dos pantallas urgentes.
+- Tope del ring en 2^26 notas (`kSharpRingMax`, 768 MiB; 1,1 GiB mientras crece desde 2^25): si una pantalla
+  necesitara más, se pierden las notas más viejas en vez de cerrar la app.
+- `[WASMIDI app]` (`?visualdebug=1`) muestra `resident N, long M`: notas en el ring y notas sostenidas.
+- `browser_bench.py`: la ayuda decía `--url URL` y el script solo lee `--url=URL`.
+
+### Medición
+
+Chromium del contenedor (4 hilos, SwiftShader), WASMIDI con The Nuker 3, note speed 0,10 s, 6144 voces, desde el
+principio, 218 s de reproducción (`browser_bench.py app ... --setting=noteSpeed=0.1 --voices=6144`):
+
+| | rev. 106 | rev. 107 |
+|---|---|---|
+| notas en el ring, máximo | 5,15 M | 0,58 M |
+| mayor subida sin bajar | +4,97 M en 68 s | +0,48 M en 6 s |
+| notas sostenidas, máximo | (en el ring) | 1383 |
+| saltos del roll | 21 | 16 |
+| cuadros retenidos | 481 | 386 |
+| memoria de la app | 147 MiB | 151 MiB |
+
+El ring no creció en ninguna de las dos (2^23 alcanza para 5 M); en la rev. 106 la subida paró solo porque otro salto
+vació el ring. El final de la corrida de la rev. 106 coincidió con una compilación en el contenedor: los saltos y
+cuadros retenidos no son comparables, la forma de la curva sí.
+
+MIDI sintético con notas de 8 s, una nota que no se cierra y notas cortas encima (`longnotes.mid`, 3 pistas), note
+speed 0,1: con la rev. 106 el ring guardaba 5120 notas (la nota larga de la cola sostenía todo); con la rev. 107, 1825
+en el ring y 17 sostenidas, mismas notas dibujadas (164 como máximo).
+
+The Nuker 3 desde un salto a ~400 s (la segunda zona densa, 420-450 s), mismas opciones, 110 s: máximo 0,53 M notas
+en el ring y 1145 sostenidas, 41 saltos del roll (el contenedor no alcanza esa zona), memoria de la app 161 MiB, sin
+`ring grows`.
+
+### Verificación
+
+- Chequeo temporal cuadro a cuadro (no quedó en el código): una copia de cada nota de la generación con sus cierres,
+  comparada después de `advanceSharpTail` con el ring y la lista de sostenidas (toda nota visible tiene que estar en
+  uno de los dos, con el mismo inicio, fin y datos). `longnotes.mid` con note speed 0,1 y 1 y un salto adelante y
+  otro atrás, y many30.mid con 0,1: 3080 cuadros, 0 diferencias.
+- Capturas de `longnotes.mid` con tiles, con `?tiles=0` y con la rev. 106: las notas de 8 s cruzan la pantalla entera
+  en las tres, debajo de las cortas que empiezan después.
+- Compilación local con Emscripten 3.1.56 / Qt 6.8.3; CI del PR.
+
+### No verificado
+
+- The Nuker 3 entero en las PCs de Dekx, con GPU real.
+- El tope de 2^26 notas no se alcanzó en ninguna prueba (haría falta una pantalla con más de 67 M notas).
+- Con muchas notas sostenidas y el roll dibujando crudo, cada cuadro sube la parte de la lista que cambió.
+- Sin cambio: un salto o una reconstrucción que empieza dentro de una nota larga no la muestra, porque el cursor del
+  Worker arranca sin notas activas (`resetRenderCursor`).

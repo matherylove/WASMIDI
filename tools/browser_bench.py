@@ -12,7 +12,7 @@
         the keyboard/counter round trips (requests, replies, latency) and how far the roll's
         prepared notes lead the playhead (ticks), measured on the parser Worker's messages.
 
-Options: --url http://127.0.0.1:8080  --headed  --log (every console message)
+Options: --url=http://127.0.0.1:8080  --headed  --log (every console message)
          --query=helpers=3 (appended to the page URL)
          --voices=N --workers=N (audio: applies the WasmiSynth settings before playing)
          --seek=S (app: at second S click the position slider near the start; --seekx=X clicks at x=X)
