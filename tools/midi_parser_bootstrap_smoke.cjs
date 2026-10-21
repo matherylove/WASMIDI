@@ -474,6 +474,27 @@ async function visualStreamSmoke(Module, createParser, denseMidi) {
                 r.appends.length / 3 + "/" + foldMerge.appends.length / 3 + " notes");
     }
 
+    // Roll summaries in colors per track (HANDOFF sec. 113): the same notes with the summaries for the fold.
+    for (const name of ["_wmp_roll_request_js", "_wmp_roll_decode_js", "_wmp_roll_attach_js"]) {
+        if (typeof Module[name] !== "function")
+            throw new Error("Missing generated export " + name);
+    }
+    const foldWindow = Math.max(2, Math.floor(maxTick / 16));
+    for (const M of [Module, Spans]) {
+        M._wmp_render_fold_js(foldWindow, 64);
+        M._wmp_roll_summary_js(2);
+    }
+    const sumLocal = sweep(true, false, 1), sumSpans = sweep(true, true, 1);
+    for (const M of [Module, Spans]) {
+        M._wmp_render_fold_js(0, 0);
+        M._wmp_roll_summary_js(1);
+    }
+    for (const [name, r] of [["local", sumLocal], ["helper", sumSpans]]) {
+        if (!same(r.appends, foldMerge.appends) || !same(r.closes, foldMerge.closes))
+            throw new Error("Roll summary per track (" + name + ") differs from the merge sweep: " +
+                r.appends.length / 3 + "/" + foldMerge.appends.length / 3 + " notes");
+    }
+
     // Joint spans (HANDOFF sec. 85): one helper decode gives the feed result and the visual span.
     for (const name of ["_wmp_joint_decode_js", "_wmp_feed_block_tick_js", "_wmp_feed_block_at_tick_js"]) {
         if (typeof Module[name] !== "function")

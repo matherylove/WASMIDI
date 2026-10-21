@@ -67,6 +67,10 @@ for fold in 4000:640 40000:64 100000:32; do
   FOLD=$fold ./render_compare_bpfa /tmp/feeder_synth.mid 0 40 1 /tmp/rb.bin 2>/dev/null
   [ -s /tmp/ra.bin ] && cmp -s /tmp/ra.bin /tmp/rb.bin && echo "render fold $fold IDENTICAL" || echo "render fold $fold DIFFER"
 done
+# Roll summaries in colors per track (HANDOFF sec. 113): the same notes as the sweep that reads every word.
+g++ -O2 -std=c++17 $ZSTD_FLAGS -I../../src -I../../src/midi -o roll_track_check roll_track_check.cpp $SRCS $ZSTD_LIBS || exit 1
+./roll_track_check
+rm -f roll_track_check
 ./live_compare_old /tmp/feeder_synth.mid /tmp/la.bin 0 5 2.5 30 1 2>/dev/null
 ./live_compare_bpfa /tmp/feeder_synth.mid /tmp/lb.bin 0 5 2.5 30 1 2>/dev/null
 cmp -s /tmp/la.bin /tmp/lb.bin && echo "live snapshots IDENTICAL" || echo "live snapshots DIFFER"

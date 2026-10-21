@@ -152,6 +152,14 @@ public:
     // Roll summaries (HANDOFF sec. 108): the helpers send them with each span and the sweep in
     // channel colors applies whole segments from them; off, it reads every word.
     void setRollSummaryEnabled(bool enabled) { rollSummaryEnabled_ = enabled; }
+    // 0 off, 1 channel colors, 2 colors per track with the fold set by setRenderFold (HANDOFF sec. 113):
+    // what this store's spans carry and what the sweep uses.
+    void setRollSummaryMode(int mode) { rollSummaryEnabled_ = mode != 0; rollSummaryPerTrack_ = mode == 2; }
+    // The held pieces whose summary is not for the sweep's current colors and fold, from the sweep on,
+    // go to the helpers one per request (HANDOFF sec. 113); false when none is left.
+    bool buildRollRequest(std::vector<uint8_t>& request);
+    bool decodeRollRequest(const uint8_t* request, std::size_t size, std::vector<uint8_t>& result);
+    bool attachRollResult(const uint8_t* result, std::size_t size);
     // Colors per track (HANDOFF sec. 108): a note that covers no pixel centre of a roll `pixels`
     // wide per `windowTicks` is never sent. 0 sends every note; applies from the next reset.
     void setRenderFold(uint32_t windowTicks, uint32_t pixels) { foldWindow_ = windowTicks; foldPixels_ = pixels; }
@@ -546,6 +554,7 @@ private:
     struct RollSegment {
         uint32_t beginWord, endWord, endByte, endTick, endTrack, firstTick;
         uint32_t slotBegin, slotCount;
+        uint32_t itemCount = 0, itemData = 0;   // colors per track: the notes, all keys in word order
     };
     // total/low/high: sum, lowest and highest prefix sum of the copies; final: the walk from zero
     // at the end. At data: the records (each new lowest sum below zero) and the opens/closes of the
@@ -555,9 +564,30 @@ private:
         int32_t total, low, high;
         uint32_t data;
     };
+    // Colors per track (HANDOFF sec. 113): final/finalOwner, the walk from no note at the end. For a
+    // key that starts the segment holding a note: the first note-on (f1, by firstOwner, flag 1), the
+    // first one by another owner (f2, flag 2), the highest and the last sum of firstOwner's copies
+    // before f2 (high, total). At data, the records: each note-off before f1 and each new lowest sum
+    // of firstOwner before f2, as varints (word and tick deltas, then drop << 4 | owner).
+    struct RollTrackSlot {
+        uint16_t slot, final;
+        uint32_t records;
+        uint8_t finalOwner, firstOwner, flags, unused;
+        int32_t high, total;
+        uint32_t f1Word, f1Tick, f2Word, f2Tick, data;
+    };
+    // The fold the encoder drops notes for, with the track colors of the opens.
+    struct RollFold {
+        uint32_t window = 0, pixels = 0;
+        const std::array<uint8_t, 16>* colors = nullptr;
+        std::size_t colorCount = 0;
+    };
     struct RollSummary {
         std::vector<RollSegment> segments;
         std::vector<RollSlot> slots;
+        std::vector<RollTrackSlot> trackSlots;
+        uint32_t mode = 0;                          // 0 none computed, 1 channel colors, 2 colors per track
+        uint32_t foldWindow = 0, foldPixels = 0;    // the fold of mode 2
         std::vector<uint8_t> data;
         bool empty() const { return segments.empty(); }
         std::size_t bytes() const;
@@ -568,6 +598,7 @@ private:
         std::vector<uint8_t> bytes;
         std::vector<VisualMark> marks;
         RollSummary roll;
+        uint32_t rollAsked = 0;         // rollKeyGen_ of the last buildRollRequest for it
     };
     struct VisualCursor {
         uint64_t pos = 0;               // absolute index of the next word
@@ -581,10 +612,24 @@ private:
     uint64_t visEnd_ = 0;           // absolute index past the last word held
     VisualCursor visRenderAt_, visLiveAt_;
     static void visualEncode(const EventWord* events, const uint16_t* tracks, std::size_t count, uint32_t startTick,
-                             std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks, RollSummary* roll = nullptr);
+                             std::vector<uint8_t>& bytes, std::vector<VisualMark>& marks, RollSummary* roll = nullptr,
+                             const RollFold* fold = nullptr);
+    static bool visualDecodeBytes(const uint8_t* bytes, std::size_t size, uint32_t startTick,
+                                  std::vector<EventWord>& events, std::vector<uint16_t>& tracks);
+    const RollFold* encodeFold(RollFold& fold) const;
     bool rollSummaryStep(VisualCursor& c, uint32_t through, std::size_t& budget, std::vector<VisualNote>& appends,
                          std::vector<RenderClose>& closes);
+    bool rollTrackStep(VisualCursor& c, const VisualPiece& piece, const RollSegment& seg, uint32_t through,
+                       std::size_t& budget, std::vector<VisualNote>& appends, std::vector<RenderClose>& closes);
     bool rollSummaryEnabled_ = true;
+    bool rollSummaryPerTrack_ = false;
+    uint32_t rollKeyMode_ = 0, rollKeyWindow_ = 0, rollKeyPixels_ = 0;   // the summary the sweep reads
+    uint32_t rollKeyGen_ = 1;       // changes with that key
+    bool rollMatches(const RollSummary& roll) const;
+    // rollTrackStep: per key, where its walk starts to apply (2 * word + open) and the count of a held
+    // note that outlasts the segment.
+    std::array<uint32_t, 128u * 16u> rollCut_{};
+    std::array<uint32_t, 128u * 16u> rollKeep_{};
     struct RollOut { uint32_t word, tick; uint16_t slot; uint8_t velocity, kind; };
     std::vector<RollOut> rollOut_;
     std::vector<uint32_t> rollNeeded_;

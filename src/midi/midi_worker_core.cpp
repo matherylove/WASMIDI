@@ -1780,16 +1780,87 @@ void wmp_visual_keep_all_js(int keepAll)
 #endif
 }
 
-// Roll summaries (HANDOFF sec. 108): off, the sweep reads every word of the visual stream.
+// Roll summaries (HANDOFF sec. 108-109): 0 off (the sweep reads every word of the visual stream),
+// 1 channel colors, 2 colors per track for the fold of wmp_render_fold_js.
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif
-void wmp_roll_summary_js(int enabled)
+void wmp_roll_summary_js(int mode)
 {
 #if WASMIDI_PARSER_BPFA
-    g_mappedStore.setRollSummaryEnabled(enabled != 0);
+    g_mappedStore.setRollSummaryMode(mode);
 #else
-    (void)enabled;
+    (void)mode;
+#endif
+}
+
+// Coordinator: the next held piece to summarize again for the sweep's colors and fold, into the
+// feed buffer (HANDOFF sec. 113). 0: none left.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_roll_request_js()
+{
+#if WASMIDI_PARSER_BPFA
+    try {
+        return g_mappedStore.buildRollRequest(g_feedBuffer) ? 1 : 0;
+    } catch (...) {
+        g_error = "Roll summary request ran out of memory";
+        return 0;
+    }
+#else
+    return 0;
+#endif
+}
+
+// Helper: summarizes the piece in the feed buffer again; the result replaces the buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_roll_decode_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid roll request"; return 0; }
+    try {
+        std::vector<uint8_t> request(g_feedBuffer.begin(), g_feedBuffer.begin() + std::ptrdiff_t(size));
+        if (!g_mappedStore.decodeRollRequest(request.data(), request.size(), g_feedBuffer)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Roll summary helper ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
+#endif
+}
+
+// Coordinator: attaches the helper's summary the page copied into the feed buffer.
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_roll_attach_js(double byteCount)
+{
+#if WASMIDI_PARSER_BPFA
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size) || size > g_feedBuffer.size()) { g_error = "Invalid roll result"; return 0; }
+    try {
+        if (!g_mappedStore.attachRollResult(g_feedBuffer.data(), size)) {
+            g_error = g_mappedStore.error();
+            return 0;
+        }
+        return 1;
+    } catch (...) {
+        g_error = "Roll summary ran out of memory";
+        return 0;
+    }
+#else
+    (void)byteCount;
+    return 0;
 #endif
 }
 

@@ -64,8 +64,25 @@ async function feedMessage(m) {
         if (!ptr)
             throw new Error(errorText(Module, "No memory for the synth feed request"));
         Module.HEAPU8.set(request, ptr);
-        if ((visual || joint) && typeof Module._wmp_roll_summary_js === "function")
-            Module._wmp_roll_summary_js(m.rollSummary === false ? 0 : 1);
+        // The roll summary the parser Worker's sweep reads (HANDOFF sec. 108-109).
+        if ((visual || joint) && typeof Module._wmp_roll_summary_js === "function") {
+            Module._wmp_roll_summary_js(Number(m.rollMode) >>> 0);
+            if (typeof Module._wmp_render_fold_js === "function")
+                Module._wmp_render_fold_js(Number(m.foldWindow) >>> 0, Number(m.foldPixels) >>> 0);
+        }
+        if (m.type === "roll-summarize") {
+            // A summary that fails is skipped: the sweep reads that piece word by word.
+            let result = null, message = "";
+            if (Module._wmp_roll_decode_js(request.length)) {
+                const out = Number(Module._wmp_feed_buffer_ptr_js());
+                result = Module.HEAPU8.slice(out, out + Number(Module._wmp_feed_buffer_size_js()));
+            } else {
+                message = errorText(Module, "Roll summary failed");
+            }
+            postMessage({ type: "roll-result", id: m.id, result: result ? result.buffer : null, message },
+                result ? [result.buffer] : []);
+            return;
+        }
         const decode = visual ? Module._wmp_visual_decode_js : joint ? Module._wmp_joint_decode_js : Module._wmp_feed_decode_js;
         if (!decode(request.length))
             throw new Error(errorText(Module, visual ? "Visual span decode failed" : joint ? "Joint span decode failed" : "Synth feed decode failed"));
@@ -171,7 +188,8 @@ async function liveHandle(m) {
 
 self.onmessage = async event => {
     const m = event.data || {};
-    if (m.type === "feed-init" || m.type === "feed-decode" || m.type === "visual-decode" || m.type === "joint-decode") {
+    if (m.type === "feed-init" || m.type === "feed-decode" || m.type === "visual-decode" || m.type === "joint-decode" ||
+        m.type === "roll-summarize") {
         await feedMessage(m);
         return;
     }

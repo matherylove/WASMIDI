@@ -1,7 +1,7 @@
 # WASMIDI — contexto para Claude Code
 
 Leer esto primero. El historial completo, con cada medición y decisión, está en
-`HANDOFF.md` (§1-§112). Este archivo resume el estado al cierre de la rev. 115 y dice
+`HANDOFF.md` (§1-§113). Este archivo resume el estado al cierre de la rev. 116 y dice
 cómo trabajar. Todo en español: el usuario escribe en español.
 
 ## El proyecto
@@ -133,7 +133,7 @@ densa 98-104 s), **MatheryLSD.sf2** (11 regiones), **The Nuker 3 Ultimate F4.mid
 (15,9 GB, 9679 pistas, 2.080 M notas) y **The Nuker 4 F2.mid** (20,9 GB). Para pruebas
 con letras, `tools/feeder_check` genera MIDIs sintéticos.
 
-## Estado actual (rev. 115)
+## Estado actual (rev. 116)
 
 Rendimiento medido por el usuario:
 
@@ -352,6 +352,12 @@ Rendimiento medido por el usuario:
   (robo por radix, creación, render, reducción, compactado); el CPU solo manda note-ons, note-offs por tecla, cortes y filas
   de canal (`web/snappysynth-kestrel.js`, `kgpu_*` en `voice.c`). Chromium sin GPU: RMS igual al modo CPU (~1%).
   Sin medir con GPU real.
+- Rev. 116 (HANDOFF §113): colores por pista (los que usa la mayoría) con resumen del roll: los helpers guardan por tramo de
+  4 M palabras solo las notas que el plegado de la rev. 111 muestra, más lo necesario para cerrar la nota que cada tecla trae;
+  el barrido las aplica sin leer palabras (mismas notas). Pedazos con otro plegado (prellenado, note speed, ancho) los
+  resumen de nuevo los helpers (`roll-summarize`). Host 436-448 s: barrido 0,32-0,70 → 0,04-0,06 s por segundo. Chromium
+  desde 425 s: barrido 554-565 → 71-73 ms/s, teclado 28 → 34/s; el roll ahí sigue limitado por 3 helpers. El codificador
+  en wasm costaba 40-59 ns por palabra por una llamada por nota que pasaba por JavaScript (`-fexceptions`): ~16 ns.
 
 Mecanismos activos y cómo desactivarlos:
 
@@ -372,6 +378,7 @@ Mecanismos activos y cómo desactivarlos:
 | Adelanto del roll con presupuesto fijo y ring con tope de 2^26 notas (rev. 107) | sin interruptor (`kSharpResidentBudget`, `kSharpRingMax`) |
 | Resumen del roll por tramos de 4 M palabras, barrido en colores por canal sin leer palabras (rev. 111) | `?rollsummary=0` |
 | Colores por pista: solo las notas que cubren un centro de píxel; otro ancho del roll reconstruye (rev. 111) | `?rollfold=0` |
+| Resumen del roll en colores por pista con el plegado; los helpers lo recalculan para otro plegado (rev. 116) | `?rollsummary=0` (apaga los dos resúmenes) |
 | Límite de render del synth | `?synthlimit=0` / `ssw_set_render_limit_percent(0)` |
 | Admisión por bloque (25% de voces) | `ssw_set_admission_percent(0)` |
 | Tope de robos por ciclo (25%) | `ssw_set_steal_cap_percent(0)` |
@@ -426,7 +433,7 @@ Mecanismos activos y cómo desactivarlos:
    Rev. 93: modos look-ahead y canción entera (como BPFA).
    Falta: cuadros del roll de solo lo visible (rev. 106) con GPU real; The Nuker 3 entero sin cierre (rev. 107) en las
    PCs; 7:14-7:29 de The Nuker 3 en las PCs con la rev. 111 (en el contenedor lo que queda es la decodificación de
-   3 helpers desde ~440 s); el barrido en colores por pista (lee cada palabra); los dos modos de la rev. 93 en las PCs
+   3 helpers desde ~440 s); colores por pista con el resumen de la rev. 116 en las PCs; los dos modos de la rev. 93 en las PCs
    (canción entera de The Nuker 3: con `deviceMemory` limitado a 8 GB el tope es 4 GB y no entra, HANDOFF §108);
    el tiempo de carga (el usuario: sharkmidi abre mucho más rápido); The Nuker 3 en WASMIDI con 12288 voces (`helpers N% busy` de
    `[WASMIDI visual]`; probar 6144 voces para separar CPU del synth de decodificación),
@@ -456,6 +463,8 @@ Mecanismos activos y cómo desactivarlos:
 - No afirmar que una herramienta no existe sin buscarla en todo el sistema.
 - No dejar la descarga a GPU del motor encendida mientras el JS no la atiende (rev. 73):
   cualquier cambio en el ciclo de vida del core debe apagarla primero.
+- En los módulos wasm con `-fexceptions` (el parser), no llamar por evento a una función que puede lanzar y no queda en
+  línea (una lambda con `push_back`): cada llamada pasa por JavaScript. Medir el costo en wasm, no solo en host (rev. 116).
 
 ## Licencias de las referencias
 
